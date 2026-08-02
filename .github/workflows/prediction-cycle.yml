@@ -1,0 +1,88 @@
+name: Prediction Cycle
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Execution mode
+        type: choice
+        required: true
+        default: observe
+        options:
+          - observe
+          - live
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prediction-agent-${{ vars.EXCHANGE_ID || 'polymarket-us' }}
+  cancel-in-progress: false
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    env:
+      EXCHANGE_ID: ${{ vars.EXCHANGE_ID || 'polymarket-us' }}
+      LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
+      LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+      LLM_MODEL: ${{ vars.LLM_MODEL }}
+      LLM_CATALOG_MODEL: ${{ vars.LLM_CATALOG_MODEL }}
+
+      TRADING_MODE: >-
+        ${{ github.event_name == 'workflow_dispatch'
+            && inputs.mode
+            || 'live' }}
+
+      POLYMARKET_KEY_ID: ${{ secrets.POLYMARKET_KEY_ID }}
+      POLYMARKET_SECRET_KEY: ${{ secrets.POLYMARKET_SECRET_KEY }}
+      KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+      KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+      KALSHI_API_BASE_URL: ${{ vars.KALSHI_API_BASE_URL }}
+      AGENT_MEMORY_SCOPE: ${{ vars.AGENT_MEMORY_SCOPE }}
+
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Restore advisory agent state
+        uses: actions/cache@v4
+        with:
+          path: |
+            reports/memory
+            reports/advisory
+            reports/history
+          key: >-
+            agent-state-${{ runner.os }}-${{ vars.EXCHANGE_ID || 'polymarket-us' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            agent-state-${{ runner.os }}-${{ vars.EXCHANGE_ID || 'polymarket-us' }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run cycle
+        run: npm run cycle
+
+      - name: Upload cycle report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cycle-${{ github.run_id }}
+          path: reports/
+          retention-days: 30
