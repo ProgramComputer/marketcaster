@@ -1,0 +1,101 @@
+{
+  "cycle": {
+    "timeoutSeconds": 1740,
+    "stageBudgetsSeconds": {
+      "marketDiscovery": 120,
+      "agentResearch": 1500,
+      "validationExecution": 120,
+      "reconciliationReporting": 120
+    }
+  },
+  "marketSelection": {
+    "opportunityBoardVariant": "GENERALIST_CONTROL",
+    "maximumPromptMarkets": 24,
+    "minimumMinutesToClose": 5,
+    "maximumDaysToClose": 365,
+    "maximumSpread": "0.10",
+    "minimumLiquidityUsd": "1000",
+    "minimumVolume24hUsd": "500",
+    "allowIfLiquidityOrVolumePasses": true,
+    "familyScouts": {
+      "enabled": true,
+      "reservedPromptMarkets": 8,
+      "maximumFamilies": 8,
+      "maximumMembersPerFamily": 3,
+      "minimumFamilyMembers": 3,
+      "enrichmentRequestBudget": 24,
+      "maximumMarketsPerCategory": 4,
+      "maximumClimateMarkets": 4,
+      "scoringWeights": {
+        "liquidityOrDepth": "0.30",
+        "volume24h": "0.25",
+        "uncertainty": "0.20",
+        "exchangeRankQuality": "0.20",
+        "cappedRecurrence": "0.05"
+      }
+    }
+  },
+  "agent": {
+    "maximumRounds": 22,
+    "maximumWebSearches": 8,
+    "maximumProviderWebSearchesPerResponse": 2,
+    "maximumEvidenceSourceReadRequests": 6,
+    "maximumMarketDiscoveryRequests": 5,
+    "maximumMarketDetailRequests": 10,
+    "maximumMarketAnalysisRequests": 6,
+    "maximumTradePreviewRequests": 6,
+    "maximumNoteOperations": 20,
+    "passResearch": {
+      "minimumDiscoveryRequests": 1,
+      "minimumDistinctDiscoveryModes": 1,
+      "minimumInspectedMarkets": 4,
+      "minimumDistinctEventFamilies": 2,
+      "minimumWebSearches": 2,
+      "minimumMarketAnalyses": 1,
+      "minimumTradePreviews": 1
+    },
+    "memory": {
+      "enabled": false,
+      "maximumNotes": 50,
+      "maximumContextNotes": 20,
+      "maximumNoteCharacters": 1200
+    },
+    "state": {
+      "enabled": true,
+      "maximumBeliefs": 100,
+      "maximumContextBeliefs": 40,
+      "maximumBeliefCharacters": 2000,
+      "maximumPlanCharacters": 4000
+    },
+    "timeoutSeconds": 1500
+  },
+  "risk": {
+    "maximumPositionCostBasisFraction": "0.15",
+    "maximumCycleSpendFraction": "0.05",
+    "maximumExecutionSpread": "0.10",
+    "kellyFraction": "0.25",
+    "uncertaintyBoundWeight": "0.50",
+    "duplicateWindowMinutes": 30,
+    "minimumIndependentSources": 1,
+    "allowNakedShorts": false,
+    "emergencyExitEnabled": false
+  },
+  "exchange": {
+    "maximumConcurrentRequests": 4,
+    "targetRequestsPerSecond": 8,
+    "maximumGetRetries": 20,
+    "baseRetryDelayMilliseconds": 1000,
+    "maximumRetryDelayMilliseconds": 8000,
+    "activityLookbackDays": 30,
+    "cleanupUnexpectedOpenOrders": false
+  },
+  "reporting": {
+    "directory": "reports",
+    "shadowLedger": {
+      "enabled": true,
+      "maximumObservationsPerCycle": 16,
+      "maximumSettlementChecksPerCycle": 24,
+      "maximumMarkChecksPerCycle": 12
+    }
+  }
+}
