@@ -752,8 +752,7 @@ function bookSnapshot(
             .minus(buy.vwap)
             .minus(feePerContract)
             .toFixed(),
-          authorizationBuyProbability:
-            authorizationBuyProbability.toFixed(),
+          authorizationBuyProbability: authorizationBuyProbability.toFixed(),
           authorizationBuyEdgePerContract: authorizationBuyProbability
             .minus(buy.vwap)
             .minus(feePerContract)
@@ -939,8 +938,7 @@ export async function captureShadowLedgerObservations(input: {
                   candidate.probabilityLowerBound.toFixed(),
                 probabilityUpperBound:
                   candidate.probabilityUpperBound.toFixed(),
-                uncertaintyBoundWeight:
-                  input.uncertaintyBoundWeight.toFixed(),
+                uncertaintyBoundWeight: input.uncertaintyBoundWeight.toFixed(),
                 buyAuthorizationProbability: candidate.estimatedProbability
                   .plus(
                     candidate.probabilityLowerBound

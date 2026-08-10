@@ -9,6 +9,7 @@
     }
   },
   "marketSelection": {
+    "opportunityBoardVariant": "GENERALIST_CONTROL",
     "maximumPromptMarkets": 24,
     "minimumMinutesToClose": 5,
     "maximumDaysToClose": 365,
@@ -24,7 +25,14 @@
       "minimumFamilyMembers": 3,
       "enrichmentRequestBudget": 24,
       "maximumMarketsPerCategory": 4,
-      "maximumClimateMarkets": 4
+      "maximumClimateMarkets": 4,
+      "scoringWeights": {
+        "liquidityOrDepth": "0.30",
+        "volume24h": "0.25",
+        "uncertainty": "0.20",
+        "exchangeRankQuality": "0.20",
+        "cappedRecurrence": "0.05"
+      }
     }
   },
   "agent": {
@@ -62,11 +70,11 @@
     "timeoutSeconds": 1500
   },
   "risk": {
-    "maximumPositionCostBasisFraction": "0.75",
-    "maximumCycleSpendFraction": "0.50",
+    "maximumPositionCostBasisFraction": "0.15",
+    "maximumCycleSpendFraction": "0.05",
     "maximumExecutionSpread": "0.10",
-    "kellyFraction": "0.85",
-    "uncertaintyBoundWeight": "0.25",
+    "kellyFraction": "0.25",
+    "uncertaintyBoundWeight": "0.50",
     "duplicateWindowMinutes": 30,
     "minimumIndependentSources": 1,
     "allowNakedShorts": false,

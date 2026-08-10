@@ -35,11 +35,13 @@ export interface PassEdgeAuditReport {
 function probabilityForSide(
   disposition: CandidateDisposition,
   side: OutcomeSide,
-): {
-  readonly point: Decimal;
-  readonly lower: Decimal;
-  readonly upper: Decimal;
-} | undefined {
+):
+  | {
+      readonly point: Decimal;
+      readonly lower: Decimal;
+      readonly upper: Decimal;
+    }
+  | undefined {
   const point = disposition.estimatedProbability;
   const lower = disposition.probabilityLowerBound;
   const upper = disposition.probabilityUpperBound;
@@ -72,9 +74,7 @@ function authorizationProbability(
   uncertaintyBoundWeight: Decimal,
 ): Decimal {
   return probability.point.plus(
-    probability.lower
-      .minus(probability.point)
-      .mul(uncertaintyBoundWeight),
+    probability.lower.minus(probability.point).mul(uncertaintyBoundWeight),
   );
 }
 

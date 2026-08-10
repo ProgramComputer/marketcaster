@@ -12,6 +12,12 @@ const optionalModelId = z.preprocess((value) => {
   return normalized.length === 0 ? undefined : normalized;
 }, z.string().min(1).optional());
 
+const optionalFileSystemPath = z.preprocess((value) => {
+  if (typeof value !== "string") return value;
+  const normalized = value.trim();
+  return normalized.length === 0 ? undefined : normalized;
+}, z.string().min(1).optional());
+
 const optionalAgentMemoryScope = z.preprocess(
   (value) => {
     if (typeof value !== "string") return value;
@@ -85,6 +91,9 @@ export const RuntimeEnvironmentSchema = z
     LLM_BASE_URL: optionalHttpUrl,
     LLM_MODEL: z.string().min(1),
     LLM_CATALOG_MODEL: optionalModelId,
+    MARKETCASTER_CONFIG_PATH: optionalFileSystemPath,
+    MARKETCASTER_DECISION_PROMPT_PATH: optionalFileSystemPath,
+    MARKETCASTER_REPORT_DIR: optionalFileSystemPath,
     GITHUB_RUN_ID: z.string().optional(),
     GITHUB_STEP_SUMMARY: z.string().optional(),
   })

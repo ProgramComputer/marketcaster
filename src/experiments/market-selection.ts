@@ -40,9 +40,21 @@ const FrozenFamilyScoutPolicySchema = z.object({
   enrichmentRequestBudget: z.number().int().nonnegative().optional(),
   maximumMarketsPerCategory: z.number().int().positive().optional(),
   maximumClimateMarkets: z.number().int().nonnegative().optional(),
+  scoringWeights: z
+    .object({
+      liquidityOrDepth: DecimalStringSchema,
+      volume24h: DecimalStringSchema,
+      uncertainty: DecimalStringSchema,
+      exchangeRankQuality: DecimalStringSchema,
+      cappedRecurrence: DecimalStringSchema,
+    })
+    .optional(),
 });
 
 const FrozenPolicySchema = z.object({
+  opportunityBoardVariant: z
+    .enum(["GENERALIST_CONTROL", "RESOLVER_LAG_TREATMENT"])
+    .optional(),
   maximumPromptMarkets: z.number().int().positive(),
   minimumMinutesToClose: z.number().nonnegative(),
   maximumDaysToClose: z.number().positive(),
@@ -162,6 +174,7 @@ function freezePolicy(
   policy: AgentConfig["marketSelection"],
 ): z.infer<typeof FrozenPolicySchema> {
   return {
+    opportunityBoardVariant: policy.opportunityBoardVariant,
     maximumPromptMarkets: policy.maximumPromptMarkets,
     minimumMinutesToClose: policy.minimumMinutesToClose,
     maximumDaysToClose: policy.maximumDaysToClose,
@@ -197,6 +210,17 @@ function freezePolicy(
                   maximumClimateMarkets:
                     policy.familyScouts.maximumClimateMarkets,
                 }),
+            scoringWeights: {
+              liquidityOrDepth:
+                policy.familyScouts.scoringWeights.liquidityOrDepth.toFixed(),
+              volume24h: policy.familyScouts.scoringWeights.volume24h.toFixed(),
+              uncertainty:
+                policy.familyScouts.scoringWeights.uncertainty.toFixed(),
+              exchangeRankQuality:
+                policy.familyScouts.scoringWeights.exchangeRankQuality.toFixed(),
+              cappedRecurrence:
+                policy.familyScouts.scoringWeights.cappedRecurrence.toFixed(),
+            },
           },
         }),
   };
@@ -327,6 +351,8 @@ function thawPolicy(
   value: z.infer<typeof FrozenPolicySchema>,
 ): AgentConfig["marketSelection"] {
   return {
+    opportunityBoardVariant:
+      value.opportunityBoardVariant ?? "RESOLVER_LAG_TREATMENT",
     maximumPromptMarkets: value.maximumPromptMarkets,
     minimumMinutesToClose: value.minimumMinutesToClose,
     maximumDaysToClose: value.maximumDaysToClose,
@@ -336,7 +362,29 @@ function thawPolicy(
     allowIfLiquidityOrVolumePasses: value.allowIfLiquidityOrVolumePasses,
     ...(value.familyScouts === undefined
       ? {}
-      : { familyScouts: { ...value.familyScouts } }),
+      : {
+          familyScouts: {
+            ...value.familyScouts,
+            scoringWeights: {
+              liquidityOrDepth: new Decimal(
+                value.familyScouts.scoringWeights?.liquidityOrDepth ?? "0.35",
+              ),
+              volume24h: new Decimal(
+                value.familyScouts.scoringWeights?.volume24h ?? "0.25",
+              ),
+              uncertainty: new Decimal(
+                value.familyScouts.scoringWeights?.uncertainty ?? "0.25",
+              ),
+              exchangeRankQuality: new Decimal(
+                value.familyScouts.scoringWeights?.exchangeRankQuality ??
+                  "0.10",
+              ),
+              cappedRecurrence: new Decimal(
+                value.familyScouts.scoringWeights?.cappedRecurrence ?? "0.05",
+              ),
+            },
+          },
+        }),
   };
 }
 

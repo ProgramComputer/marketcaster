@@ -60,7 +60,7 @@ export type OpportunityBoardVariant =
   "GENERALIST_CONTROL" | "RESOLVER_LAG_TREATMENT";
 
 export const DEFAULT_OPPORTUNITY_BOARD_VARIANT: OpportunityBoardVariant =
-  "RESOLVER_LAG_TREATMENT";
+  "GENERALIST_CONTROL";
 
 export const MAXIMUM_REQUIRED_PASSED_PRIORITY_MARKETS = 2;
 
@@ -1309,11 +1309,16 @@ export async function buildEnrichedOpportunityBoard(
         cappedRecurrence: Math.min(5, family.recurrenceInstanceCount) / 5,
       };
       const totalScore =
-        scoreComponents.liquidityOrDepth * 0.35 +
-        scoreComponents.volume24h * 0.25 +
-        scoreComponents.uncertainty * 0.25 +
-        scoreComponents.exchangeRankQuality * 0.1 +
-        scoreComponents.cappedRecurrence * 0.05;
+        scoreComponents.liquidityOrDepth *
+          scoutPolicy.scoringWeights.liquidityOrDepth.toNumber() +
+        scoreComponents.volume24h *
+          scoutPolicy.scoringWeights.volume24h.toNumber() +
+        scoreComponents.uncertainty *
+          scoutPolicy.scoringWeights.uncertainty.toNumber() +
+        scoreComponents.exchangeRankQuality *
+          scoutPolicy.scoringWeights.exchangeRankQuality.toNumber() +
+        scoreComponents.cappedRecurrence *
+          scoutPolicy.scoringWeights.cappedRecurrence.toNumber();
       const category = normalizedCategoryKey(market);
       return {
         market,

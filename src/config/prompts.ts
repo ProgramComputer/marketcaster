@@ -237,6 +237,11 @@ export interface PromptBundle {
   };
 }
 
+export interface PromptBundlePaths {
+  readonly directory?: string;
+  readonly decisionSystemPath?: string;
+}
+
 function parseJson(contents: string, fileName: string): unknown {
   try {
     return JSON.parse(contents) as unknown;
@@ -268,11 +273,16 @@ function validateUserTemplate(template: string): void {
 }
 
 export async function loadPromptBundle(
-  directory = resolve(process.cwd(), "config", "prompt", "decision", "v1"),
+  paths: PromptBundlePaths = {},
 ): Promise<PromptBundle> {
+  const directory =
+    paths.directory ??
+    resolve(process.cwd(), "config", "prompt", "decision", "reference");
+  const decisionSystemPath =
+    paths.decisionSystemPath ?? resolve(directory, "system.md");
   const [systemSource, userSource, toolsSource, messagesSource] =
     await Promise.all([
-      readFile(resolve(directory, "system.md"), "utf8"),
+      readFile(decisionSystemPath, "utf8"),
       readFile(resolve(directory, "user.md"), "utf8"),
       readFile(resolve(directory, "tools.json"), "utf8"),
       readFile(resolve(directory, "messages.json"), "utf8"),

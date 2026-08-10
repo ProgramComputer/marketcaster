@@ -3,8 +3,10 @@ import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { runCycle } from "./agent/cycle.js";
 import { parseRuntimeEnvironment, resolveRuntimeMode } from "./config/env.js";
-import { loadPromptBundle } from "./config/prompts.js";
-import { loadRepositoryConfig } from "./config/schema.js";
+import {
+  loadRuntimeConfiguration,
+  requestedReportDirectory,
+} from "./config/runtime-overrides.js";
 import type { ExchangeId } from "./domain/primitives.js";
 import { createExchange } from "./exchanges/factory.js";
 import {
@@ -70,15 +72,12 @@ export async function main(env = process.env): Promise<number> {
     stage: "initialization",
   });
   let journal: RunJournal | undefined;
-  let reportingDirectory = "reports";
+  let reportingDirectory = requestedReportDirectory(env);
   let accountScope: string | undefined;
 
   try {
     const environment = parseRuntimeEnvironment(env);
-    const [config, prompts] = await Promise.all([
-      loadRepositoryConfig(),
-      loadPromptBundle(),
-    ]);
+    const { config, prompts } = await loadRuntimeConfiguration(environment);
     reportingDirectory = config.reporting.directory;
     const exchange = createExchange(environment, config);
     accountScope = exchange.memoryScope;

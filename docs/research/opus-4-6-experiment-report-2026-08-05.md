@@ -47,13 +47,13 @@ https://www.predictionarena.ai/models/claude-opus-4-6?platform=polymarket
 Every nested panel was independently scrolled from beginning to actual bottom,
 with intermediate checks that its rows changed:
 
-| Panel | Inspected |
-| --- | ---: |
-| Current Market Beliefs | 36 cards: 34 beliefs and two plans |
-| Active Positions | 38 rows |
-| Recent Closed Trades | 20 rows |
-| Recent Trades | 50 rows |
-| Recent Settlement Components | 20 rows |
+| Panel                        |                          Inspected |
+| ---------------------------- | ---------------------------------: |
+| Current Market Beliefs       | 36 cards: 34 beliefs and two plans |
+| Active Positions             |                            38 rows |
+| Recent Closed Trades         |                            20 rows |
+| Recent Trades                |                            50 rows |
+| Recent Settlement Components |                            20 rows |
 
 No expansion, tab, pagination, or load-more control was present. Public JSON
 endpoints extended the sample to 943 actions and 477 settlement components.
@@ -295,14 +295,14 @@ Official references:
 
 ## Iteration results
 
-| Experiment | Hypothesis | Prospective result |
-| --- | --- | --- |
-| A: advisory operator memory | Useful lessons should survive without becoming trade evidence | Improved: two mutations committed with zero provenance issues versus two discarded mutations and three issues in baseline. No decision-quality conclusion yet. |
-| B: measurement-family lane | Short-horizon exact weather was being filtered out | Improved selection coverage: frozen replay moved treatment climate rows from zero measurement families to four; live run inspected NYC/LAX families. No order and no return conclusion. |
-| C: source/contract separation | Contract numbers were causing false external-evidence vetoes | Improved: verified current sources rose from zero to two and blocking issues fell to zero in the treatment run. It exposed a separate two-sided decision error. |
-| D: both-sides pass audit | A rejected named side could conceal opposite-side edge | Improved: audit rejected the LAX pass with 9.3174 cents estimated NO edge after fees. Repaired plan contained NYC and LAX NO targets. NYC IOC filled 12.3 at 0.40; post-fill reporting then exposed the fractional-activity schema bug. |
-| E: execution throughput | Fixing activity parsing, preview budget, and pass-gate scope would allow a full live cycle | Improved: LAX NO filled 8.3 at 0.29; account reconciliation succeeded; no ambiguity stop; ledger persisted and the run ended `SUCCESS`. |
-| F: conditional concentration | Higher ceilings would deploy more capital when caps bind | Inconclusive in the treatment cycle: $43.5683 capacity, $0 committed. Only about six LAX and 0.3 NYC contracts were visible within preview limits; the model held rather than chasing. Keep the higher ceilings, but depth—not caps—was binding. |
+| Experiment                    | Hypothesis                                                                                 | Prospective result                                                                                                                                                                                                                               |
+| ----------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A: advisory operator memory   | Useful lessons should survive without becoming trade evidence                              | Improved: two mutations committed with zero provenance issues versus two discarded mutations and three issues in baseline. No decision-quality conclusion yet.                                                                                   |
+| B: measurement-family lane    | Short-horizon exact weather was being filtered out                                         | Improved selection coverage: frozen replay moved treatment climate rows from zero measurement families to four; live run inspected NYC/LAX families. No order and no return conclusion.                                                          |
+| C: source/contract separation | Contract numbers were causing false external-evidence vetoes                               | Improved: verified current sources rose from zero to two and blocking issues fell to zero in the treatment run. It exposed a separate two-sided decision error.                                                                                  |
+| D: both-sides pass audit      | A rejected named side could conceal opposite-side edge                                     | Improved: audit rejected the LAX pass with 9.3174 cents estimated NO edge after fees. Repaired plan contained NYC and LAX NO targets. NYC IOC filled 12.3 at 0.40; post-fill reporting then exposed the fractional-activity schema bug.          |
+| E: execution throughput       | Fixing activity parsing, preview budget, and pass-gate scope would allow a full live cycle | Improved: LAX NO filled 8.3 at 0.29; account reconciliation succeeded; no ambiguity stop; ledger persisted and the run ended `SUCCESS`.                                                                                                          |
+| F: conditional concentration  | Higher ceilings would deploy more capital when caps bind                                   | Inconclusive in the treatment cycle: $43.5683 capacity, $0 committed. Only about six LAX and 0.3 NYC contracts were visible within preview limits; the model held rather than chasing. Keep the higher ceilings, but depth—not caps—was binding. |
 
 The D order result was known and durable despite its reporting failure: the IOC
 filled 12.0 and 0.3 NYC NO contracts at a 0.40 average, then expired. The

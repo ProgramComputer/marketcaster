@@ -18,13 +18,13 @@ The page's five independently scrollable panels were each scrolled slowly from
 their first row to their actual bottom, with intermediate stops confirming that
 the visible row indexes changed:
 
-| Panel | Rows/cards inspected | Scroll range |
-| --- | ---: | ---: |
-| Current Market Beliefs | 36 cards (34 beliefs and 2 plans) | 0-35 |
-| Active Positions | 38 | 0-37 |
-| Recent Closed Trades | 20 | 0-19 |
-| Recent Trades | 50 | 0-49 |
-| Recent Settlement Components | 20 | 0-19 |
+| Panel                        |              Rows/cards inspected | Scroll range |
+| ---------------------------- | --------------------------------: | -----------: |
+| Current Market Beliefs       | 36 cards (34 beliefs and 2 plans) |         0-35 |
+| Active Positions             |                                38 |         0-37 |
+| Recent Closed Trades         |                                20 |         0-19 |
+| Recent Trades                |                                50 |         0-49 |
+| Recent Settlement Components |                                20 |         0-19 |
 
 No row expanders, tabs, pagination, or load-more controls were present. The
 public JSON endpoints supplied the deeper history: 943 actions and 477

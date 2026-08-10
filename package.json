@@ -10,6 +10,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "check:overrides": "node scripts/check-runtime-overrides.mjs",
     "cycle": "node dist/src/index.js",
     "dev": "tsx src/index.ts",
     "experiment:market-selection": "node dist/src/experiments/market-selection.js",

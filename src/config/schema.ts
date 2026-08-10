@@ -75,6 +75,29 @@ const PassResearchConfigSchema = z
   })
   .strict();
 
+const FamilyScoutScoringWeightsSchema = z
+  .object({
+    liquidityOrDepth: FractionSchema,
+    volume24h: FractionSchema,
+    uncertainty: FractionSchema,
+    exchangeRankQuality: FractionSchema,
+    cappedRecurrence: FractionSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const total = value.liquidityOrDepth
+      .plus(value.volume24h)
+      .plus(value.uncertainty)
+      .plus(value.exchangeRankQuality)
+      .plus(value.cappedRecurrence);
+    if (!total.eq(1)) {
+      context.addIssue({
+        code: "custom",
+        message: "Family-scout scoring weights must sum to one",
+      });
+    }
+  });
+
 export const RepositoryConfigSchema = z
   .object({
     cycle: z
@@ -92,6 +115,10 @@ export const RepositoryConfigSchema = z
       .strict(),
     marketSelection: z
       .object({
+        opportunityBoardVariant: z.enum([
+          "GENERALIST_CONTROL",
+          "RESOLVER_LAG_TREATMENT",
+        ]),
         maximumPromptMarkets: PositiveIntegerSchema,
         minimumMinutesToClose: z.number().nonnegative(),
         maximumDaysToClose: z.number().positive(),
@@ -99,7 +126,9 @@ export const RepositoryConfigSchema = z
         minimumLiquidityUsd: NonNegativeDecimalSchema,
         minimumVolume24hUsd: NonNegativeDecimalSchema,
         allowIfLiquidityOrVolumePasses: z.boolean(),
-        familyScouts: FamilyScoutConfigSchema.optional(),
+        familyScouts: FamilyScoutConfigSchema.extend({
+          scoringWeights: FamilyScoutScoringWeightsSchema,
+        }).optional(),
       })
       .strict()
       .superRefine((value, context) => {
@@ -275,6 +304,13 @@ export async function loadRepositoryConfig(
   path = resolve(process.cwd(), "config", "default.json"),
 ): Promise<AgentConfig> {
   const contents = await readFile(path, "utf8");
-  const raw: unknown = JSON.parse(contents);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(contents) as unknown;
+  } catch (error) {
+    throw new Error(`Invalid JSON in configuration file ${path}`, {
+      cause: error,
+    });
+  }
   return RepositoryConfigSchema.parse(raw);
 }

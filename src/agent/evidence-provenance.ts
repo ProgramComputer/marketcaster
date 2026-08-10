@@ -1192,10 +1192,7 @@ export async function validateDecisionEvidence(input: {
     const sourceIssueEnd = issues.length;
     const hasRequiredCurrentDomains =
       currentDomains.size >= input.minimumIndependentSources;
-    if (
-      currentEvidenceRequired(item) &&
-      !hasRequiredCurrentDomains
-    ) {
+    if (currentEvidenceRequired(item) && !hasRequiredCurrentDomains) {
       issues.push({
         code: "INSUFFICIENT_CURRENT_DOMAINS",
         marketSlug: item.marketSlug,

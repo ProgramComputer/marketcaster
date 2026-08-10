@@ -1074,6 +1074,7 @@ export async function runCycle(
           },
           startedAt,
           signal,
+          dependencies.config.marketSelection.opportunityBoardVariant,
         );
         const marketSelectionSnapshot = freezeMarketSelectionSnapshot(
           catalog,
@@ -1268,8 +1269,7 @@ export async function runCycle(
           dependencies.config.risk.maximumCycleSpendFraction,
         maximumExecutionSpread: dependencies.config.risk.maximumExecutionSpread,
         kellyFraction: dependencies.config.risk.kellyFraction,
-        uncertaintyBoundWeight:
-          dependencies.config.risk.uncertaintyBoundWeight,
+        uncertaintyBoundWeight: dependencies.config.risk.uncertaintyBoundWeight,
         duplicateWindowMinutes: dependencies.config.risk.duplicateWindowMinutes,
         minimumIndependentSources:
           dependencies.config.risk.minimumIndependentSources,
@@ -1570,54 +1570,54 @@ export async function runCycle(
       );
       const [evidence, baseCoverage, freshTargetLive, passAudit] =
         await Promise.all([
-        validateDecisionEvidence({
-          decision: candidateDecision,
-          observedSources: researchTools.observedEvidenceSources,
-          marketsBySlug,
-          minimumIndependentSources:
-            dependencies.config.risk.minimumIndependentSources,
-          // Independently verified current sources authorize increases in
-          // exposure. Covered reductions remain fully audited, but a failed
-          // page fetch cannot trap an existing position; deterministic exit
-          // edge, spread, depth, quantity, and freshness guards still apply.
-          blockingTargetMarketSlugs: exposureIncreasingMarketSlugs,
-          now: now(),
-          signal,
-        }),
-        Promise.resolve(
-          validateDecisionCoverage({
+          validateDecisionEvidence({
             decision: candidateDecision,
-            snapshot: initialSnapshot,
-            qualifiedMarketSlugs: researchTools.qualifiedMarketSlugs,
-            seriouslyEvaluatedMarketSlugs:
-              researchTools.seriouslyEvaluatedMarketSlugs,
-            inspectedMarketSlugs: new Set([
-              ...visibleHeldSlugs,
-              ...researchTools.inspectedMarketSlugs,
-            ]),
-            requiredPrioritySignalMarketSlugs:
-              requiredPassedPriorityMarketSlugs,
+            observedSources: researchTools.observedEvidenceSources,
+            marketsBySlug,
+            minimumIndependentSources:
+              dependencies.config.risk.minimumIndependentSources,
+            // Independently verified current sources authorize increases in
+            // exposure. Covered reductions remain fully audited, but a failed
+            // page fetch cannot trap an existing position; deterministic exit
+            // edge, spread, depth, quantity, and freshness guards still apply.
+            blockingTargetMarketSlugs: exposureIncreasingMarketSlugs,
+            now: now(),
+            signal,
           }),
-        ),
-        refreshOfficialLiveProbabilities(
-          candidateDecision.portfolioTargets,
-          resolvedMarketDetailsBySlug,
-          now(),
-          signal,
-        ),
-        auditNoPositiveEdgePasses({
-          decision: candidateDecision,
-          marketsBySlug,
-          previewedMarketSlugs: researchTools.previewedMarketSlugs,
-          exchange: dependencies.exchange,
-          maximumExecutionSpread:
-            dependencies.config.risk.maximumExecutionSpread,
-          uncertaintyBoundWeight:
-            dependencies.config.risk.uncertaintyBoundWeight,
-          quoteCache: passEdgeQuoteCache,
-          signal,
-        }),
-      ]);
+          Promise.resolve(
+            validateDecisionCoverage({
+              decision: candidateDecision,
+              snapshot: initialSnapshot,
+              qualifiedMarketSlugs: researchTools.qualifiedMarketSlugs,
+              seriouslyEvaluatedMarketSlugs:
+                researchTools.seriouslyEvaluatedMarketSlugs,
+              inspectedMarketSlugs: new Set([
+                ...visibleHeldSlugs,
+                ...researchTools.inspectedMarketSlugs,
+              ]),
+              requiredPrioritySignalMarketSlugs:
+                requiredPassedPriorityMarketSlugs,
+            }),
+          ),
+          refreshOfficialLiveProbabilities(
+            candidateDecision.portfolioTargets,
+            resolvedMarketDetailsBySlug,
+            now(),
+            signal,
+          ),
+          auditNoPositiveEdgePasses({
+            decision: candidateDecision,
+            marketsBySlug,
+            previewedMarketSlugs: researchTools.previewedMarketSlugs,
+            exchange: dependencies.exchange,
+            maximumExecutionSpread:
+              dependencies.config.risk.maximumExecutionSpread,
+            uncertaintyBoundWeight:
+              dependencies.config.risk.uncertaintyBoundWeight,
+            quoteCache: passEdgeQuoteCache,
+            signal,
+          }),
+        ]);
       const liveCoverageIssues: DecisionCoverageReport["issues"][number][] = [];
       const heldMarketSlugs = new Set(
         initialSnapshot.positions.map((position) => position.marketSlug),
@@ -2144,15 +2144,15 @@ export async function runCycle(
             firstAcceptedMaximumSpend: "15.69428258",
             secondTargetRequestedRisk: "8.71938",
             secondAcceptedMaximumSpend: "1.74381312",
-            result: "The 20% cycle ceiling bound and resized the second target.",
+            result:
+              "The 20% cycle ceiling bound and resized the second target.",
           },
           treatment: {
             maximumPositionCostBasisFraction:
               dependencies.config.risk.maximumPositionCostBasisFraction.toFixed(),
             maximumCycleSpendFraction:
               dependencies.config.risk.maximumCycleSpendFraction.toFixed(),
-            kellyFraction:
-              dependencies.config.risk.kellyFraction.toFixed(),
+            kellyFraction: dependencies.config.risk.kellyFraction.toFixed(),
             uncertaintyBoundWeight:
               dependencies.config.risk.uncertaintyBoundWeight.toFixed(),
             maximumExecutionSpread:
