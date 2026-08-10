@@ -268,7 +268,7 @@ jobs:
           cache-dependency-path: engine/package-lock.json
 
       - name: Restore advisory agent state
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ${{ steps.paths.outputs.report-directory }}/memory
