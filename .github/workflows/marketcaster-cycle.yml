@@ -186,21 +186,21 @@ jobs:
 
     steps:
       - name: Check out deployment repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: deployment
           persist-credentials: false
 
       - name: Check out engine from caller
         if: ${{ inputs.engine_repository == '' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: engine
           persist-credentials: false
 
       - name: Check out public engine
         if: ${{ inputs.engine_repository != '' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.engine_repository }}
           ref: ${{ inputs.engine_ref }}
