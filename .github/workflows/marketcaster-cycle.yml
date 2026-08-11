@@ -188,7 +188,6 @@ jobs:
       - name: Check out deployment repository
         uses: actions/checkout@v4
         with:
-          path: deployment
           persist-credentials: false
 
       - name: Check out engine from caller
@@ -217,7 +216,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          deployment_root="$(realpath -m "$GITHUB_WORKSPACE/deployment")"
+          deployment_root="$(realpath -m "$GITHUB_WORKSPACE")"
 
           resolve_deployment_path() {
             local supplied="$1"
@@ -250,7 +249,7 @@ jobs:
           fi
 
           echo "MARKETCASTER_REPORT_DIR=$report_directory" >> "$GITHUB_ENV"
-          echo "report-directory=$report_directory" >> "$GITHUB_OUTPUT"
+          echo "report-directory=${REPORT_DIRECTORY_INPUT:-engine/reports}" >> "$GITHUB_OUTPUT"
 
           case "$TRADING_MODE" in
             observe|live) ;;
