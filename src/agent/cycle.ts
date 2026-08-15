@@ -1760,6 +1760,24 @@ export async function runCycle(
                   `Evidence ${issue.code} for ${issue.marketSlug}${issue.url === undefined ? "" : ` at ${issue.url}`}: ${issue.message}`,
               ),
             ];
+            const targetMarketSlugs = new Set(
+              candidateDecision.portfolioTargets.map(
+                (target) => target.marketSlug,
+              ),
+            );
+            const evidenceRepairMarketSlugs = new Set(
+              guards.evidence.issues.flatMap((issue) =>
+                targetMarketSlugs.has(issue.marketSlug)
+                  ? [issue.marketSlug]
+                  : [],
+              ),
+            );
+            const evidenceRepairInstructions = [
+              ...evidenceRepairMarketSlugs,
+            ].map(
+              (marketSlug) =>
+                `Evidence repair fallback for ${marketSlug}: either correct every cited source issue with exact provider-verifiable current excerpts, or remove this target and submit a PASS disposition using INSUFFICIENT_CURRENT_EVIDENCE with null probability fields, empty evidence, and no evidence bundle IDs. Do not label an evidence-blocked market NO_POSITIVE_EDGE.`,
+            );
             const guardFeedback =
               guardInstructions.length > 0
                 ? ({
@@ -1770,6 +1788,7 @@ export async function runCycle(
                       "Use only sources observed in this cycle. Current evidence needs an exact excerpt, correct event year, and a provider-verifiable publication/as-of date; do not copy a search result from another year.",
                       "Rejected-candidate evidence cannot authorize exposure. Do not spend repair rounds rescuing a source for a candidate you will not trade; omit that candidate.",
                       "For a held market, retain the target after decision-relevant inspection even when holding unchanged. Do not synthesize or paraphrase an exact excerpt.",
+                      ...evidenceRepairInstructions,
                       ...guardInstructions,
                     ],
                   } satisfies TerminalDecisionRepairFeedback)

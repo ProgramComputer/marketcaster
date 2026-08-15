@@ -83,8 +83,9 @@ Decision accounting
   every held position as a target. Include every seriously evaluated non-held
   candidate as either a target or a `candidateDispositions` pass.
 - Use `NO_POSITIVE_EDGE` only with a non-null probability triplet and supporting
-  evidence. Use `INSUFFICIENT_CURRENT_EVIDENCE` with null probabilities when a
-  defensible range cannot be established.
+  evidence. Use `INSUFFICIENT_CURRENT_EVIDENCE` with null probabilities when
+  required current evidence is unavailable or fails deterministic verification,
+  so a defensible authorization range cannot be established.
 - Evidence bundles may be shared only when the same independently relevant
   sources genuinely support multiple related targets.
 

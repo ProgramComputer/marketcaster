@@ -582,7 +582,7 @@ const AgentDecisionModelJsonSchemaWithDispositions = {
           reasonCode: {
             type: "string",
             description:
-              "NO_POSITIVE_EDGE requires all three probability fields and is valid only when the policy-adjusted authorization probability does not beat the latest executable price plus conservative per-contract fees. Cash preservation, an unrelated fully sized holding, or calling a trade subordinate does not make positive edge non-positive. Use the specific settlement, evidence, correlation, or market-structure reason when that constraint blocks entry. Use INSUFFICIENT_CURRENT_EVIDENCE only when a defensible probability triplet cannot be formed.",
+              "NO_POSITIVE_EDGE requires all three probability fields and is valid only when the policy-adjusted authorization probability does not beat the latest executable price plus conservative per-contract fees. Cash preservation, an unrelated fully sized holding, or calling a trade subordinate does not make positive edge non-positive. Use the specific settlement, evidence, correlation, or market-structure reason when that constraint blocks entry. Use INSUFFICIENT_CURRENT_EVIDENCE with null probability fields when required current evidence is unavailable or fails deterministic verification, so a defensible authorization range cannot be established.",
             enum: [
               "NO_POSITIVE_EDGE",
               "INSUFFICIENT_CURRENT_EVIDENCE",

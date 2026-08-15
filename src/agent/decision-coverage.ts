@@ -66,7 +66,13 @@ export function validateDecisionCoverage(input: {
 }): DecisionCoverageReport {
   const held = heldPositions(input.snapshot);
   const seriouslyEvaluated = [...input.seriouslyEvaluatedMarketSlugs];
-  const requiredPrioritySignals = [...input.requiredPrioritySignalMarketSlugs];
+  // Priority research may be waived when a separately grounded target adds new
+  // exposure. Only require a terminal disposition after the priority market
+  // was actually inspected so coverage cannot make a market both required and
+  // forbidden in the same decision.
+  const requiredPrioritySignals = [
+    ...input.requiredPrioritySignalMarketSlugs,
+  ].filter((slug) => input.inspectedMarketSlugs.has(slug));
   const requiredSlugs = new Set([
     ...held.map((position) => position.marketSlug),
     ...seriouslyEvaluated,
