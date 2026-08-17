@@ -1826,18 +1826,42 @@ export async function runCycle(
       rawDecision,
       overallController.signal,
     );
+    // A pass-edge contradiction challenges a non-ordering disposition. Keep it
+    // blocking throughout bounded model repair, then retain it as an audited
+    // advisory instead of letting that PASS veto unrelated valid targets.
+    const unresolvedPassEdgeIssues = finalGuards.coverage.issues.filter(
+      (issue) => issue.code === "CONTRADICTORY_NO_POSITIVE_EDGE",
+    );
+    const blockingCoverageIssues = finalGuards.coverage.issues.filter(
+      (issue) => issue.code !== "CONTRADICTORY_NO_POSITIVE_EDGE",
+    );
+    const authoritativeCoverage: DecisionCoverageReport = {
+      ...finalGuards.coverage,
+      valid: blockingCoverageIssues.length === 0,
+      issues: blockingCoverageIssues,
+    };
     evidenceValidation = finalGuards.evidence;
-    decisionCoverage = finalGuards.coverage;
+    decisionCoverage = authoritativeCoverage;
     mutationProvenance = finalGuards.mutationProvenance;
     passEdgeAudit = finalGuards.passEdgeAudit;
+    if (unresolvedPassEdgeIssues.length > 0) {
+      const unresolvedMarketSlugs = [
+        ...new Set(
+          unresolvedPassEdgeIssues.map((issue) => issue.marketSlug),
+        ),
+      ];
+      warnings.push(
+        `Kept ${unresolvedMarketSlugs.length} unresolved passed market${unresolvedMarketSlugs.length === 1 ? "" : "s"} non-ordering after bounded terminal repair; the unresolved dispositions did not authorize orders or block independently valid targets: ${unresolvedMarketSlugs.join(", ")}`,
+      );
+    }
     if (finalGuards.evidence.advisoryIssues.length > 0) {
       warnings.push(
         `Recorded ${finalGuards.evidence.advisoryIssues.length} non-blocking evidence issue${finalGuards.evidence.advisoryIssues.length === 1 ? "" : "s"} on non-ordering targets, rejected candidates, or unused bundles`,
       );
     }
-    if (!finalGuards.coverage.valid || !finalGuards.evidence.valid) {
+    if (!authoritativeCoverage.valid || !finalGuards.evidence.valid) {
       const reasons = [
-        ...finalGuards.coverage.issues.map(
+        ...authoritativeCoverage.issues.map(
           (issue) => `${issue.code}: ${issue.message}`,
         ),
         ...finalGuards.evidence.issues.map(
