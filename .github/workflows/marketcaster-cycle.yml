@@ -1,0 +1,321 @@
+name: MarketCaster cycle
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: Execution mode; scheduled deployment callers should pass live explicitly
+        type: string
+        required: false
+        default: observe
+      engine_repository:
+        description: Public engine repository for a cross-repository caller; blank checks out the caller
+        type: string
+        required: false
+        default: ""
+      engine_ref:
+        description: Engine branch, tag, or commit used with engine_repository
+        type: string
+        required: false
+        default: main
+      config_path:
+        description: Optional configuration path relative to the caller repository
+        type: string
+        required: false
+        default: ""
+      strategy_path:
+        description: Optional trusted policy module relative to the caller repository
+        type: string
+        required: false
+        default: ""
+      decision_prompt_path:
+        description: Optional decision system-prompt path relative to the caller repository
+        type: string
+        required: false
+        default: ""
+      report_directory:
+        description: Optional report root relative to the caller repository
+        type: string
+        required: false
+        default: ""
+      exchange_id:
+        description: Exchange identifier
+        type: string
+        required: false
+        default: polymarket-us
+      llm_provider:
+        description: Decision provider
+        type: string
+        required: false
+        default: openai
+      llm_base_url:
+        description: Optional trusted OpenAI-compatible API root
+        type: string
+        required: false
+        default: ""
+      llm_model:
+        description: Primary decision model
+        type: string
+        required: false
+        default: ""
+      llm_catalog_model:
+        description: Optional catalog-narrowing model
+        type: string
+        required: false
+        default: ""
+      kalshi_api_base_url:
+        description: Optional official Kalshi Trade API v2 root
+        type: string
+        required: false
+        default: ""
+      agent_memory_scope:
+        description: Optional stable non-secret account profile label
+        type: string
+        required: false
+        default: ""
+      upload_artifact:
+        description: Upload the report root when it is safe for the caller repository
+        type: boolean
+        required: false
+        default: true
+    secrets:
+      POLYMARKET_KEY_ID:
+        required: false
+      POLYMARKET_SECRET_KEY:
+        required: false
+      KALSHI_API_KEY_ID:
+        required: false
+      KALSHI_PRIVATE_KEY:
+        required: false
+      LLM_API_KEY:
+        required: true
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Execution mode
+        type: choice
+        required: true
+        default: observe
+        options:
+          - observe
+          - live
+      config_path:
+        description: Optional configuration path relative to this repository
+        type: string
+        required: false
+        default: ""
+      strategy_path:
+        description: Optional trusted policy module relative to the caller repository
+        type: string
+        required: false
+        default: ""
+      decision_prompt_path:
+        description: Optional decision system-prompt path relative to this repository
+        type: string
+        required: false
+        default: ""
+      report_directory:
+        description: Optional report root relative to this repository
+        type: string
+        required: false
+        default: ""
+      exchange_id:
+        description: Exchange identifier
+        type: choice
+        required: true
+        default: polymarket-us
+        options:
+          - polymarket-us
+          - kalshi
+      llm_provider:
+        description: Decision provider
+        type: choice
+        required: true
+        default: openai
+        options:
+          - openai
+          - anthropic
+      llm_base_url:
+        description: Optional trusted OpenAI-compatible API root
+        type: string
+        required: false
+        default: ""
+      llm_model:
+        description: Primary decision model; blank uses the repository variable
+        type: string
+        required: false
+        default: ""
+      llm_catalog_model:
+        description: Optional catalog-narrowing model
+        type: string
+        required: false
+        default: ""
+      kalshi_api_base_url:
+        description: Optional official Kalshi Trade API v2 root
+        type: string
+        required: false
+        default: ""
+      agent_memory_scope:
+        description: Optional stable non-secret account profile label
+        type: string
+        required: false
+        default: ""
+      upload_artifact:
+        description: Upload observe-mode reports
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: marketcaster-${{ github.repository }}-${{ inputs.exchange_id || 'polymarket-us' }}
+  cancel-in-progress: false
+
+jobs:
+  cycle:
+    # Account research, caches, logs, and reports belong to private deployments.
+    if: ${{ github.event.repository.private == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    env:
+      EXCHANGE_ID: ${{ inputs.exchange_id || vars.EXCHANGE_ID || 'polymarket-us' }}
+      LLM_PROVIDER: ${{ inputs.llm_provider || vars.LLM_PROVIDER || 'openai' }}
+      LLM_BASE_URL: ${{ inputs.llm_base_url || vars.LLM_BASE_URL }}
+      LLM_MODEL: ${{ inputs.llm_model || vars.LLM_MODEL }}
+      LLM_CATALOG_MODEL: ${{ inputs.llm_catalog_model || vars.LLM_CATALOG_MODEL }}
+      TRADING_MODE: ${{ inputs.mode || 'observe' }}
+      POLYMARKET_KEY_ID: ${{ secrets.POLYMARKET_KEY_ID }}
+      POLYMARKET_SECRET_KEY: ${{ secrets.POLYMARKET_SECRET_KEY }}
+      KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+      KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+      KALSHI_API_BASE_URL: ${{ inputs.kalshi_api_base_url || vars.KALSHI_API_BASE_URL }}
+      AGENT_MEMORY_SCOPE: ${{ inputs.agent_memory_scope || vars.AGENT_MEMORY_SCOPE }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+
+    steps:
+      - name: Check out deployment repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out engine from caller
+        if: ${{ inputs.engine_repository == '' }}
+        uses: actions/checkout@v4
+        with:
+          path: engine
+          persist-credentials: false
+
+      - name: Check out public engine
+        if: ${{ inputs.engine_repository != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.engine_repository }}
+          ref: ${{ inputs.engine_ref }}
+          path: engine
+          persist-credentials: false
+
+      - name: Resolve runtime paths
+        id: paths
+        shell: bash
+        env:
+          STRATEGY_PATH_INPUT: ${{ inputs.strategy_path }}
+          CONFIG_PATH_INPUT: ${{ inputs.config_path }}
+          DECISION_PROMPT_PATH_INPUT: ${{ inputs.decision_prompt_path }}
+          REPORT_DIRECTORY_INPUT: ${{ inputs.report_directory }}
+        run: |
+          set -euo pipefail
+
+          deployment_root="$(realpath -m "$GITHUB_WORKSPACE")"
+
+          resolve_deployment_path() {
+            local supplied="$1"
+            local label="$2"
+            local resolved
+            resolved="$(realpath -m "$deployment_root/$supplied")"
+            case "$resolved" in
+              "$deployment_root"/*) printf '%s' "$resolved" ;;
+              *)
+                echo "$label must remain inside the caller repository" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          if [[ -n "$CONFIG_PATH_INPUT" ]]; then
+            config_path="$(resolve_deployment_path "$CONFIG_PATH_INPUT" "config_path")"
+            echo "MARKETCASTER_CONFIG_PATH=$config_path" >> "$GITHUB_ENV"
+          fi
+
+          if [[ -n "$STRATEGY_PATH_INPUT" ]]; then
+            strategy_path="$(resolve_deployment_path "$STRATEGY_PATH_INPUT" "strategy_path")"
+            echo "MARKETCASTER_STRATEGY_PATH=$strategy_path" >> "$GITHUB_ENV"
+          fi
+
+          if [[ -n "$DECISION_PROMPT_PATH_INPUT" ]]; then
+            prompt_path="$(resolve_deployment_path "$DECISION_PROMPT_PATH_INPUT" "decision_prompt_path")"
+            echo "MARKETCASTER_DECISION_PROMPT_PATH=$prompt_path" >> "$GITHUB_ENV"
+          fi
+
+          if [[ -n "$REPORT_DIRECTORY_INPUT" ]]; then
+            report_directory="$(resolve_deployment_path "$REPORT_DIRECTORY_INPUT" "report_directory")"
+          else
+            report_directory="$(realpath -m "$GITHUB_WORKSPACE/engine/reports")"
+          fi
+
+          echo "MARKETCASTER_REPORT_DIR=$report_directory" >> "$GITHUB_ENV"
+          echo "report-directory=${REPORT_DIRECTORY_INPUT:-engine/reports}" >> "$GITHUB_OUTPUT"
+
+          case "$TRADING_MODE" in
+            observe|live) ;;
+            *)
+              echo "mode must be observe or live" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: engine/package-lock.json
+
+      - name: Restore advisory agent state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.paths.outputs.report-directory }}/memory
+            ${{ steps.paths.outputs.report-directory }}/advisory
+            ${{ steps.paths.outputs.report-directory }}/history
+            ${{ steps.paths.outputs.report-directory }}/execution-health
+          key: >-
+            agent-state-${{ runner.os }}-${{ inputs.exchange_id || vars.EXCHANGE_ID || 'polymarket-us' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            agent-state-${{ runner.os }}-${{ inputs.exchange_id || vars.EXCHANGE_ID || 'polymarket-us' }}-
+
+      - name: Install dependencies
+        working-directory: engine
+        run: npm ci
+
+      - name: Build
+        working-directory: engine
+        run: npm run build
+
+      - name: Run cycle
+        working-directory: engine
+        run: npm run cycle
+
+      - name: Upload cycle report
+        if: >-
+          ${{ !cancelled()
+              && inputs.upload_artifact
+              && github.event.repository.private == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cycle-${{ github.run_id }}
+          path: ${{ steps.paths.outputs.report-directory }}/
+          retention-days: 30
