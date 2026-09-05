@@ -1,0 +1,30 @@
+import type { AgentConfig } from "../config/schema.js";
+
+export type RiskPolicy = AgentConfig["risk"];
+
+export type RiskRejectionCode =
+  | "MARKET_NOT_RESEARCHED"
+  | "MARKET_NOT_FOUND"
+  | "MARKET_INACTIVE"
+  | "MARKET_CLOSED"
+  | "MARKET_CHANGED"
+  | "INVALID_MARKET_CONSTRAINTS"
+  | "MISSING_QUOTE"
+  | "CROSSED_BOOK"
+  | "SPREAD_TOO_WIDE"
+  | "PRICE_LIMIT_MISSING"
+  | "PRICE_LIMIT_EXCEEDED"
+  | "INVALID_PRICE"
+  | "INSUFFICIENT_SOURCES"
+  | "NON_POSITIVE_EDGE"
+  | "NO_POSITION"
+  | "SIDE_MISMATCH"
+  | "NAKED_SHORT"
+  | "MINIMUM_QUANTITY"
+  | "NO_DEPTH"
+  | "INSUFFICIENT_BUDGET"
+  | "BUYING_POWER"
+  | "CYCLE_SPEND"
+  | "CONCENTRATION"
+  | "INVALID_PROPOSAL"
+  | "EXCHANGE_ERROR";
