@@ -53,6 +53,44 @@ const result = allocateBatchBudget({
 assert.equal(result.committedSpend.toString(), "1.5");
 assert.equal(result.unallocatedSpend.toString(), "0.5");
 assert.equal(result.allocations[0].candidate, candidate);
+const contextualCandidate = {
+  ...candidate,
+  context: {
+    marketSlug: "synthetic",
+    side: "YES",
+    quoteObservedAt: "2026-01-01T00:00:00Z",
+    authorizationProbability: new Decimal("0.6"),
+    limitPrice: new Decimal("0.4"),
+  },
+};
+allocateBatchBudget({
+  ...input,
+  candidates: [contextualCandidate],
+  allocationPolicy: ({ candidates }) => {
+    assert.equal(candidates[0].context.marketSlug, "synthetic");
+    assert(Object.isFrozen(candidates[0].context));
+    assert.notEqual(
+      candidates[0].context.authorizationProbability,
+      contextualCandidate.context.authorizationProbability,
+    );
+    assert.throws(() => {
+      candidates[0].context.side = "NO";
+    });
+    return [{ id: candidate.id, spend: new Decimal(1) }];
+  },
+});
+assert.equal(contextualCandidate.context.side, "YES");
+assert.throws(() =>
+  allocateBatchBudget({
+    ...input,
+    candidates: [
+      {
+        ...contextualCandidate,
+        context: { ...contextualCandidate.context, limitPrice: new Decimal(2) },
+      },
+    ],
+  }),
+);
 for (const instructions of [
   [{ id: "unknown", spend: new Decimal(1) }],
   [{ id: candidate.id, spend: new Decimal("0.5") }],
@@ -99,6 +137,8 @@ try {
     },
     { ...strategy, executionCooldownMilliseconds: { NO_FILL: -1 } },
     { ...strategy, reconciliationTolerance: 7 },
+    { ...strategy, selectMemoryContext: 7 },
+    { ...strategy, resolutionReview: {} },
   ])
     assert.throws(() => assertStrategyPolicy(invalid));
   const requests = [{ marketSlug: "synthetic", side: "YES" }];

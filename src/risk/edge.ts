@@ -103,6 +103,23 @@ export function estimateExchangeTakerFeePerContract(
   return estimateExchangeTakerFee(exchangeId, new Decimal(1), price);
 }
 
+/**
+ * Selects the fee used to evaluate edge and Kelly sizing. Polymarket's local
+ * fee curve is evaluated at the same price as the trade economics; its larger
+ * fee-only reserve remains available separately for cash and spend guards.
+ * Other exchanges retain their conservative reserve because their fee terms
+ * can include quantity-sensitive rounding and exchange-specific schedules.
+ */
+export function feeForEdgeEvaluation(
+  exchangeId: string,
+  estimatedFeesAtEconomicPrice: Decimal,
+  conservativeFeeReserve: Decimal,
+): Decimal {
+  return exchangeId === "polymarket-us"
+    ? estimatedFeesAtEconomicPrice
+    : conservativeFeeReserve;
+}
+
 export function calculateNetEdge(
   estimatedProbability: Decimal,
   executablePrice: Decimal,

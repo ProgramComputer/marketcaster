@@ -63,6 +63,9 @@ export interface OpportunityBoardItem {
 export interface OpportunityScoutEnrichment {
   readonly market: Market;
   readonly bbo?: MarketBbo;
+  /** Optional for older policy callers; current engine enrichment always reports status. */
+  readonly quoteStatus?: "AVAILABLE" | "EMPTY" | "UNAVAILABLE";
+  readonly bookStatus?: "AVAILABLE" | "UNAVAILABLE" | "NOT_REQUESTED";
   readonly nearTouchTwoSidedDepth?: number;
   /** Ask-side price times quantity within the deployment's depth price band. */
   readonly yesNearTouchBuyNotionalUsd?: number;
@@ -109,9 +112,54 @@ export const selectionPolicyApi = Object.freeze({
   serializeDecimal,
   buildFamilyScout,
   MAXIMUM_SCOUT_FAMILIES,
+  isTradeableEnrichment,
 });
 
 export type SelectionPolicyApi = typeof selectionPolicyApi;
+
+/** A usable entry snapshot, independent of ranking or preferred market families. */
+export function isTradeableEnrichment(
+  result: OpportunityScoutEnrichment | undefined,
+  minimumNearTouchBuyNotionalUsd = 0,
+  maximumSpread?: number,
+): result is OpportunityScoutEnrichment {
+  if (
+    !Number.isFinite(minimumNearTouchBuyNotionalUsd) ||
+    minimumNearTouchBuyNotionalUsd < 0
+  ) {
+    throw new RangeError(
+      "Minimum buy notional must be finite and non-negative",
+    );
+  }
+  if (
+    maximumSpread !== undefined &&
+    (!Number.isFinite(maximumSpread) || maximumSpread < 0)
+  ) {
+    throw new RangeError("Maximum spread must be finite and non-negative");
+  }
+  if (result?.quoteStatus !== "AVAILABLE" || result.bookStatus !== "AVAILABLE")
+    return false;
+  return [
+    { quote: result.bbo?.yes, notional: result.yesNearTouchBuyNotionalUsd },
+    { quote: result.bbo?.no, notional: result.noNearTouchBuyNotionalUsd },
+  ].some(
+    ({ quote, notional }) =>
+      quote?.bid !== undefined &&
+      quote.ask !== undefined &&
+      quote.bid.isFinite() &&
+      quote.ask.isFinite() &&
+      quote.bid.gte(0) &&
+      quote.ask.gt(0) &&
+      quote.ask.lte(1) &&
+      quote.bid.lte(quote.ask) &&
+      (maximumSpread === undefined ||
+        quote.ask.minus(quote.bid).lte(maximumSpread)) &&
+      notional !== undefined &&
+      Number.isFinite(notional) &&
+      notional > 0 &&
+      notional >= minimumNearTouchBuyNotionalUsd,
+  );
+}
 
 export function eligibleForOpportunityBoard(
   market: Market,
@@ -273,12 +321,30 @@ export async function buildEnrichedOpportunityBoard(
     .flatMap(({ market, exchangeRank }) => {
       const result = results.get(market.slug);
       if (result === null) return [];
+      if (
+        policy.minimumNearTouchBuyNotionalUsd !== undefined &&
+        result === undefined
+      )
+        return [];
       const refreshed = result?.market ?? market;
       if (
         !eligibleForOpportunityBoard(refreshed, catalog.heldSlugs, policy, now)
       )
         return [];
       if (result !== undefined) {
+        const requiresTradeability =
+          result.quoteStatus !== undefined ||
+          result.bookStatus !== undefined ||
+          policy.minimumNearTouchBuyNotionalUsd !== undefined;
+        if (
+          requiresTradeability &&
+          !isTradeableEnrichment(
+            result,
+            policy.minimumNearTouchBuyNotionalUsd?.toNumber() ?? 0,
+            policy.maximumSpread.toNumber(),
+          )
+        )
+          return [];
         if (
           result.bbo?.yes.ask === undefined &&
           result.bbo?.no.ask === undefined
@@ -287,6 +353,7 @@ export async function buildEnrichedOpportunityBoard(
         const bid = result.bbo.yes.bid;
         const ask = result.bbo.yes.ask;
         if (
+          !requiresTradeability &&
           bid !== undefined &&
           ask !== undefined &&
           (ask.lt(bid) || ask.minus(bid).gt(policy.maximumSpread))

@@ -1,5 +1,16 @@
 import { Decimal } from "decimal.js";
 
+/** Assessed facts for deployment evaluation; these do not alter risk ceilings. */
+export interface BatchAllocationContext {
+  readonly marketSlug: string;
+  readonly side: "YES" | "NO";
+  readonly eventId?: string;
+  readonly closesAt?: string;
+  readonly quoteObservedAt: string;
+  readonly authorizationProbability: Decimal;
+  readonly limitPrice: Decimal;
+}
+
 /**
  * A proposal that has already passed market, evidence, edge, liquidity, and
  * per-position risk assessment. `maximumSpend` is the proposal's final
@@ -10,6 +21,7 @@ export interface BatchAllocationCandidate {
   readonly conservativeNetEdge: Decimal;
   readonly minimumSpend: Decimal;
   readonly maximumSpend: Decimal;
+  readonly context?: BatchAllocationContext;
 }
 
 export interface AllocateBatchBudgetInput<
@@ -74,6 +86,26 @@ function assertCandidate(
   inputIndex: number,
 ): void {
   const prefix = `candidates[${inputIndex}]`;
+  const context = candidate.context;
+  if (
+    context !== undefined &&
+    (typeof context.marketSlug !== "string" ||
+      context.marketSlug.length === 0 ||
+      !["YES", "NO"].includes(context.side) ||
+      !Number.isFinite(Date.parse(context.quoteObservedAt)) ||
+      (context.closesAt !== undefined &&
+        !Number.isFinite(Date.parse(context.closesAt))) ||
+      [context.authorizationProbability, context.limitPrice].some(
+        (value) =>
+          !Decimal.isDecimal(value) ||
+          !value.isFinite() ||
+          value.lt(0) ||
+          value.gt(1),
+      ))
+  )
+    throw new TypeError(
+      `${prefix}.context contains invalid assessed market facts`,
+    );
   if (candidate.id.length === 0) {
     throw new RangeError(`${prefix}.id must not be empty`);
   }
@@ -123,6 +155,25 @@ export function allocateBatchBudget<Candidate extends BatchAllocationCandidate>(
           conservativeNetEdge: new Decimal(candidate.conservativeNetEdge),
           minimumSpend: new Decimal(candidate.minimumSpend),
           maximumSpend: new Decimal(candidate.maximumSpend),
+          ...(candidate.context === undefined
+            ? {}
+            : {
+                context: Object.freeze({
+                  marketSlug: candidate.context.marketSlug,
+                  side: candidate.context.side,
+                  ...(candidate.context.eventId === undefined
+                    ? {}
+                    : { eventId: candidate.context.eventId }),
+                  ...(candidate.context.closesAt === undefined
+                    ? {}
+                    : { closesAt: candidate.context.closesAt }),
+                  quoteObservedAt: candidate.context.quoteObservedAt,
+                  authorizationProbability: new Decimal(
+                    candidate.context.authorizationProbability,
+                  ),
+                  limitPrice: new Decimal(candidate.context.limitPrice),
+                }),
+              }),
         }),
       ),
     }) ?? [];

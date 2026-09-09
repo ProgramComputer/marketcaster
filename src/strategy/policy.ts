@@ -18,12 +18,16 @@ import {
   type ExecutionFailureCode,
 } from "../execution/execution-health.js";
 import type { BatchAllocationPolicy } from "../risk/batch-allocation.js";
+import type { AgentBeliefContextSelector } from "../agent/agent-state.js";
+import type { ResolutionReviewPolicy } from "./resolution-review.js";
 
 /** Trusted deployment code supplies policy; the engine retains risk enforcement. */
 export interface StrategyPolicy {
   readonly apiVersion: 1;
   readonly selection: SelectionPolicy;
   readonly forecast?: ForecastPolicy;
+  readonly selectMemoryContext?: AgentBeliefContextSelector;
+  readonly resolutionReview?: ResolutionReviewPolicy;
   readonly allocation: BatchAllocationPolicy;
   readonly passAuditMinimumEdge: Decimal;
   readonly reconciliationTolerance?: (riskEquity: Decimal) => Decimal;
@@ -70,6 +74,17 @@ export function assertStrategyPolicy(
     throw new TypeError(
       "Strategy must implement the version 1 policy contract",
     );
+  if (
+    policy.selectMemoryContext !== undefined &&
+    typeof policy.selectMemoryContext !== "function"
+  )
+    throw new TypeError("Strategy memory context selector must be a function");
+  if (
+    policy.resolutionReview !== undefined &&
+    (typeof policy.resolutionReview.selectMarketSlugs !== "function" ||
+      typeof policy.resolutionReview.reviewTarget !== "function")
+  )
+    throw new TypeError("Strategy resolution review contract is invalid");
   if (
     policy.forecast !== undefined &&
     (typeof policy.forecast.systemLiveEvidenceSources !== "function" ||

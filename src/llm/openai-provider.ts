@@ -10,6 +10,8 @@ import {
   type DecisionToolResultTranscript,
   type FetchImplementation,
   fetchProviderResponse,
+  isTradePlanSchemaValidationError,
+  MAXIMUM_TRADE_PLAN_SCHEMA_CORRECTION_ATTEMPTS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS,
   resolveDecisionLimits,
@@ -276,19 +278,30 @@ export class OpenAIDecisionProvider implements DecisionProvider {
         let repairRounds = 0;
         let repairActive = false;
         let repairAttemptsOffered = 0;
+        let schemaCorrectionAttemptsOffered = 0;
+        let schemaCorrectionPending = false;
+        let schemaCorrectionFinalRound = false;
         let transcriptRound = 0;
         let catalogPhaseActive = this.catalogModelId !== undefined;
         let previousRequestModelId: string | undefined;
         while (
-          repairActive
+          schemaCorrectionPending ||
+          (repairActive
             ? repairRounds < MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS
-            : initialRounds < limits.maximumRounds
+            : initialRounds < limits.maximumRounds)
         ) {
-          const finalRound = repairActive
-            ? repairRounds === MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS - 1
-            : initialRounds === limits.maximumRounds - 1;
+          const schemaCorrectionRound = schemaCorrectionPending;
+          schemaCorrectionPending = false;
+          const finalRound: boolean = schemaCorrectionRound
+            ? schemaCorrectionFinalRound
+            : repairActive
+              ? repairRounds === MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS - 1
+              : initialRounds === limits.maximumRounds - 1;
           const useCatalogModel =
-            catalogPhaseActive && !repairActive && !finalRound;
+            catalogPhaseActive &&
+            !repairActive &&
+            !schemaCorrectionRound &&
+            !finalRound;
           const requestModelId = useCatalogModel
             ? (this.catalogModelId ?? this.modelId)
             : this.modelId;
@@ -302,18 +315,28 @@ export class OpenAIDecisionProvider implements DecisionProvider {
             conversationInput.push(...transferableInput);
           }
           previousRequestModelId = requestModelId;
-          if (repairActive) repairRounds += 1;
-          else initialRounds += 1;
+          if (!schemaCorrectionRound) {
+            if (repairActive) repairRounds += 1;
+            else initialRounds += 1;
+          }
           transcriptRound += 1;
-          const roundDefinitions =
-            input.researchTools.definitionsForRound(finalRound);
+          const roundDefinitions = input.researchTools.definitionsForRound(
+            finalRound || schemaCorrectionRound,
+          );
           const definitions = useCatalogModel
             ? definitionsForCatalogModel(roundDefinitions)
-            : roundDefinitions;
+            : schemaCorrectionRound
+              ? roundDefinitions.filter(
+                  (definition) => definition.name === "submit_trade_plan",
+                )
+              : roundDefinitions;
           const remainingWebSearches =
             limits.maximumWebSearches - serverWebSearchCount;
           const serverWebSearchEnabled =
-            !useCatalogModel && !finalRound && remainingWebSearches > 0;
+            !schemaCorrectionRound &&
+            !useCatalogModel &&
+            !finalRound &&
+            remainingWebSearches > 0;
           const providerTools: unknown[] = [
             ...(serverWebSearchEnabled ? [{ type: "web_search" }] : []),
             ...definitions
@@ -347,7 +370,9 @@ export class OpenAIDecisionProvider implements DecisionProvider {
                 instructions: input.prompt.system,
                 input: conversationInput,
                 tools: providerTools,
-                tool_choice: "required",
+                tool_choice: schemaCorrectionRound
+                  ? { type: "function", name: "submit_trade_plan" }
+                  : "required",
                 parallel_tool_calls: false,
                 ...(serverWebSearchEnabled
                   ? {
@@ -487,6 +512,15 @@ export class OpenAIDecisionProvider implements DecisionProvider {
             conversationInput.push(...parsedResponse.data.output);
             for (const call of calls) {
               try {
+                if (
+                  schemaCorrectionRound &&
+                  call.name !== "submit_trade_plan"
+                ) {
+                  throw new DecisionProviderError(
+                    "Schema correction permits only submit_trade_plan",
+                    "INVALID_RESPONSE",
+                  );
+                }
                 if (isPrimaryModelHandoffToolName(call.name)) {
                   catalogPhaseActive = false;
                   const result = {
@@ -561,6 +595,23 @@ export class OpenAIDecisionProvider implements DecisionProvider {
                     call_id: call.call_id,
                     output: result.content,
                   });
+                  if (
+                    call.name === "submit_trade_plan" &&
+                    isTradePlanSchemaValidationError(result)
+                  ) {
+                    if (
+                      schemaCorrectionAttemptsOffered >=
+                      MAXIMUM_TRADE_PLAN_SCHEMA_CORRECTION_ATTEMPTS
+                    ) {
+                      throw new DecisionProviderError(
+                        "OpenAI submitted a trade plan that failed schema validation after one correction attempt",
+                        "INVALID_DECISION",
+                      );
+                    }
+                    schemaCorrectionAttemptsOffered += 1;
+                    schemaCorrectionFinalRound = finalRound;
+                    schemaCorrectionPending = true;
+                  }
                 }
               } catch (error) {
                 if (error instanceof ResearchToolLimitError) {

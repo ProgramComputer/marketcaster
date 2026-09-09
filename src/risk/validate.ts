@@ -28,6 +28,7 @@ import {
   calculateNetEdge,
   estimateExchangeTakerFee,
   estimateExchangeTakerFeePerContract,
+  feeForEdgeEvaluation,
 } from "./edge.js";
 import { calculateKellyBudget } from "./kelly.js";
 import type { RiskPolicy, RiskRejectionCode } from "./policy.js";
@@ -881,13 +882,15 @@ async function assessOne(
     minimumFeeReserve,
     minimumEstimatedFee,
   );
-  const minimumFeePerContract = minimumConservativeFeeReserve.div(
-    market.minimumTradeQuantity,
-  );
+  const minimumLimitEdgeFeePerContract = feeForEdgeEvaluation(
+    input.exchange.id,
+    minimumEstimatedFee,
+    minimumConservativeFeeReserve,
+  ).div(market.minimumTradeQuantity);
   const conservativeLimitEdge = calculateNetEdge(
     authorizationProbability,
     limitPrice,
-    minimumFeePerContract,
+    minimumLimitEdgeFeePerContract,
   );
   if (conservativeLimitEdge.lte(0)) {
     reject(
@@ -895,11 +898,20 @@ async function assessOne(
       `Limit-price net edge ${conservativeLimitEdge.toFixed()} is not positive after conservative fees`,
     );
   }
+  const kellyPrice = executionPolicy === "GTD" ? limitPrice : quote.ask;
+  const minimumKellyEstimatedFee = estimateExchangeTakerFee(
+    input.exchange.id,
+    market.minimumTradeQuantity,
+    kellyPrice,
+  );
+  const minimumKellyFeePerContract = feeForEdgeEvaluation(
+    input.exchange.id,
+    minimumKellyEstimatedFee,
+    minimumConservativeFeeReserve,
+  ).div(market.minimumTradeQuantity);
   const kellyBudget = calculateKellyBudget(
     authorizationProbability,
-    (executionPolicy === "GTD" ? limitPrice : quote.ask).plus(
-      minimumFeePerContract,
-    ),
+    kellyPrice.plus(minimumKellyFeePerContract),
     riskEquity,
     input.policy.kellyFraction,
   );
@@ -940,12 +952,15 @@ async function assessOne(
     executionPolicy,
   );
   // Some exchange fee estimators are quantity-sensitive. Recompute absolute
-  // Kelly headroom at the actual conservative per-contract fee and shrink
-  // until the worst-price spend fits. This never increases a candidate.
+  // Kelly headroom at the applicable per-contract economic fee and shrink
+  // until the separately reserved worst-price spend fits. This never
+  // increases a candidate.
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    const sizedFeePerContract = maximumSized.conservativeFeeReserve.div(
-      maximumSized.quantity,
-    );
+    const sizedFeePerContract = feeForEdgeEvaluation(
+      input.exchange.id,
+      maximumSized.fees,
+      maximumSized.conservativeFeeReserve,
+    ).div(maximumSized.quantity);
     const sizedKellyBudget = calculateKellyBudget(
       authorizationProbability,
       (executionPolicy === "GTD" ? limitPrice : maximumSized.depth.vwap).plus(
@@ -980,9 +995,11 @@ async function assessOne(
       executionPolicy,
     );
   }
-  const feePerContract = maximumSized.conservativeFeeReserve.div(
-    maximumSized.quantity,
-  );
+  const feePerContract = feeForEdgeEvaluation(
+    input.exchange.id,
+    maximumSized.fees,
+    maximumSized.conservativeFeeReserve,
+  ).div(maximumSized.quantity);
   const finalKellyHeadroom = Decimal.max(
     0,
     calculateKellyBudget(
@@ -1027,6 +1044,17 @@ async function assessOne(
       conservativeNetEdge: netEdge,
       minimumSpend: minimumExecutionSpend,
       maximumSpend: maximumSized.maximumExecutionSpend,
+      context: {
+        marketSlug: market.slug,
+        side: proposal.side,
+        ...(market.eventId === undefined ? {} : { eventId: market.eventId }),
+        ...(market.closesAt === undefined
+          ? {}
+          : { closesAt: market.closesAt.toISOString() }),
+        quoteObservedAt: bbo.observedAt.toISOString(),
+        authorizationProbability,
+        limitPrice,
+      },
       proposalIndex,
       proposal,
       authorizationProbability,
@@ -1061,7 +1089,11 @@ function finalizeBuy(
         candidate.feeReserveForQuantity,
         candidate.executionPolicy,
       );
-  const feePerContract = sized.conservativeFeeReserve.div(sized.quantity);
+  const feePerContract = feeForEdgeEvaluation(
+    candidate.market.id.exchange,
+    sized.fees,
+    sized.conservativeFeeReserve,
+  ).div(sized.quantity);
   const netEdge = calculateNetEdge(
     candidate.authorizationProbability,
     candidate.executionPolicy === "GTD"

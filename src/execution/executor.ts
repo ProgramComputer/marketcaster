@@ -10,6 +10,10 @@ import {
   type PredictionExchange,
 } from "../exchanges/exchange.js";
 import { reconstructAccount } from "../portfolio/reconstruct.js";
+import {
+  estimateExchangeTakerFee,
+  feeForEdgeEvaluation,
+} from "../risk/edge.js";
 import type { RiskPolicy } from "../risk/policy.js";
 import type {
   ManagedRestingBuyOrdersPolicy,
@@ -327,12 +331,16 @@ function assertPreviewSafe(
   }
   // A preview may omit principal or report lower fees than deterministic
   // validation reserved. Neither may reduce the already-approved worst case.
-  const principal =
+  const economicPrincipal = previewPrincipal ?? limitPrincipal;
+  const reservedPrincipal =
     proposal.proposal.action === "BUY"
-      ? Decimal.max(limitPrincipal, previewPrincipal ?? 0)
-      : (previewPrincipal ?? limitPrincipal);
-  const fees = Decimal.max(previewFees, proposal.conservativeFeeReserve);
-  const totalCost = principal.plus(fees);
+      ? Decimal.max(limitPrincipal, economicPrincipal)
+      : economicPrincipal;
+  const reservedFees = Decimal.max(
+    previewFees,
+    proposal.conservativeFeeReserve,
+  );
+  const totalCost = reservedPrincipal.plus(reservedFees);
   if (proposal.proposal.action === "BUY") {
     const validatedMaximumExecutionSpend = limitPrincipal.plus(
       proposal.conservativeFeeReserve,
@@ -350,8 +358,25 @@ function assertPreviewSafe(
     if (totalCost.gt(availableBuyingPower)) {
       throw new SafetyGuardError("Preview cost exceeds fresh buying power");
     }
-    const previewPrice = principal.div(proposal.order.quantity);
-    const feePerContract = fees.div(proposal.order.quantity);
+    const previewPrice = economicPrincipal.div(proposal.order.quantity);
+    if (previewPrice.lt(0) || previewPrice.gt(1)) {
+      throw new SafetyGuardError(
+        "Authoritative preview returned an invalid effective price",
+      );
+    }
+    const edgeFees = feeForEdgeEvaluation(
+      proposal.market.id.exchange,
+      Decimal.max(
+        previewFees,
+        estimateExchangeTakerFee(
+          proposal.market.id.exchange,
+          proposal.order.quantity,
+          previewPrice,
+        ),
+      ),
+      reservedFees,
+    );
+    const feePerContract = edgeFees.div(proposal.order.quantity);
     const netEdge = proposal.authorizationProbability
       .minus(previewPrice)
       .minus(feePerContract);
@@ -360,8 +385,31 @@ function assertPreviewSafe(
         "Authoritative preview price and fees do not leave positive net edge",
       );
     }
+    const limitEdgeFees = feeForEdgeEvaluation(
+      proposal.market.id.exchange,
+      Decimal.max(
+        previewFees,
+        estimateExchangeTakerFee(
+          proposal.market.id.exchange,
+          proposal.order.quantity,
+          proposal.order.canonicalLimitPrice,
+        ),
+      ),
+      reservedFees,
+    );
+    const limitNetEdge = proposal.authorizationProbability
+      .minus(proposal.order.canonicalLimitPrice)
+      .minus(limitEdgeFees.div(proposal.order.quantity));
+    if (limitNetEdge.lte(0)) {
+      throw new SafetyGuardError(
+        "Validated limit price and fees no longer leave positive net edge",
+      );
+    }
   }
-  if (proposal.proposal.action === "SELL" && fees.gte(principal)) {
+  if (
+    proposal.proposal.action === "SELL" &&
+    reservedFees.gte(economicPrincipal)
+  ) {
     throw new SafetyGuardError(
       "Preview fees would consume all conservative exit proceeds",
     );
@@ -371,7 +419,8 @@ function assertPreviewSafe(
       "Preview returned unexpected collateral requirements",
     );
   }
-  const cycleSpend = proposal.proposal.action === "BUY" ? totalCost : fees;
+  const cycleSpend =
+    proposal.proposal.action === "BUY" ? totalCost : reservedFees;
   if (cycleSpend.gt(remainingCycleSpend)) {
     throw new SafetyGuardError(
       "Authoritative preview spend exceeds remaining cycle spend headroom",

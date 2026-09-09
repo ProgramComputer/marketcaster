@@ -112,6 +112,17 @@ export type TerminalDecisionReview =
 
 export const MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS = 8;
 export const MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS = 3;
+export const MAXIMUM_TRADE_PLAN_SCHEMA_CORRECTION_ATTEMPTS = 1;
+
+export function isTradePlanSchemaValidationError(
+  result: ToolExecutionResult,
+): boolean {
+  return (
+    result.kind === "TOOL_RESULT" &&
+    result.isError &&
+    result.errorCode === "INVALID_TRADE_PLAN_INPUT"
+  );
+}
 
 export interface DecisionToolCallTranscript {
   readonly callId: string;

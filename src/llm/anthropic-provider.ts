@@ -12,6 +12,8 @@ import {
   type DecisionToolResultTranscript,
   type FetchImplementation,
   fetchProviderResponse,
+  isTradePlanSchemaValidationError,
+  MAXIMUM_TRADE_PLAN_SCHEMA_CORRECTION_ATTEMPTS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS,
   resolveDecisionLimits,
@@ -361,26 +363,37 @@ export class AnthropicDecisionProvider implements DecisionProvider {
         let repairRounds = 0;
         let repairActive = false;
         let repairAttemptsOffered = 0;
+        let schemaCorrectionAttemptsOffered = 0;
+        let schemaCorrectionPending = false;
+        let schemaCorrectionFinalRound = false;
         let transcriptRound = 0;
         let previousInputTokens: number | undefined;
         let diagnosticsPreviousMessageId = this.#previousMessageId;
         let catalogPhaseActive = this.catalogModelId !== undefined;
         let previousRequestModelId: string | undefined;
         while (
-          repairActive
+          schemaCorrectionPending ||
+          (repairActive
             ? repairRounds < MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS
-            : initialRounds < limits.maximumRounds
+            : initialRounds < limits.maximumRounds)
         ) {
+          const schemaCorrectionRound = schemaCorrectionPending;
+          schemaCorrectionPending = false;
           const contextPressure =
             previousInputTokens !== undefined &&
             previousInputTokens >= ANTHROPIC_CONTEXT_PRESSURE_INPUT_TOKENS;
-          const finalRound =
+          const finalRound: boolean =
             contextPressure ||
-            (repairActive
-              ? repairRounds === MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS - 1
-              : initialRounds === limits.maximumRounds - 1);
+            (schemaCorrectionRound
+              ? schemaCorrectionFinalRound
+              : repairActive
+                ? repairRounds === MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS - 1
+                : initialRounds === limits.maximumRounds - 1);
           const useCatalogModel =
-            catalogPhaseActive && !repairActive && !finalRound;
+            catalogPhaseActive &&
+            !repairActive &&
+            !schemaCorrectionRound &&
+            !finalRound;
           const requestModelId = useCatalogModel
             ? (this.catalogModelId ?? this.modelId)
             : this.modelId;
@@ -396,17 +409,25 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             previousInputTokens = undefined;
           }
           previousRequestModelId = requestModelId;
-          if (repairActive) repairRounds += 1;
-          else initialRounds += 1;
+          if (!schemaCorrectionRound) {
+            if (repairActive) repairRounds += 1;
+            else initialRounds += 1;
+          }
           transcriptRound += 1;
-          const roundDefinitions =
-            input.researchTools.definitionsForRound(finalRound);
+          const roundDefinitions = input.researchTools.definitionsForRound(
+            finalRound || schemaCorrectionRound,
+          );
           const definitions = useCatalogModel
             ? definitionsForCatalogModel(roundDefinitions)
-            : roundDefinitions;
+            : schemaCorrectionRound
+              ? roundDefinitions.filter(
+                  (definition) => definition.name === "submit_trade_plan",
+                )
+              : roundDefinitions;
           const remainingServerWebSearches =
             limits.maximumWebSearches - serverWebSearchCount;
           const useServerWebSearch =
+            !schemaCorrectionRound &&
             !useCatalogModel &&
             !input.researchTools.hasClientWebSearchHandler &&
             limits.maximumWebSearches > 0;
@@ -439,9 +460,10 @@ export class AnthropicDecisionProvider implements DecisionProvider {
           if (finalProviderTool !== undefined) {
             finalProviderTool.cache_control = ANTHROPIC_STABLE_CACHE_CONTROL;
           }
-          const toolChoice = finalRound
-            ? { type: "tool", name: "submit_trade_plan" }
-            : { type: "any" };
+          const toolChoice =
+            finalRound || schemaCorrectionRound
+              ? { type: "tool", name: "submit_trade_plan" }
+              : { type: "any" };
           const comparedMessageId = diagnosticsPreviousMessageId;
           const providerRequest = await fetchProviderResponse({
             providerName: "Anthropic",
@@ -616,6 +638,15 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             });
             for (const call of calls) {
               try {
+                if (
+                  schemaCorrectionRound &&
+                  call.name !== "submit_trade_plan"
+                ) {
+                  throw new DecisionProviderError(
+                    "Schema correction permits only submit_trade_plan",
+                    "INVALID_RESPONSE",
+                  );
+                }
                 if (isPrimaryModelHandoffToolName(call.name)) {
                   catalogPhaseActive = false;
                   const result = {
@@ -681,6 +712,23 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                     content: result.content,
                     is_error: result.isError,
                   });
+                  if (
+                    call.name === "submit_trade_plan" &&
+                    isTradePlanSchemaValidationError(result)
+                  ) {
+                    if (
+                      schemaCorrectionAttemptsOffered >=
+                      MAXIMUM_TRADE_PLAN_SCHEMA_CORRECTION_ATTEMPTS
+                    ) {
+                      throw new DecisionProviderError(
+                        "Anthropic submitted a trade plan that failed schema validation after one correction attempt",
+                        "INVALID_DECISION",
+                      );
+                    }
+                    schemaCorrectionAttemptsOffered += 1;
+                    schemaCorrectionFinalRound = finalRound;
+                    schemaCorrectionPending = true;
+                  }
                 }
               } catch (error) {
                 if (error instanceof ResearchToolLimitError) {

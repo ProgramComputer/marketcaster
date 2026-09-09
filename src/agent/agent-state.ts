@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import { redactPotentialSecrets } from "../utilities/redaction.js";
+import type { StagedMutationValidator } from "./persistence-transaction.js";
 
 export const AGENT_BELIEF_TYPES = [
   "EVENT_ANALYSIS",
@@ -26,7 +27,15 @@ interface EvidenceReferences {
   readonly basisMarketSlugs?: readonly string[] | undefined;
 }
 
-interface BeliefLifecycle {
+export interface BeliefThesisMetadata {
+  /** Deployment-owned stable identity; no market-selection semantics. */
+  readonly thesisId?: string | undefined;
+  readonly familyKey?: string | undefined;
+  /** An estimate for YES, never an authoritative resolution status. */
+  readonly forecastYesProbability?: number | null | undefined;
+}
+
+interface BeliefLifecycle extends BeliefThesisMetadata {
   /** Omitted status preserves the behavior of existing active beliefs. */
   readonly status?: AgentBeliefStatus | undefined;
   readonly supersedesBeliefId?: string | null | undefined;
@@ -131,12 +140,29 @@ export interface AgentStateOperationResult {
 
 export interface AgentState {
   readonly persistent: boolean;
-  load(): Promise<AgentStateContext>;
+  load(input?: AgentBeliefContextScope): Promise<AgentStateContext>;
+  /** Full bounded snapshot for private reporting, never model context. */
+  loadAudit?(): Promise<AgentStateContext>;
   manage(
     operation: AgentStateOperation,
     signal?: AbortSignal,
+    beforePersist?: StagedMutationValidator,
   ): Promise<AgentStateOperationResult>;
 }
+
+export interface AgentBeliefContextScope {
+  readonly marketSlugs?: readonly string[];
+  readonly heldMarketSlugs?: readonly string[];
+}
+
+/** Return distinct IDs from the supplied active beliefs, in context order. */
+export type AgentBeliefContextSelector = (input: {
+  readonly beliefs: readonly AgentBelief[];
+  readonly marketSlugs: readonly string[];
+  readonly heldMarketSlugs: readonly string[];
+  readonly now: string;
+  readonly maximumBeliefs: number;
+}) => readonly string[];
 
 const STATELESS_CONTEXT: AgentStateContext = Object.freeze({
   mode: "STATELESS",
@@ -170,6 +196,9 @@ const EvidenceReferenceFields = {
   basisMarketSlugs: z.array(NonEmptyStringSchema).optional(),
 };
 const BeliefLifecycleFields = {
+  thesisId: z.string().trim().min(1).max(200).optional(),
+  familyKey: z.string().trim().min(1).max(300).optional(),
+  forecastYesProbability: z.number().min(0).max(1).nullable().optional(),
   status: z.enum(AGENT_BELIEF_STATUSES).optional(),
   supersedesBeliefId: z.uuid().nullable().optional(),
   expiresAt: TimestampSchema.nullable().optional(),
@@ -297,6 +326,7 @@ interface SnapshotRead {
 
 export interface FileAgentStateOptions {
   readonly filePath: string;
+  readonly selectContextBeliefs?: AgentBeliefContextSelector;
   readonly maximumBeliefs?: number;
   readonly maximumContextBeliefs?: number;
   readonly maximumBeliefCharacters?: number;
@@ -327,6 +357,7 @@ function emptySnapshot(): AgentStateSnapshot {
 
 export class FileAgentState implements AgentState {
   public readonly persistent = true as const;
+  private readonly selectContextBeliefs: AgentBeliefContextSelector | undefined;
   private readonly filePath: string;
   private readonly maximumBeliefs: number;
   private readonly maximumContextBeliefs: number;
@@ -342,6 +373,7 @@ export class FileAgentState implements AgentState {
 
   public constructor(options: FileAgentStateOptions) {
     this.filePath = resolve(options.filePath);
+    this.selectContextBeliefs = options.selectContextBeliefs;
     this.maximumBeliefs = positiveInteger(
       options.maximumBeliefs ?? 100,
       "maximumBeliefs",
@@ -459,6 +491,17 @@ export class FileAgentState implements AgentState {
 
   private normalizeLifecycle(value: BeliefLifecycle): BeliefLifecycle {
     return {
+      ...(value.thesisId === undefined
+        ? {}
+        : { thesisId: this.normalizeText(value.thesisId, "Thesis ID", 200) }),
+      ...(value.familyKey === undefined
+        ? {}
+        : {
+            familyKey: this.normalizeText(value.familyKey, "Family key", 300),
+          }),
+      ...(value.forecastYesProbability === undefined
+        ? {}
+        : { forecastYesProbability: value.forecastYesProbability }),
       ...(value.status === undefined ? {} : { status: value.status }),
       ...(value.supersedesBeliefId === undefined
         ? {}
@@ -654,7 +697,10 @@ export class FileAgentState implements AgentState {
     });
   }
 
-  private context(snapshot: AgentStateSnapshot): AgentStateContext {
+  private context(
+    snapshot: AgentStateSnapshot,
+    scope: AgentBeliefContextScope = {},
+  ): AgentStateContext {
     // Keep corrections and expired entries in LIST/storage for auditability.
     // Expiring a correction never revives the belief it replaced.
     const supersededIds = new Set(
@@ -669,7 +715,36 @@ export class FileAgentState implements AgentState {
         !supersededIds.has(belief.id) &&
         (belief.expiresAt == null || Date.parse(belief.expiresAt) > now),
     );
-    const beliefs = activeBeliefs.slice(0, this.maximumContextBeliefs);
+    let selectedBeliefs = activeBeliefs;
+    if (this.selectContextBeliefs !== undefined) {
+      const byId = new Map(activeBeliefs.map((belief) => [belief.id, belief]));
+      const ids = this.selectContextBeliefs({
+        beliefs: structuredClone(activeBeliefs),
+        marketSlugs: [...(scope.marketSlugs ?? [])],
+        heldMarketSlugs: [...(scope.heldMarketSlugs ?? [])],
+        now: new Date(now).toISOString(),
+        maximumBeliefs: this.maximumContextBeliefs,
+      });
+      if (
+        !Array.isArray(ids) ||
+        ids.length > this.maximumContextBeliefs ||
+        new Set(ids).size !== ids.length ||
+        (ids as readonly unknown[]).some(
+          (id) => typeof id !== "string" || !byId.has(id),
+        )
+      ) {
+        throw new TypeError(
+          "Memory context policy must return distinct active belief IDs within the context limit",
+        );
+      }
+      selectedBeliefs = (ids as readonly string[]).map((id) => {
+        const belief = byId.get(id);
+        if (belief === undefined)
+          throw new TypeError("Unknown selected belief ID");
+        return belief;
+      });
+    }
+    const beliefs = selectedBeliefs.slice(0, this.maximumContextBeliefs);
     return {
       mode: "PERSISTENT",
       beliefs,
@@ -737,6 +812,9 @@ export class FileAgentState implements AgentState {
       "supersedesBeliefId",
       "expiresAt",
       "reviewAt",
+      "thesisId",
+      "familyKey",
+      "forecastYesProbability",
     ];
     if (!updateFields.some((field) => operation[field] !== undefined)) {
       throw new Error("UPDATE_BELIEF requires at least one changed field");
@@ -823,13 +901,36 @@ export class FileAgentState implements AgentState {
     return plan;
   }
 
-  public load(): Promise<AgentStateContext> {
+  public load(scope?: AgentBeliefContextScope): Promise<AgentStateContext> {
     const result = this.mutationQueue.then(async () => {
       const read = await this.readSnapshot();
       if (read.exists && read.normalized) {
         await this.writeSnapshot(read.snapshot);
       }
-      return this.context(read.snapshot);
+      return this.context(read.snapshot, scope);
+    });
+    this.mutationQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  public loadAudit(): Promise<AgentStateContext> {
+    const result = this.mutationQueue.then(async () => {
+      const { snapshot } = await this.readSnapshot();
+      return {
+        mode: "PERSISTENT" as const,
+        beliefs: this.sortedBeliefs(snapshot),
+        nextCyclePlan: snapshot.nextCyclePlan,
+        longTermPlan: snapshot.longTermPlan,
+        totalBeliefCount: snapshot.beliefs.length,
+        truncated: false,
+        maximumBeliefs: this.maximumBeliefs,
+        maximumContextBeliefs: this.maximumContextBeliefs,
+        maximumBeliefCharacters: this.maximumBeliefCharacters,
+        maximumPlanCharacters: this.maximumPlanCharacters,
+      };
     });
     this.mutationQueue = result.then(
       () => undefined,
@@ -841,6 +942,7 @@ export class FileAgentState implements AgentState {
   public manage(
     operation: AgentStateOperation,
     signal?: AbortSignal,
+    beforePersist?: StagedMutationValidator,
   ): Promise<AgentStateOperationResult> {
     const result = this.mutationQueue.then(async () => {
       signal?.throwIfAborted();
@@ -932,6 +1034,33 @@ export class FileAgentState implements AgentState {
         };
       }
       const normalized = this.normalizeSnapshot(snapshot);
+      const effectiveBelief = normalized.beliefs.find(
+        (belief) => belief.id === mutatedBeliefId,
+      );
+      const effective =
+        parsed.action === "SET_NEXT_CYCLE_PLAN"
+          ? normalized.nextCyclePlan
+          : parsed.action === "SET_LONG_TERM_PLAN"
+            ? normalized.longTermPlan
+            : effectiveBelief;
+      beforePersist?.({
+        kind:
+          parsed.action === "DELETE_BELIEF" ||
+          parsed.action === "CLEAR_NEXT_CYCLE_PLAN"
+            ? "DESTRUCTIVE"
+            : effectiveBelief === undefined
+              ? "PLAN"
+              : "BELIEF",
+        action: parsed.action,
+        identity:
+          mutatedBeliefId === undefined
+            ? parsed.action === "SET_LONG_TERM_PLAN"
+              ? "PLAN:LONG_TERM"
+              : "PLAN:NEXT_CYCLE"
+            : `BELIEF:${mutatedBeliefId}`,
+        evidenceUrls: effective?.evidenceUrls ?? [],
+        basisMarketSlugs: effective?.basisMarketSlugs ?? [],
+      });
       await this.writeSnapshot(normalized, signal);
       return this.operationResult(
         parsed.action,
