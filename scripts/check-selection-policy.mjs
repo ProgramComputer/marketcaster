@@ -8,6 +8,7 @@ import {
   buildOpportunityBoard,
   buildEnrichedOpportunityBoard,
   referenceSelectionPolicy,
+  isTradeableEnrichment,
 } from "../dist/src/agent/opportunity-board.js";
 import { buildFamilyScout } from "../dist/src/agent/family-scout.js";
 import {
@@ -118,6 +119,111 @@ const mismatch = await buildEnrichedOpportunityBoard(
 assert.deepEqual(
   mismatch.map((row) => row.slug),
   ["synthetic-2", "synthetic-1", "synthetic-0"],
+);
+const executable = {
+  market: markets[0],
+  quoteStatus: "AVAILABLE",
+  bookStatus: "AVAILABLE",
+  bbo: { yes: { bid: new Decimal("0.4"), ask: new Decimal("0.41") }, no: {} },
+  yesNearTouchBuyNotionalUsd: 2,
+};
+assert.equal(isTradeableEnrichment(executable, 2), true);
+assert.equal(isTradeableEnrichment(executable, 2.01), false);
+assert.equal(isTradeableEnrichment(executable, 2, 0.01), true);
+assert.equal(isTradeableEnrichment(executable, 2, 0.009), false);
+for (const invalid of [-1, Number.NaN, Number.POSITIVE_INFINITY])
+  assert.throws(
+    () => isTradeableEnrichment(executable, 2, invalid),
+    RangeError,
+  );
+const narrowQuote = { bid: new Decimal("0.4"), ask: new Decimal("0.41") };
+const wideQuote = { bid: new Decimal("0.4"), ask: new Decimal("0.6") };
+for (const [snapshot, expected] of [
+  [
+    {
+      bbo: { yes: {}, no: wideQuote },
+      yesNearTouchBuyNotionalUsd: 0,
+      noNearTouchBuyNotionalUsd: 2,
+    },
+    false,
+  ],
+  [
+    {
+      bbo: { yes: wideQuote, no: narrowQuote },
+      yesNearTouchBuyNotionalUsd: 2,
+      noNearTouchBuyNotionalUsd: 0,
+    },
+    false,
+  ],
+  [
+    {
+      bbo: { yes: narrowQuote, no: wideQuote },
+      yesNearTouchBuyNotionalUsd: 0,
+      noNearTouchBuyNotionalUsd: 2,
+    },
+    false,
+  ],
+  [
+    {
+      bbo: { yes: {}, no: narrowQuote },
+      yesNearTouchBuyNotionalUsd: 0,
+      noNearTouchBuyNotionalUsd: 2,
+    },
+    true,
+  ],
+  [
+    {
+      bbo: { yes: wideQuote, no: narrowQuote },
+      yesNearTouchBuyNotionalUsd: 2,
+      noNearTouchBuyNotionalUsd: 2,
+    },
+    true,
+  ],
+]) {
+  const snapshotResult = { ...executable, ...snapshot };
+  assert.equal(isTradeableEnrichment(snapshotResult, 2, 0.05), expected);
+  const snapshotBoard = await buildEnrichedOpportunityBoard(
+    catalog,
+    { ...enrichedConfig, minimumNearTouchBuyNotionalUsd: new Decimal(2) },
+    async (slug) => ({ ...snapshotResult, market: catalog.bySlug.get(slug) }),
+    now,
+  );
+  assert.equal(snapshotBoard.length, expected ? 2 : 0);
+}
+for (const patch of [
+  { quoteStatus: "EMPTY" },
+  { quoteStatus: "UNAVAILABLE" },
+  { bookStatus: "UNAVAILABLE" },
+  { bookStatus: "NOT_REQUESTED" },
+  { yesNearTouchBuyNotionalUsd: 0 },
+  { yesNearTouchBuyNotionalUsd: Number.NaN },
+  { yesNearTouchBuyNotionalUsd: Number.POSITIVE_INFINITY },
+  {
+    bbo: { yes: { bid: new Decimal("0.5"), ask: new Decimal("0.4") }, no: {} },
+  },
+])
+  assert.equal(isTradeableEnrichment({ ...executable, ...patch }), false);
+assert.throws(() => isTradeableEnrichment(executable, -1), RangeError);
+assert.equal(
+  isTradeableEnrichment({
+    ...executable,
+    yesNearTouchBuyNotionalUsd: 100,
+    noNearTouchBuyNotionalUsd: 0,
+    bbo: { yes: {}, no: { bid: new Decimal("0.4"), ask: new Decimal("0.41") } },
+  }),
+  false,
+  "The executable quote and depth must belong to the same side",
+);
+const strict = await buildEnrichedOpportunityBoard(
+  catalog,
+  { ...enrichedConfig, minimumNearTouchBuyNotionalUsd: new Decimal(1) },
+  async (slug) => ({ ...executable, market: catalog.bySlug.get(slug) }),
+  now,
+);
+assert.deepEqual(
+  strict.map((row) => row.slug),
+  ["synthetic-4", "synthetic-3"],
+  "A configured threshold never backfills uninspected rows",
 );
 const controller = new globalThis.AbortController();
 controller.abort();

@@ -218,6 +218,16 @@ jobs:
           path: engine
           persist-credentials: false
 
+      - name: Capture exact checkout revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          deployment_sha="$(git rev-parse HEAD)"
+          engine_sha="$(git -C engine rev-parse HEAD)"
+          [[ "$deployment_sha" =~ ^[a-f0-9]{40}$ && "$engine_sha" =~ ^[a-f0-9]{40}$ ]]
+          echo "MARKETCASTER_DEPLOYMENT_SHA=$deployment_sha" >> "$GITHUB_ENV"
+          echo "MARKETCASTER_ENGINE_SHA=$engine_sha" >> "$GITHUB_ENV"
+
       - name: Resolve runtime paths
         id: paths
         shell: bash
