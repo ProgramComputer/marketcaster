@@ -276,6 +276,9 @@ export interface StagedMutationReference {
 
 export interface MutationProvenanceIssue {
   readonly action: string;
+  readonly code: "UNOBSERVED_EVIDENCE" | "UNINSPECTED_MARKET" | "MISSING_BASIS";
+  readonly field: "evidenceUrls" | "basisMarketSlugs" | "provenance";
+  readonly references?: readonly string[];
   readonly message: string;
 }
 
@@ -283,6 +286,78 @@ export interface MutationProvenanceReport {
   readonly valid: boolean;
   readonly mutationCount: number;
   readonly issues: readonly MutationProvenanceIssue[];
+}
+
+export interface MutationProvenanceContext {
+  readonly observedCurrentUrls: ReadonlySet<string>;
+  readonly currentCycleMarketBasisSlugs: ReadonlySet<string>;
+}
+
+/** Runs against the effective normalized object, before any persistence write. */
+export type StagedMutationValidator = (
+  reference: StagedMutationReference,
+) => void;
+
+export function validateMutationProvenance(
+  mutation: StagedMutationReference,
+  input: MutationProvenanceContext,
+): readonly MutationProvenanceIssue[] {
+  if (mutation.kind === "DESTRUCTIVE") return [];
+  const issues: MutationProvenanceIssue[] = [];
+  const unknownEvidence = mutation.evidenceUrls.filter((url) => {
+    try {
+      return !input.observedCurrentUrls.has(canonicalEvidenceUrl(url));
+    } catch {
+      return true;
+    }
+  });
+  const unknownMarkets = mutation.basisMarketSlugs.filter(
+    (slug) => !input.currentCycleMarketBasisSlugs.has(slug),
+  );
+  if (unknownEvidence.length > 0) {
+    issues.push({
+      action: mutation.action,
+      code: "UNOBSERVED_EVIDENCE",
+      field: "evidenceUrls",
+      references: unknownEvidence,
+      message:
+        "Use evidence URLs observed during this cycle; replace or remove unobserved references.",
+    });
+  }
+  if (unknownMarkets.length > 0) {
+    issues.push({
+      action: mutation.action,
+      code: "UNINSPECTED_MARKET",
+      field: "basisMarketSlugs",
+      references: unknownMarkets,
+      message:
+        "Inspect the referenced markets first, or use a preloaded held market as the explicit basis.",
+    });
+  }
+  if (
+    mutation.evidenceUrls.length === unknownEvidence.length &&
+    mutation.basisMarketSlugs.length === unknownMarkets.length
+  ) {
+    issues.push({
+      action: mutation.action,
+      code: "MISSING_BASIS",
+      field: "provenance",
+      message:
+        "Supply at least one current-cycle evidence URL in evidenceUrls or an inspected/preloaded held market in basisMarketSlugs; marketSlugs alone is not provenance.",
+    });
+  }
+  return issues;
+}
+
+export class MutationProvenanceError extends Error {
+  public constructor(
+    public readonly issues: readonly MutationProvenanceIssue[],
+  ) {
+    super(
+      "Memory change was not staged. Correct its provenance and retry within the remaining tool budget.",
+    );
+    this.name = "MutationProvenanceError";
+  }
 }
 
 export class StagedMutationLedger {
@@ -310,59 +385,10 @@ export class StagedMutationLedger {
     }
   }
 
-  public validate(input: {
-    readonly observedCurrentUrls: ReadonlySet<string>;
-    readonly currentCycleMarketBasisSlugs: ReadonlySet<string>;
-  }): MutationProvenanceReport {
-    const issues: MutationProvenanceIssue[] = [];
-    for (const mutation of this.#mutations) {
-      if (mutation.kind === "DESTRUCTIVE") continue;
-      const validEvidence = mutation.evidenceUrls.filter((url) => {
-        try {
-          return input.observedCurrentUrls.has(canonicalEvidenceUrl(url));
-        } catch {
-          return false;
-        }
-      });
-      const validMarkets = mutation.basisMarketSlugs.filter((slug) =>
-        input.currentCycleMarketBasisSlugs.has(slug),
-      );
-      if (validEvidence.length !== mutation.evidenceUrls.length) {
-        issues.push({
-          action: mutation.action,
-          message:
-            "Mutation references an evidence URL that was not observed during the current cycle",
-        });
-      }
-      if (validMarkets.length !== mutation.basisMarketSlugs.length) {
-        issues.push({
-          action: mutation.action,
-          message:
-            "Mutation references a market that was neither inspected nor supplied as a preloaded held market this cycle",
-        });
-      }
-      if (
-        mutation.kind === "BELIEF" &&
-        validEvidence.length === 0 &&
-        validMarkets.length === 0
-      ) {
-        issues.push({
-          action: mutation.action,
-          message:
-            "Belief mutations require at least one observed current-cycle evidence URL or inspected market basis",
-        });
-      } else if (
-        mutation.kind !== "BELIEF" &&
-        validEvidence.length === 0 &&
-        validMarkets.length === 0
-      ) {
-        issues.push({
-          action: mutation.action,
-          message:
-            "Note and plan mutations require verified evidence or an inspected market basis",
-        });
-      }
-    }
+  public validate(input: MutationProvenanceContext): MutationProvenanceReport {
+    const issues = this.#mutations.flatMap((mutation) =>
+      validateMutationProvenance(mutation, input),
+    );
     return {
       valid: issues.length === 0,
       mutationCount: this.#mutations.length,

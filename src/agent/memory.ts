@@ -10,15 +10,21 @@ import {
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import { redactPotentialSecrets } from "../utilities/redaction.js";
+import type { StagedMutationValidator } from "./persistence-transaction.js";
 
-export interface AgentNote {
+interface NoteEvidenceReferences {
+  readonly evidenceUrls?: readonly string[] | undefined;
+  readonly basisMarketSlugs?: readonly string[] | undefined;
+}
+
+export interface AgentNote extends NoteEvidenceReferences {
   readonly id: string;
   readonly content: string;
   readonly createdAt: Date;
   readonly updatedAt: Date;
 }
 
-export interface AgentNoteContext {
+export interface AgentNoteContext extends NoteEvidenceReferences {
   readonly id: string;
   readonly content: string;
   readonly createdAt: string;
@@ -52,8 +58,8 @@ export type AgentNoteOperation =
       readonly action: "UPDATE";
       readonly noteId: string;
       readonly content: string;
-      readonly evidenceUrls?: readonly string[];
-      readonly basisMarketSlugs?: readonly string[];
+      readonly evidenceUrls?: readonly string[] | undefined;
+      readonly basisMarketSlugs?: readonly string[] | undefined;
     }
   | { readonly action: "DELETE"; readonly noteId: string };
 
@@ -70,7 +76,10 @@ export interface AgentNoteOperationResult {
 export interface AgentMemory {
   readonly persistent: boolean;
   load(): Promise<AgentMemoryContext>;
-  manage(operation: AgentNoteOperation): Promise<AgentNoteOperationResult>;
+  manage(
+    operation: AgentNoteOperation,
+    beforePersist?: StagedMutationValidator,
+  ): Promise<AgentNoteOperationResult>;
 }
 
 const STATELESS_CONTEXT: AgentMemoryContext = Object.freeze({
@@ -93,11 +102,31 @@ export class StatelessAgentMemory implements AgentMemory {
   }
 }
 
+const NoteReferenceFields = {
+  evidenceUrls: z
+    .array(z.url({ protocol: /^https?$/u }))
+    .max(100)
+    .optional(),
+  basisMarketSlugs: z.array(z.string().min(1).max(500)).max(25).optional(),
+};
+
+function noteReferences(value: NoteEvidenceReferences): NoteEvidenceReferences {
+  return {
+    ...(value.evidenceUrls === undefined
+      ? {}
+      : { evidenceUrls: [...new Set(value.evidenceUrls)] }),
+    ...(value.basisMarketSlugs === undefined
+      ? {}
+      : { basisMarketSlugs: [...new Set(value.basisMarketSlugs)] }),
+  };
+}
+
 const NoteEventSchema = z.discriminatedUnion("action", [
   z
     .object({
       version: z.literal(1),
       action: z.literal("ADD"),
+      ...NoteReferenceFields,
       id: z.uuid(),
       content: z.string().min(1),
       recordedAt: z.iso.datetime({ offset: true }),
@@ -107,6 +136,7 @@ const NoteEventSchema = z.discriminatedUnion("action", [
     .object({
       version: z.literal(1),
       action: z.literal("UPDATE"),
+      ...NoteReferenceFields,
       id: z.uuid(),
       content: z.string().min(1),
       recordedAt: z.iso.datetime({ offset: true }),
@@ -150,6 +180,7 @@ function positiveInteger(value: number, fieldName: string): number {
 
 function contextNote(note: AgentNote): AgentNoteContext {
   return {
+    ...noteReferences(note),
     id: note.id,
     content: note.content,
     createdAt: note.createdAt.toISOString(),
@@ -308,6 +339,7 @@ export class FileAgentMemory implements AgentMemory {
           throw new Error(`Duplicate agent-note ID ${event.id}`);
         }
         notes.set(event.id, {
+          ...noteReferences(event),
           id: event.id,
           content: event.content,
           createdAt: recordedAt,
@@ -322,6 +354,7 @@ export class FileAgentMemory implements AgentMemory {
         }
         notes.set(event.id, {
           ...prior,
+          ...noteReferences(event),
           content: event.content,
           updatedAt: recordedAt,
         });
@@ -357,6 +390,7 @@ export class FileAgentMemory implements AgentMemory {
         version: 1,
         action: "ADD",
         id: note.id,
+        ...noteReferences(note),
         content: note.content,
         recordedAt: note.createdAt.toISOString(),
       });
@@ -367,6 +401,7 @@ export class FileAgentMemory implements AgentMemory {
           version: 1,
           action: "UPDATE",
           id: note.id,
+          ...noteReferences(note),
           content: note.content,
           recordedAt: note.updatedAt.toISOString(),
         }),
@@ -433,6 +468,7 @@ export class FileAgentMemory implements AgentMemory {
 
   public manage(
     operation: AgentNoteOperation,
+    beforePersist?: StagedMutationValidator,
   ): Promise<AgentNoteOperationResult> {
     const result = this.mutationQueue.then(async () => {
       const log = await this.eventLog();
@@ -463,6 +499,7 @@ export class FileAgentMemory implements AgentMemory {
           version: 1,
           action: "ADD",
           id,
+          ...noteReferences(operation),
           content: this.normalizeContent(operation.content),
           recordedAt: recordedAt.toISOString(),
         });
@@ -474,6 +511,7 @@ export class FileAgentMemory implements AgentMemory {
           version: 1,
           action: "UPDATE",
           id: operation.noteId,
+          ...noteReferences(operation),
           content: this.normalizeContent(operation.content),
           recordedAt: recordedAt.toISOString(),
         });
@@ -490,6 +528,14 @@ export class FileAgentMemory implements AgentMemory {
       }
       const nextEvents = [...log.events, event];
       const nextNotes = this.notes(nextEvents);
+      const effectiveNote = nextNotes.find((note) => note.id === event.id);
+      beforePersist?.({
+        kind: operation.action === "DELETE" ? "DESTRUCTIVE" : "NOTE",
+        action: operation.action,
+        identity: `NOTE:${event.id}`,
+        evidenceUrls: effectiveNote?.evidenceUrls ?? [],
+        basisMarketSlugs: effectiveNote?.basisMarketSlugs ?? [],
+      });
       if (
         this.shouldCompact(log) ||
         nextEvents.length > this.maximumPersistedEvents

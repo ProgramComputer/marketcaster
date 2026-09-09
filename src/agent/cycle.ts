@@ -5,6 +5,7 @@ import {
   referenceStrategy,
   type StrategyPolicy,
 } from "../strategy/policy.js";
+import { reviewResolvedTargets } from "../strategy/resolution-review.js";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { Decimal } from "decimal.js";
@@ -124,6 +125,11 @@ import {
 import {
   PersistenceTransaction,
   StagedMutationLedger,
+  MutationProvenanceError,
+  validateMutationProvenance,
+  type MutationProvenanceContext,
+  type StagedMutationReference,
+  type StagedMutationValidator,
   type MutationProvenanceReport,
 } from "./persistence-transaction.js";
 import {
@@ -650,11 +656,33 @@ export async function runCycle(
     );
   }
   const strategy = dependencies.strategy ?? referenceStrategy;
-  const refreshForecasts = (
+  let forecastRefreshSequence = 0;
+  let resolutionReviewSequence = 0;
+  let allocationReviewSequence = 0;
+  const refreshForecasts = async (
     ...args: Parameters<
       NonNullable<StrategyPolicy["forecast"]>["refreshForecasts"]
     >
-  ) => refreshPolicyForecasts(strategy.forecast, ...args);
+  ) => {
+    const result = await refreshPolicyForecasts(strategy.forecast, ...args);
+    const [requests, , observedAt] = args;
+    await journal?.recordArtifact(
+      `forecast-refresh-${++forecastRefreshSequence}`,
+      {
+        observedAt: observedAt.toISOString(),
+        requiredMarketSlugs: [...result.requiredMarketSlugs],
+        estimates: requests.flatMap((request) => {
+          const probability = result.selectedSideProbabilityByMarketSlug.get(
+            request.marketSlug,
+          );
+          return probability === undefined
+            ? []
+            : [{ ...request, kind: "ESTIMATE", probability }];
+        }),
+      },
+    );
+    return result;
+  };
   const now = dependencies.now ?? (() => new Date());
   const startedAt = now();
   const suppliedManifest = dependencies.journal?.currentManifest;
@@ -754,6 +782,14 @@ export async function runCycle(
         exchangeId: dependencies.exchange.id,
         accountScope,
         now,
+      });
+      const validSha = (value: string | undefined) =>
+        value !== undefined && /^[a-f0-9]{40}$/iu.test(value) ? value : null;
+      await journal.recordArtifact("runtime-provenance", {
+        productionSha: validSha(process.env.MARKETCASTER_DEPLOYMENT_SHA),
+        engineSha: validSha(process.env.MARKETCASTER_ENGINE_SHA),
+        provider: dependencies.decisionProvider.providerId,
+        model: dependencies.decisionProvider.modelId,
       });
     }
     if (dependencies.mode === "live") {
@@ -858,6 +894,9 @@ export async function runCycle(
       (dependencies.config.agent.state.enabled &&
       dependencies.writeReports !== false
         ? new FileAgentState({
+            ...(strategy.selectMemoryContext === undefined
+              ? {}
+              : { selectContextBeliefs: strategy.selectMemoryContext }),
             filePath:
               persistenceTransaction?.stagedStateFilePath ?? stateFilePath,
             maximumBeliefs: dependencies.config.agent.state.maximumBeliefs,
@@ -884,6 +923,10 @@ export async function runCycle(
       (!memory.persistent || usesFileMemory) &&
       (!agentState.persistent || usesFileState);
     let stagedPersistenceDiscarded = false;
+    const agentStateAuditBefore =
+      agentState.loadAudit === undefined
+        ? agentStateContext
+        : await agentState.loadAudit();
     stageLogger(dependencies.logger, "account-reconstruction").info(
       "Reconstructing authoritative account state",
     );
@@ -943,13 +986,19 @@ export async function runCycle(
                 marketSlug,
                 enrichmentSignal,
               );
+              const quoteStatus =
+                details.bbo === undefined
+                  ? "UNAVAILABLE"
+                  : details.bbo.yes.ask === undefined &&
+                      details.bbo.no.ask === undefined
+                    ? "EMPTY"
+                    : "AVAILABLE";
+              let bookStatus: "AVAILABLE" | "UNAVAILABLE" | "NOT_REQUESTED" =
+                quoteStatus === "AVAILABLE" ? "UNAVAILABLE" : "NOT_REQUESTED";
               let nearTouchTwoSidedDepth: number | undefined;
               let yesNearTouchBuyNotionalUsd: number | undefined;
               let noNearTouchBuyNotionalUsd: number | undefined;
-              if (
-                details.bbo?.yes.bid !== undefined &&
-                details.bbo.yes.ask !== undefined
-              ) {
+              if (quoteStatus === "AVAILABLE" && details.bbo !== undefined) {
                 try {
                   enrichmentSignal?.throwIfAborted();
                   const book = await dependencies.exchange.getOrderBook(
@@ -966,34 +1015,42 @@ export async function runCycle(
                     "NO",
                     strategy.selection.depthPriceBand ?? new Decimal(0),
                   ).toNumber();
-                  const bidFloor = details.bbo.yes.bid.minus(
-                    strategy.selection.depthPriceBand ?? 0,
-                  );
-                  const askCeiling = details.bbo.yes.ask.plus(
-                    strategy.selection.depthPriceBand ?? 0,
-                  );
-                  const bidDepth = book.yesBids
-                    .filter((level) => level.price.gte(bidFloor))
-                    .reduce(
-                      (total, level) => total.plus(level.quantity),
-                      details.bbo.yes.bid.mul(0),
+                  bookStatus = "AVAILABLE";
+                  if (
+                    details.bbo.yes.bid !== undefined &&
+                    details.bbo.yes.ask !== undefined
+                  ) {
+                    const bidFloor = details.bbo.yes.bid.minus(
+                      strategy.selection.depthPriceBand ?? 0,
                     );
-                  const askDepth = book.yesAsks
-                    .filter((level) => level.price.lte(askCeiling))
-                    .reduce(
-                      (total, level) => total.plus(level.quantity),
-                      details.bbo.yes.ask.mul(0),
+                    const askCeiling = details.bbo.yes.ask.plus(
+                      strategy.selection.depthPriceBand ?? 0,
                     );
-                  nearTouchTwoSidedDepth = Decimal.min(
-                    bidDepth,
-                    askDepth,
-                  ).toNumber();
+                    const bidDepth = book.yesBids
+                      .filter((level) => level.price.gte(bidFloor))
+                      .reduce(
+                        (total, level) => total.plus(level.quantity),
+                        details.bbo.yes.bid.mul(0),
+                      );
+                    const askDepth = book.yesAsks
+                      .filter((level) => level.price.lte(askCeiling))
+                      .reduce(
+                        (total, level) => total.plus(level.quantity),
+                        details.bbo.yes.ask.mul(0),
+                      );
+                    nearTouchTwoSidedDepth = Decimal.min(
+                      bidDepth,
+                      askDepth,
+                    ).toNumber();
+                  }
                 } catch (error) {
                   if (enrichmentSignal?.aborted === true) throw error;
                 }
               }
               return {
                 market: details.market,
+                quoteStatus,
+                bookStatus,
                 ...(yesNearTouchBuyNotionalUsd === undefined
                   ? {}
                   : { yesNearTouchBuyNotionalUsd }),
@@ -1172,6 +1229,13 @@ export async function runCycle(
       modelSnapshot,
       initialValuation,
     );
+    const memoryContextScope = {
+      marketSlugs: opportunityBoard.map((market) => market.slug),
+      heldMarketSlugs: [...visibleHeldSlugs],
+    };
+    if (agentState.persistent && strategy.selectMemoryContext !== undefined) {
+      agentStateContext = await agentState.load(memoryContextScope);
+    }
     const contextInput: BuildAgentContextInput = {
       ...(strategy.selection.buildCriticalLearning === undefined
         ? {}
@@ -1237,6 +1301,39 @@ export async function runCycle(
       dependencies.exchange,
       discovery.catalog.bySlug,
     );
+    const currentMutationProvenanceContext = (): MutationProvenanceContext => ({
+      // Advisory memory may cite an observed source; trade authorization retains
+      // its stricter excerpt, freshness, and source-independence validation.
+      observedCurrentUrls: new Set(
+        researchTools.observedEvidenceSources.map((source) => source.url),
+      ),
+      currentCycleMarketBasisSlugs: new Set([
+        ...discovery.preloadedHeld.map(({ market }) => market.slug),
+        ...researchTools.inspectedMarketSlugs,
+      ]),
+    });
+    const manageAdvisoryMutation = async <T>(
+      apply: (beforePersist: StagedMutationValidator) => Promise<T>,
+      usesStagedFile: boolean,
+    ): Promise<T> => {
+      let effectiveReference: StagedMutationReference | undefined;
+      const result = await apply((reference) => {
+        const issues = validateMutationProvenance(
+          reference,
+          currentMutationProvenanceContext(),
+        );
+        if (issues.length > 0) throw new MutationProvenanceError(issues);
+        effectiveReference = reference;
+      });
+      if (effectiveReference === undefined) {
+        throw new Error(
+          "Persistent memory adapter did not validate its mutation before writing",
+        );
+      }
+      mutationLedger.record(effectiveReference);
+      if (usesStagedFile) persistenceTransaction?.markMutated();
+      return result;
+    };
     const researchTools = new DecisionResearchTools({
       ...(strategy.selection.shouldEnforceRequiredResearch === undefined
         ? {}
@@ -1283,48 +1380,13 @@ export async function runCycle(
         ? {
             agentNotesHandler: async (
               operation: Parameters<AgentMemory["manage"]>[0],
-            ) => {
-              if (operation.action === "ADD" || operation.action === "UPDATE") {
-                const {
-                  evidenceUrls = [],
-                  basisMarketSlugs = [],
-                  ...persisted
-                } = operation;
-                const result = await memory.manage(persisted);
-                const mutatedNoteId =
-                  result.mutatedNoteId ??
-                  (operation.action === "UPDATE"
-                    ? operation.noteId
-                    : undefined);
-                if (mutatedNoteId === undefined) {
-                  throw new Error(
-                    "Persistent note mutation did not identify its effective note",
-                  );
-                }
-                mutationLedger.record({
-                  kind: "NOTE",
-                  action: operation.action,
-                  identity: `NOTE:${mutatedNoteId}`,
-                  evidenceUrls,
-                  basisMarketSlugs,
-                });
-                if (usesFileMemory) persistenceTransaction?.markMutated();
-                return result;
-              }
-              if (operation.action === "DELETE") {
-                const result = await memory.manage(operation);
-                mutationLedger.record({
-                  kind: "DESTRUCTIVE",
-                  action: operation.action,
-                  identity: `NOTE:${operation.noteId}`,
-                  evidenceUrls: [],
-                  basisMarketSlugs: [],
-                });
-                if (usesFileMemory) persistenceTransaction?.markMutated();
-                return result;
-              }
-              return memory.manage(operation);
-            },
+            ) =>
+              operation.action === "LIST"
+                ? memory.manage(operation)
+                : manageAdvisoryMutation(
+                    (beforePersist) => memory.manage(operation, beforePersist),
+                    usesFileMemory,
+                  ),
           }
         : {}),
       ...(agentState.persistent
@@ -1332,80 +1394,14 @@ export async function runCycle(
             agentStateHandler: async (
               operation: Parameters<AgentState["manage"]>[0],
               signal: AbortSignal,
-            ) => {
-              if (
-                operation.action === "ADD_BELIEF" ||
-                operation.action === "UPDATE_BELIEF"
-              ) {
-                const {
-                  evidenceUrls = [],
-                  basisMarketSlugs = [],
-                  ...persisted
-                } = operation;
-                const result = await agentState.manage(persisted, signal);
-                const mutatedBeliefId =
-                  result.mutatedBeliefId ??
-                  (operation.action === "UPDATE_BELIEF"
-                    ? operation.beliefId
-                    : undefined);
-                if (mutatedBeliefId === undefined) {
-                  throw new Error(
-                    "Persistent belief mutation did not identify its effective belief",
-                  );
-                }
-                mutationLedger.record({
-                  kind: "BELIEF",
-                  action: operation.action,
-                  identity: `BELIEF:${mutatedBeliefId}`,
-                  evidenceUrls,
-                  basisMarketSlugs,
-                });
-                if (usesFileState) persistenceTransaction?.markMutated();
-                return result;
-              }
-              if (
-                operation.action === "SET_NEXT_CYCLE_PLAN" ||
-                operation.action === "SET_LONG_TERM_PLAN"
-              ) {
-                const {
-                  evidenceUrls = [],
-                  basisMarketSlugs = [],
-                  ...persisted
-                } = operation;
-                const result = await agentState.manage(persisted, signal);
-                mutationLedger.record({
-                  kind: "PLAN",
-                  action: operation.action,
-                  identity:
-                    operation.action === "SET_NEXT_CYCLE_PLAN"
-                      ? "PLAN:NEXT_CYCLE"
-                      : "PLAN:LONG_TERM",
-                  evidenceUrls,
-                  basisMarketSlugs,
-                });
-                if (usesFileState) persistenceTransaction?.markMutated();
-                return result;
-              }
-              if (
-                operation.action === "DELETE_BELIEF" ||
-                operation.action === "CLEAR_NEXT_CYCLE_PLAN"
-              ) {
-                const result = await agentState.manage(operation, signal);
-                mutationLedger.record({
-                  kind: "DESTRUCTIVE",
-                  action: operation.action,
-                  identity:
-                    operation.action === "DELETE_BELIEF"
-                      ? `BELIEF:${operation.beliefId}`
-                      : "PLAN:NEXT_CYCLE",
-                  evidenceUrls: [],
-                  basisMarketSlugs: [],
-                });
-                if (usesFileState) persistenceTransaction?.markMutated();
-                return result;
-              }
-              return agentState.manage(operation, signal);
-            },
+            ) =>
+              operation.action === "LIST"
+                ? agentState.manage(operation, signal)
+                : manageAdvisoryMutation(
+                    (beforePersist) =>
+                      agentState.manage(operation, signal, beforePersist),
+                    usesFileState,
+                  ),
           }
         : {}),
       candidateFamilies: [
@@ -1459,8 +1455,20 @@ export async function runCycle(
         now(),
         signal,
       );
-      return validateProposals({
-        allocationPolicy: strategy.allocation,
+      const allocationAssessments: unknown[] = [];
+      const result = await validateProposals({
+        allocationPolicy: (input) => {
+          const assessedInput: unknown = JSON.parse(JSON.stringify(input));
+          const instructions = strategy.allocation(input);
+          const returnedInstructions: unknown = JSON.parse(
+            JSON.stringify(instructions),
+          );
+          allocationAssessments.push({
+            input: assessedInput,
+            instructions: returnedInstructions,
+          });
+          return instructions;
+        },
         minimumNearTouchBuyNotionalUsd:
           dependencies.config.marketSelection.minimumNearTouchBuyNotionalUsd,
         depthPriceBand: strategy.selection.depthPriceBand,
@@ -1485,6 +1493,15 @@ export async function runCycle(
         now,
         signal,
       });
+      await journal?.recordArtifact(
+        `allocation-review-${++allocationReviewSequence}`,
+        {
+          observedAt: now().toISOString(),
+          assessments: allocationAssessments,
+          executionAuthorization: false,
+        },
+      );
+      return result;
     };
     let evidenceValidation: EvidenceValidationReport | undefined;
     let decisionCoverage: DecisionCoverageReport | undefined;
@@ -1572,6 +1589,25 @@ export async function runCycle(
           }),
         ]);
       const liveCoverageIssues: DecisionCoverageReport["issues"][number][] = [];
+      const resolutionReview = await reviewResolvedTargets({
+        policy: strategy.resolutionReview,
+        targets: candidateDecision.portfolioTargets,
+        forecasts: freshTargetLive,
+        details: resolvedMarketDetailsBySlug,
+        exchange: dependencies.exchange,
+        now,
+        signal,
+      });
+      await journal?.recordArtifact(
+        `resolution-review-${++resolutionReviewSequence}`,
+        resolutionReview,
+      );
+      liveCoverageIssues.push(
+        ...resolutionReview.issues.map((issue) => ({
+          code: "RESOLUTION_POLICY_REVIEW_REQUIRED" as const,
+          ...issue,
+        })),
+      );
       for (const target of candidateDecision.portfolioTargets) {
         if (!freshTargetLive.requiredMarketSlugs.has(target.marketSlug)) {
           continue;
@@ -1614,21 +1650,9 @@ export async function runCycle(
         ],
       };
       passEdgeAuditHistory.push(passAudit);
-      const provenance = mutationLedger.validate({
-        // Advisory memory has a deliberately weaker trust boundary than trade
-        // authorization. A source must have been observed this cycle (so the
-        // model cannot persist invented URLs), but it need not satisfy the
-        // stricter excerpt, freshness, and independence rules required to put
-        // capital at risk. Persisted state remains untrusted and never
-        // authorizes an order without fresh terminal evidence.
-        observedCurrentUrls: new Set(
-          researchTools.observedEvidenceSources.map((source) => source.url),
-        ),
-        currentCycleMarketBasisSlugs: new Set([
-          ...discovery.preloadedHeld.map(({ market }) => market.slug),
-          ...researchTools.inspectedMarketSlugs,
-        ]),
-      });
+      const provenance = mutationLedger.validate(
+        currentMutationProvenanceContext(),
+      );
       return {
         evidence,
         coverage,
@@ -1893,10 +1917,13 @@ export async function runCycle(
         detailedMarketsBySlug.get(market.slug) ?? market,
       ),
     );
-    let agentStateAfter = agentStateContext;
+    let agentStateAfter = agentStateAuditBefore;
     if (agentState.persistent && !stagedPersistenceDiscarded) {
       try {
-        agentStateAfter = await agentState.load();
+        agentStateAfter =
+          agentState.loadAudit === undefined
+            ? await agentState.load(memoryContextScope)
+            : await agentState.loadAudit();
       } catch (error) {
         warnings.push(
           `Structured agent state could not be reloaded after research: ${safeErrorMessage(error)}`,
@@ -1904,7 +1931,7 @@ export async function runCycle(
       }
     }
     await journal?.recordArtifact("agent-state", {
-      before: agentStateContext,
+      before: agentStateAuditBefore,
       after: agentStateAfter,
     });
     const observedPassResearchGate = researchTools.strictPassResearchReadiness;
@@ -2307,6 +2334,10 @@ export async function runCycle(
       valuation: finalValuation,
     });
     await persistenceTransaction?.commit();
+    await journal?.recordArtifact("advisory-persistence", {
+      status: stagedPersistenceDiscarded ? "DISCARDED" : "COMMITTED",
+      mutationCount: finalGuards.mutationProvenance.mutationCount,
+    });
     persistenceTransaction = undefined;
     const completedAt = now();
     const counts = researchTools.totalCounts;
@@ -2349,7 +2380,7 @@ export async function runCycle(
       accountAfter: finalSnapshot,
       valuationBefore: initialValuation,
       valuationAfter: finalValuation,
-      agentStateBefore: agentStateContext,
+      agentStateBefore: agentStateAuditBefore,
       agentStateAfter,
       marketDiscovery: {
         catalogued: discovery.catalog.markets.length,
