@@ -2,6 +2,7 @@ import type { ExchangeId, RuntimeMode } from "../domain/primitives.js";
 import type { CandidateFunnel } from "../agent/candidate-funnel.js";
 import type { ShadowLedgerCycleReport } from "./shadow-ledger.js";
 import type { AgentBelief, AgentPlan } from "../agent/agent-state.js";
+import type { DecisionSubmissionHistory } from "../agent/decision-submission-audit.js";
 import type { Position } from "../domain/position.js";
 import type {
   ExecutionCooldown,
@@ -363,6 +364,13 @@ export interface CycleReport {
       readonly missedInputTokens: number;
     };
     readonly decisionAudit?: {
+      readonly submissions?: DecisionSubmissionHistory;
+      readonly forecastMemory?: {
+        readonly checkedBeliefCount: number;
+        readonly issueCount: number;
+        readonly quarantinedBeliefIds: readonly string[];
+        readonly unverifiedBeliefCount: number;
+      };
       readonly evidence: {
         readonly valid: boolean;
         readonly verifiedSourceCount: number;

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { AgentConfig } from "../config/schema.js";
 import type { AgentDecision } from "../agent/decision-schema.js";
+import type { EvidenceValidationIssue } from "../agent/evidence-provenance.js";
 import type { DecisionPrompt } from "../agent/prompt-builder.js";
 import type {
   DecisionResearchTools,
@@ -101,6 +102,8 @@ export interface TerminalDecisionRepairFeedback {
   readonly acceptedProposalIndexes: readonly number[];
   readonly rejectedProposals: readonly TerminalDecisionRejectedProposal[];
   readonly instructions: readonly string[];
+  /** Exact validation failures and cached repair context; no new decision gate. */
+  readonly evidenceIssues?: readonly EvidenceValidationIssue[];
 }
 
 export type TerminalDecisionReview =

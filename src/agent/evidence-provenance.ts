@@ -3,6 +3,10 @@ import { BlockList, isIP, type LookupFunction } from "node:net";
 import { Agent, type Dispatcher } from "undici";
 import type { AgentDecision, DecisionEvidence } from "./decision-schema.js";
 import type { Market } from "../domain/market.js";
+import {
+  evidenceRepairContext,
+  type EvidenceRepairContext,
+} from "./evidence-repair.js";
 
 export type EvidenceSourceProvider =
   | "CLIENT_WEB_SEARCH"
@@ -757,6 +761,9 @@ export interface EvidenceValidationIssue {
   readonly marketSlug: string;
   readonly url?: string;
   readonly message: string;
+  readonly unsupportedNumericDetails?: readonly string[];
+  readonly sourceFetchFailureReason?: EvidencePageReadFailureReason;
+  readonly repairContext?: EvidenceRepairContext;
 }
 
 export interface VerifiedEvidenceSource {
@@ -1006,6 +1013,11 @@ function currentEvidenceRequired(item: {
 export async function validateDecisionEvidence(input: {
   readonly decision: AgentDecision;
   readonly observedSources: readonly ObservedEvidenceSource[];
+  /** Already-read pages from this cycle; no second fetch or newer snapshot. */
+  readonly evidencePageSnapshots?: ReadonlyMap<
+    string,
+    Promise<FetchedEvidencePage>
+  >;
   readonly marketsBySlug: ReadonlyMap<string, Market>;
   readonly minimumIndependentSources: number;
   /** Targets that currently derive an exchange order and therefore authorize action. */
@@ -1022,7 +1034,7 @@ export async function validateDecisionEvidence(input: {
   const advisoryIssues: EvidenceValidationIssue[] = [];
   const verified: VerifiedEvidenceSource[] = [];
   const verifiedKeys = new Set<string>();
-  const fetchCache = new Map<string, Promise<FetchedEvidencePage>>();
+  const fetchCache = new Map(input.evidencePageSnapshots);
   const decisionItems = [
     ...input.decision.portfolioTargets.map((target) => ({
       kind: "TARGET" as const,
@@ -1090,7 +1102,7 @@ export async function validateDecisionEvidence(input: {
           !searchable.includes(normalizedExcerpt(excerpt))) ||
         (evidence.evidenceClass === "CURRENT_REPORT" &&
           authoritativeDate === undefined);
-      if (needsBody) {
+      if (needsBody || fetchCache.has(canonicalEvidenceUrl(evidence.url))) {
         try {
           const key = canonicalEvidenceUrl(evidence.url);
           let pending = fetchCache.get(key);
@@ -1119,12 +1131,15 @@ export async function validateDecisionEvidence(input: {
             authoritativeDate = new Date(fetched.publishedAt);
           }
         } catch (error) {
-          issues.push({
-            code: "SOURCE_FETCH_FAILED",
-            marketSlug: item.marketSlug,
-            url: evidence.url,
-            message: `The source could not be safely fetched for verification: ${error instanceof Error ? error.message : "unknown failure"}`,
-          });
+          if (needsBody) {
+            issues.push({
+              code: "SOURCE_FETCH_FAILED",
+              marketSlug: item.marketSlug,
+              url: evidence.url,
+              message: `The source could not be safely fetched for verification: ${error instanceof Error ? error.message : "unknown failure"}`,
+              sourceFetchFailureReason: evidencePageReadFailureReason(error),
+            });
+          }
         }
       }
       if (
@@ -1139,6 +1154,12 @@ export async function validateDecisionEvidence(input: {
           url: evidence.url,
           message:
             "claimExcerpt was not found in provider evidence or the safely fetched page",
+          repairContext: evidenceRepairContext({
+            sourceText: fetched?.text ?? observed.excerpt ?? "",
+            sourceKind:
+              fetched === undefined ? "PROVIDER_EXCERPT" : "PAGE_SNAPSHOT",
+            claimExcerpt: excerpt,
+          }),
         });
         continue;
       }
@@ -1165,6 +1186,14 @@ export async function validateDecisionEvidence(input: {
             marketSlug: item.marketSlug,
             url: evidence.url,
             message: `Numeric fact(s) ${unsupportedNumbers.join(", ")} appear in relevance but not in claimExcerpt`,
+            unsupportedNumericDetails: unsupportedNumbers,
+            repairContext: evidenceRepairContext({
+              sourceText: fetched?.text ?? observed.excerpt ?? "",
+              sourceKind:
+                fetched === undefined ? "PROVIDER_EXCERPT" : "PAGE_SNAPSHOT",
+              claimExcerpt: excerpt,
+              unsupportedNumericDetails: unsupportedNumbers,
+            }),
           });
           continue;
         }
