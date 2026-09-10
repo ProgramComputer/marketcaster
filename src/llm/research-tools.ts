@@ -1770,9 +1770,27 @@ export function selectEvidenceSourceText(
         matchedTerms: termSelection.matchedTerms,
       };
     }
+    const prefix = source.slice(0, EVIDENCE_SOURCE_NO_MATCH_PREVIEW_CHARACTERS);
+    const candidateStride = MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS / 3;
     return {
-      text: source.slice(0, EVIDENCE_SOURCE_NO_MATCH_PREVIEW_CHARACTERS),
-      claimExcerptCandidates: [],
+      text: prefix,
+      claimExcerptCandidates: claimExcerptCandidates(
+        prefix,
+        Array.from(
+          {
+            length: Math.min(
+              MAXIMUM_EVIDENCE_SOURCE_MATCH_FRAGMENTS,
+              Math.ceil(prefix.length / candidateStride),
+            ),
+          },
+          (_, index) => ({
+            start: index * candidateStride,
+            end:
+              index * candidateStride +
+              MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS,
+          }),
+        ),
+      ),
       sourceCharacters: source.length,
       matchCount: 0,
       returnedFragments: 0,
@@ -2190,6 +2208,14 @@ export class DecisionResearchTools {
     return this.evidenceSources.sources;
   }
 
+  /** This cycle's snapshots, also used by terminal verification and repair. */
+  public get evidencePageSnapshots(): ReadonlyMap<
+    string,
+    Promise<FetchedEvidencePage>
+  > {
+    return this.activeSession?.evidencePageSnapshots ?? new Map();
+  }
+
   public recordProviderEvidenceSources(
     sources: readonly ObservedEvidenceSource[],
   ): void {
@@ -2539,6 +2565,13 @@ export class DecisionResearchSession {
       this.evidenceSourceReadCount >=
       this.limits.maximumEvidenceSourceReadRequests
     );
+  }
+
+  public get evidencePageSnapshots(): ReadonlyMap<
+    string,
+    Promise<FetchedEvidencePage>
+  > {
+    return new Map(this.evidencePageCache);
   }
 
   public reopenForTerminalDecisionRepair(maximumAttempts = 1): void {
@@ -3346,19 +3379,20 @@ export class DecisionResearchSession {
       }
     }
 
+    let pending = this.evidencePageCache.get(url);
+    const reusedSnapshot = pending !== undefined;
     if (
+      pending === undefined &&
       this.evidenceSourceReadCount >=
-      this.limits.maximumEvidenceSourceReadRequests
+        this.limits.maximumEvidenceSourceReadRequests
     ) {
       return safeToolError(
         "EVIDENCE_SOURCE_READ_LIMIT_REACHED",
-        "The cycle snapshot evidence-read limit was reached. Repeated reads cannot monitor or refresh a source; use the evidence already returned and submit the trade plan.",
+        "The cycle source-fetch limit was reached. You may select another passage from an already-read URL; cached reads do not refresh or monitor the source.",
       );
     }
-    this.evidenceSourceReadCount += 1;
-
-    let pending = this.evidencePageCache.get(url);
     if (pending === undefined) {
+      this.evidenceSourceReadCount += 1;
       pending = this.evidencePageReader(url, signal);
       this.evidencePageCache.set(url, pending);
     }
@@ -3376,6 +3410,8 @@ export class DecisionResearchSession {
           ? {
               ...rawSelection,
               text: "No matching live-score record was present in this feed snapshot.",
+              claimExcerptCandidates: [],
+              returnedFragments: 0,
               truncated: false,
             }
           : rawSelection;
@@ -3388,7 +3424,7 @@ export class DecisionResearchSession {
           ? {}
           : { publishedAt: page.publishedAt }),
       });
-      this.successfulEvidenceSourceReadCount += 1;
+      if (!reusedSnapshot) this.successfulEvidenceSourceReadCount += 1;
       return {
         kind: "TOOL_RESULT",
         content: JSON.stringify({
@@ -3396,6 +3432,7 @@ export class DecisionResearchSession {
           securityNotice: this.messages.evidenceSourceSecurityNotice,
           url,
           finalUrl,
+          reusedSnapshot,
           title: sanitizeExternalText(observed.title),
           observedAt: observed.observedAt,
           ...(attributedMarketSlug === undefined

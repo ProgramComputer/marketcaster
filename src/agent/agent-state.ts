@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import { redactPotentialSecrets } from "../utilities/redaction.js";
 import type { StagedMutationValidator } from "./persistence-transaction.js";
+import type { ForecastMemoryIssue } from "./forecast-memory.js";
 
 export const AGENT_BELIEF_TYPES = [
   "EVENT_ANALYSIS",
@@ -54,6 +55,17 @@ export interface AgentBelief extends EvidenceReferences, BeliefLifecycle {
   readonly invalidationConditions: readonly string[];
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** Engine-authored diagnostic; never a restriction on a trading decision. */
+  readonly forecastReview?:
+    | {
+        readonly code: ForecastMemoryIssue["code"];
+        readonly originalYesProbability: number;
+        readonly reviewedAt: string;
+        readonly targetYesProbability?: number | undefined;
+        readonly targetSubmittedAt?: string | undefined;
+        readonly message: string;
+      }
+    | undefined;
 }
 
 export interface AgentPlan extends EvidenceReferences {
@@ -143,6 +155,11 @@ export interface AgentState {
   load(input?: AgentBeliefContextScope): Promise<AgentStateContext>;
   /** Full bounded snapshot for private reporting, never model context. */
   loadAudit?(): Promise<AgentStateContext>;
+  /** Clear only conflicting advisory scalars, retaining the belief and diagnosis. */
+  quarantineForecasts?(
+    issues: readonly ForecastMemoryIssue[],
+    signal?: AbortSignal,
+  ): Promise<readonly string[]>;
   manage(
     operation: AgentStateOperation,
     signal?: AbortSignal,
@@ -218,6 +235,20 @@ const BeliefSchema = z
     ...BeliefLifecycleFields,
     createdAt: TimestampSchema,
     updatedAt: TimestampSchema,
+    forecastReview: z
+      .object({
+        code: z.enum([
+          "FORECAST_PROBABILITY_CONFLICT",
+          "AMBIGUOUS_FORECAST_MARKET",
+        ]),
+        originalYesProbability: z.number().min(0).max(1),
+        reviewedAt: TimestampSchema,
+        targetYesProbability: z.number().min(0).max(1).optional(),
+        targetSubmittedAt: TimestampSchema.optional(),
+        message: NonEmptyStringSchema,
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -555,6 +586,9 @@ export class FileAgentState implements AgentState {
       ),
       ...this.normalizeReferences(belief),
       ...this.normalizeLifecycle(belief),
+      ...(belief.forecastReview === undefined
+        ? {}
+        : { forecastReview: belief.forecastReview }),
       createdAt,
       updatedAt,
     };
@@ -878,6 +912,9 @@ export class FileAgentState implements AgentState {
         : { invalidationConditions: operation.invalidationConditions }),
       ...this.normalizeReferences(operation),
       ...this.normalizeLifecycle(operation),
+      ...(operation.forecastYesProbability === undefined
+        ? {}
+        : { forecastReview: undefined }),
       updatedAt: this.timestamp(),
     });
   }
@@ -899,6 +936,59 @@ export class FileAgentState implements AgentState {
     });
     if (plan === null) throw new Error("Agent plan normalization failed");
     return plan;
+  }
+
+  public quarantineForecasts(
+    issues: readonly ForecastMemoryIssue[],
+    signal?: AbortSignal,
+  ): Promise<readonly string[]> {
+    const result = this.mutationQueue.then(async () => {
+      signal?.throwIfAborted();
+      const { snapshot } = await this.readSnapshot();
+      const byId = new Map(issues.map((issue) => [issue.beliefId, issue]));
+      const quarantined: string[] = [];
+      const reviewedAt = this.timestamp();
+      const beliefs = snapshot.beliefs.map((belief) => {
+        const issue = byId.get(belief.id);
+        // A delayed review must not clear a forecast subsequently corrected.
+        if (
+          issue?.beliefUpdatedAt !== belief.updatedAt ||
+          issue.originalYesProbability !== belief.forecastYesProbability
+        ) {
+          return belief;
+        }
+        quarantined.push(belief.id);
+        return {
+          ...belief,
+          forecastYesProbability: null,
+          updatedAt: reviewedAt,
+          forecastReview: {
+            code: issue.code,
+            originalYesProbability: issue.originalYesProbability,
+            reviewedAt,
+            ...(issue.targetYesProbability === undefined
+              ? {}
+              : { targetYesProbability: issue.targetYesProbability }),
+            ...(issue.targetSubmittedAt === undefined
+              ? {}
+              : { targetSubmittedAt: issue.targetSubmittedAt }),
+            message: issue.message,
+          },
+        };
+      });
+      if (quarantined.length > 0) {
+        await this.writeSnapshot(
+          this.normalizeSnapshot({ ...snapshot, beliefs }),
+          signal,
+        );
+      }
+      return quarantined;
+    });
+    this.mutationQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   public load(scope?: AgentBeliefContextScope): Promise<AgentStateContext> {
