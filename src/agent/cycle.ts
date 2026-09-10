@@ -86,6 +86,11 @@ import {
 } from "./context-builder.js";
 import { buildTerminalDecisionRepairFeedback } from "./decision-repair.js";
 import {
+  captureDecisionSubmission,
+  summarizeDecisionSubmissions,
+  type DecisionSubmissionAudit,
+} from "./decision-submission-audit.js";
+import {
   discoverMarketCatalog,
   MarketDetailResolver,
   MarketDiscoveryResolver,
@@ -118,6 +123,10 @@ import {
   StatelessAgentState,
 } from "./agent-state.js";
 import { buildCandidateFunnel } from "./candidate-funnel.js";
+import {
+  reviewForecastMemory,
+  type ForecastMemoryReview,
+} from "./forecast-memory.js";
 import {
   auditNoPositiveEdgePasses,
   type PassEdgeAuditReport,
@@ -641,6 +650,9 @@ function mergeTerminalDecisionRepairFeedback(
       .filter((index) => !rejectedIndexes.has(index))
       .toSorted((left, right) => left - right),
     rejectedProposals,
+    evidenceIssues: present.flatMap(
+      (feedback) => feedback.evidenceIssues ?? [],
+    ),
     instructions: [
       ...new Set(present.flatMap((feedback) => feedback.instructions)),
     ],
@@ -1504,6 +1516,7 @@ export async function runCycle(
       return result;
     };
     let evidenceValidation: EvidenceValidationReport | undefined;
+    const decisionSubmissions: DecisionSubmissionAudit[] = [];
     let decisionCoverage: DecisionCoverageReport | undefined;
     let passEdgeAudit: PassEdgeAuditReport | undefined;
     const passEdgeAuditHistory: PassEdgeAuditReport[] = [];
@@ -1542,6 +1555,7 @@ export async function runCycle(
           validateDecisionEvidence({
             decision: candidateDecision,
             observedSources: researchTools.observedEvidenceSources,
+            evidencePageSnapshots: researchTools.evidencePageSnapshots,
             marketsBySlug,
             minimumIndependentSources:
               dependencies.config.risk.minimumIndependentSources,
@@ -1673,6 +1687,7 @@ export async function runCycle(
           limits: liveDecisionLimits,
           signal,
           reviewTerminalDecision: async (candidateDecision, reviewSignal) => {
+            const submittedAt = safeTimestamp(now).toISOString();
             const guards = await validateDecisionGuards(
               candidateDecision,
               reviewSignal,
@@ -1690,6 +1705,19 @@ export async function runCycle(
             const validation = await validateDecisionProposals(
               candidatePlan.riskProposals,
               reviewSignal,
+            );
+            const submission = captureDecisionSubmission({
+              attempt: decisionSubmissions.length + 1,
+              submittedAt,
+              decision: candidateDecision,
+              evidence: guards.evidence,
+              coverage: guards.coverage,
+              validation,
+            });
+            decisionSubmissions.push(submission);
+            await journal?.recordArtifact(
+              `decision-submission-${submission.attempt}`,
+              submission,
             );
             const validationFeedback = targetRepairFeedback(
               candidatePlan,
@@ -1743,17 +1771,18 @@ export async function runCycle(
               ...evidenceRepairMarketSlugs,
             ].map(
               (marketSlug) =>
-                `Evidence repair fallback for ${marketSlug}: either correct every cited source issue with exact provider-verifiable current excerpts, or remove this target and submit a PASS disposition using INSUFFICIENT_CURRENT_EVIDENCE with null probability fields, empty evidence, and no evidence bundle IDs. Do not label an evidence-blocked market NO_POSITIVE_EDGE.`,
+                `For ${marketSlug}, correct source claims using the exact available passages in evidenceIssues[].repairContext or reselect the cached page. A claim mismatch is not a fetch failure. Keep your inferred probability and calculations in the thesis, separate from source facts. If the factual support remains unavailable, remove the target and submit INSUFFICIENT_CURRENT_EVIDENCE with null probability fields, empty evidence, and no evidence bundle IDs.`,
             );
             const guardFeedback =
               guardInstructions.length > 0
                 ? ({
                     acceptedProposalIndexes: [],
                     rejectedProposals: [],
+                    evidenceIssues: guards.evidence.issues,
                     instructions: [
                       "Resubmit the complete intended trade plan. Every held position requires a target; use its supplied current cost-basis fraction for an unchanged hold or zero to exit. Every seriously evaluated non-held candidate requires either a target or a compact pass disposition.",
                       "Use only sources observed in this cycle. Current evidence needs an exact excerpt, correct event year, and a provider-verifiable publication/as-of date; do not copy a search result from another year.",
-                      "Rejected-candidate evidence cannot authorize exposure. Do not spend repair rounds rescuing a source for a candidate you will not trade; omit that candidate.",
+                      "Evidence checks validate factual inputs, not the inferred probability of an unresolved outcome. Do not invent a source fact or change the forecast just to pass validation.",
                       "For a held market, retain the target after decision-relevant inspection even when holding unchanged. Do not synthesize or paraphrase an exact excerpt.",
                       ...evidenceRepairInstructions,
                       ...guardInstructions,
@@ -1768,7 +1797,6 @@ export async function runCycle(
             const quoteMovedOnly =
               guardFeedback === undefined &&
               passFeedback === undefined &&
-              guards.mutationProvenance.valid &&
               validation.rejected.length > 0 &&
               validation.rejected.every((rejection) =>
                 TRANSIENT_MARKET_STRUCTURE_REJECTIONS.has(rejection.code),
@@ -1789,10 +1817,21 @@ export async function runCycle(
         }),
       overallController.signal,
     );
+    const decisionReturnedAt = safeTimestamp(now).toISOString();
     const finalGuards = await validateDecisionGuards(
       rawDecision,
       overallController.signal,
     );
+    const submissionHistory = summarizeDecisionSubmissions(
+      decisionSubmissions,
+      rawDecision.portfolioTargets,
+    );
+    await journal?.recordArtifact("decision-submissions", submissionHistory);
+    for (const target of submissionHistory.omittedTargets) {
+      warnings.push(
+        `Final plan omitted previously submitted ${target.marketSlug} ${target.side}; earlier validation codes: ${target.priorIssueCodes.join(", ") || "none"}. See decision-submissions for the recorded attempts.`,
+      );
+    }
     // A pass-edge contradiction challenges a non-ordering disposition. Keep it
     // blocking throughout bounded model repair, then retain it as an audited
     // advisory instead of letting that PASS veto unrelated valid targets.
@@ -1855,6 +1894,57 @@ export async function runCycle(
       warnings.push(
         `Discarded all staged advisory-memory changes because ${finalGuards.mutationProvenance.issues.length} provenance check${finalGuards.mutationProvenance.issues.length === 1 ? "" : "s"} failed; the trade decision remained eligible for independent validation`,
       );
+    }
+    // Advisory diagnostics never revise the target or add a trading gate.
+    // Only staged, current-cycle scalar claims are compared; older forecasts
+    // remain historical observations rather than constraints on new judgment.
+    let forecastMemoryReview: ForecastMemoryReview | undefined;
+    let quarantinedForecastBeliefIds: readonly string[] = [];
+    if (agentState.persistent && !stagedPersistenceDiscarded) {
+      try {
+        const stateForReview =
+          agentState.loadAudit === undefined
+            ? await agentState.load(memoryContextScope)
+            : await agentState.loadAudit();
+        forecastMemoryReview = reviewForecastMemory({
+          beliefs: stateForReview.beliefs,
+          cycleStartedAt: startedAt.toISOString(),
+          submittedForecasts: [
+            ...decisionSubmissions.flatMap((submission) =>
+              submission.targets.map((target) => ({
+                ...target,
+                submittedAt: submission.submittedAt,
+              })),
+            ),
+            ...rawDecision.portfolioTargets.map((target) => ({
+              ...target,
+              submittedAt: decisionReturnedAt,
+            })),
+          ],
+        });
+        await journal?.recordArtifact(
+          "forecast-memory-review",
+          forecastMemoryReview,
+        );
+        if (forecastMemoryReview.issues.length > 0) {
+          quarantinedForecastBeliefIds =
+            (await agentState.quarantineForecasts?.(
+              forecastMemoryReview.issues,
+              overallController.signal,
+            )) ?? [];
+          if (quarantinedForecastBeliefIds.length > 0) {
+            persistenceTransaction?.markMutated();
+          }
+          warnings.push(
+            `Advisory forecast review found ${forecastMemoryReview.issues.length} inconsistent or ambiguous scalar(s); quarantined ${quarantinedForecastBeliefIds.length}. Original values remain in the audit; trade eligibility was unchanged.`,
+          );
+        }
+      } catch (error) {
+        if (overallController.signal.aborted) throw error;
+        warnings.push(
+          `Advisory forecast review could not complete; trade validation remains independent: ${safeErrorMessage(error)}`,
+        );
+      }
     }
     const targetPlan = materializeTargetDecision(
       rawDecision,
@@ -2344,6 +2434,18 @@ export async function runCycle(
     const tokenUsage = aggregateTokenUsage(transcriptRounds);
     const cacheDiagnostics = aggregateCacheDiagnostics(transcriptRounds);
     const decisionAudit = {
+      submissions: submissionHistory,
+      ...(forecastMemoryReview === undefined
+        ? {}
+        : {
+            forecastMemory: {
+              checkedBeliefCount: forecastMemoryReview.checkedBeliefIds.length,
+              issueCount: forecastMemoryReview.issues.length,
+              quarantinedBeliefIds: quarantinedForecastBeliefIds,
+              unverifiedBeliefCount:
+                forecastMemoryReview.unverifiedBeliefs.length,
+            },
+          }),
       evidence: {
         valid: evidenceValidation.valid,
         verifiedSourceCount: evidenceValidation.verifiedSources.length,

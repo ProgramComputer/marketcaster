@@ -5,6 +5,7 @@ import {
   evidencePageReadFailureReason,
   fetchEvidencePage,
   isPublicIpAddress,
+  validateDecisionEvidence,
 } from "../dist/src/agent/evidence-provenance.js";
 import { loadPromptBundle } from "../dist/src/config/prompts.js";
 import { DEFAULT_DECISION_LIMITS } from "../dist/src/llm/decision-provider.js";
@@ -158,7 +159,7 @@ const researchTools = new DecisionResearchTools({
 });
 const researchSession = researchTools.createSession({
   ...DEFAULT_DECISION_LIMITS,
-  maximumEvidenceSourceReadRequests: 2,
+  maximumEvidenceSourceReadRequests: 1,
 });
 researchTools.recordProviderEvidenceSources([
   {
@@ -185,16 +186,32 @@ assert.equal(firstFailedRead.errorCode, "EVIDENCE_SOURCE_READ_FAILED");
 assert.equal(JSON.parse(firstFailedRead.content).reason, "ACCESS_DENIED");
 assert.equal(cachedFailureReadCount, 1);
 
-const exhaustedRead = await researchSession.execute(
+const repeatedFailedRead = await researchSession.execute(
   "read_evidence_source",
   readInput,
+  readSignal,
+);
+assert.deepEqual(repeatedFailedRead, firstFailedRead);
+assert.equal(researchSession.counts.evidenceSourceReads, 1);
+const secondSourceUrl = "https://example.com/another-source";
+researchTools.recordProviderEvidenceSources([
+  {
+    url: secondSourceUrl,
+    title: "Another synthetic source",
+    observedAt: "2026-09-04T12:00:00.000Z",
+    provider: "CLIENT_WEB_SEARCH",
+  },
+]);
+const exhaustedRead = await researchSession.execute(
+  "read_evidence_source",
+  { url: secondSourceUrl },
   readSignal,
 );
 assert.equal(exhaustedRead.errorCode, "EVIDENCE_SOURCE_READ_LIMIT_REACHED");
 assert.equal(
   cachedFailureReadCount,
   1,
-  "Failure caching does not grant extra tool attempts",
+  "Cached failures never retry the network or grant another fetch",
 );
 
 for (const [status, reason] of [
@@ -368,7 +385,46 @@ for (const candidate of fragments.claimExcerptCandidates) {
 }
 const absent = selectEvidenceSourceText("A simple unrelated source", "needle");
 assert.equal(absent.selectionMode, "NO_MATCH_PREFIX");
-assert.deepEqual(absent.claimExcerptCandidates, []);
+assert.deepEqual(absent.claimExcerptCandidates, ["A simple unrelated source"]);
+assert.equal(
+  absent.matchCount,
+  0,
+  "A useful prefix does not claim a query match",
+);
+const prefixTable = `${"Synthetic introduction. ".repeat(50)}TABLE ROW VALUE 43.5`;
+const unmatchedTable = selectEvidenceSourceText(prefixTable, "absent query");
+assert.ok(
+  unmatchedTable.claimExcerptCandidates.some((candidate) =>
+    candidate.includes("TABLE ROW VALUE 43.5"),
+  ),
+  "No-match candidates include later source rows instead of only the page introduction",
+);
+assert.ok(
+  unmatchedTable.claimExcerptCandidates.every(
+    (candidate) => prefixTable.includes(candidate) && candidate.length <= 600,
+  ),
+);
+const boundaryRows = `HEADER\n${"row 17 value 42\n".repeat(20)}`;
+const boundarySource = `${"x".repeat(450)}${boundaryRows}${"x".repeat(450)}`;
+assert.ok(
+  selectEvidenceSourceText(
+    boundarySource,
+    "absent query",
+  ).claimExcerptCandidates.some((candidate) =>
+    candidate.includes(boundaryRows),
+  ),
+  "Overlapping candidates preserve a table section crossing a candidate boundary",
+);
+const longPrefix = `${"Synthetic introduction. ".repeat(200)}${boundaryRows}`;
+const cappedPrefixSelection = selectEvidenceSourceText(
+  longPrefix,
+  "absent query",
+);
+assert.equal(cappedPrefixSelection.text, longPrefix.slice(0, 4_000));
+assert.ok(
+  cappedPrefixSelection.claimExcerptCandidates.length <= 8,
+  "No-match candidate duplication stays bounded while the full source prefix remains readable",
+);
 assert.deepEqual(selectEvidenceSourceText("", null).claimExcerptCandidates, []);
 
 let successfulReads = 0;
@@ -381,7 +437,7 @@ const cachedSuccessTools = new DecisionResearchTools({
 });
 const cachedSuccess = cachedSuccessTools.createSession({
   ...DEFAULT_DECISION_LIMITS,
-  maximumEvidenceSourceReadRequests: 2,
+  maximumEvidenceSourceReadRequests: 1,
 });
 cachedSuccessTools.recordProviderEvidenceSources([
   {
@@ -391,7 +447,11 @@ cachedSuccessTools.recordProviderEvidenceSources([
     provider: "CLIENT_WEB_SEARCH",
   },
 ]);
-for (const find of ["FIRST VALUE", "SECOND VALUE"]) {
+for (const [index, find] of [
+  "FIRST VALUE",
+  "SECOND VALUE",
+  "FIRST VALUE",
+].entries()) {
   const result = await cachedSuccess.execute(
     "read_evidence_source",
     { url: pageUrl, find },
@@ -399,6 +459,7 @@ for (const find of ["FIRST VALUE", "SECOND VALUE"]) {
   );
   assert.equal(result.isError, false);
   const selection = JSON.parse(result.content);
+  assert.equal(selection.reusedSnapshot, index > 0);
   assert.ok(
     selection.claimExcerptCandidates.some((candidate) =>
       candidate.includes(find),
@@ -410,3 +471,168 @@ assert.equal(
   1,
   "Different excerpt queries share one observed source snapshot",
 );
+assert.equal(cachedSuccess.counts.evidenceSourceReads, 1);
+assert.equal(cachedSuccess.counts.successfulEvidenceSourceReads, 1);
+assert.equal(cachedSuccessTools.evidencePageSnapshots.size, 1);
+
+// No-match live feeds cannot pass off an unrelated prefix as a matching record.
+const absentFeedTools = new DecisionResearchTools({
+  prompts: prompts.research,
+  evidencePageReader: async (url) => ({
+    finalUrl: url,
+    text: "Unrelated record",
+  }),
+});
+const absentFeedSession = absentFeedTools.createSession(
+  DEFAULT_DECISION_LIMITS,
+);
+absentFeedTools.recordProviderEvidenceSources([
+  {
+    url: pageUrl,
+    title: "Synthetic live feed",
+    observedAt: "2026-01-02T00:00:00Z",
+    provider: "SYSTEM_LIVE_FEED",
+  },
+]);
+const absentFeed = JSON.parse(
+  (
+    await absentFeedSession.execute(
+      "read_evidence_source",
+      { url: pageUrl, find: "absent event" },
+      readSignal,
+    )
+  ).content,
+);
+assert.equal(absentFeed.selectionMode, "NO_MATCH_PREFIX");
+assert.deepEqual(absentFeed.claimExcerptCandidates, []);
+assert.match(absentFeed.text, /No matching live-score record/u);
+
+// Reproduce incomplete table claims offline. Repairs offer exact source spans;
+// they do not weaken numeric, excerpt, event-year, or timestamp validation.
+const tableSnapshot =
+  "DATE HOUR READING 6-hour maximum\n02 10:00 43.5 43.5\n02 11:00 42 43.5";
+const observation = {
+  url: pageUrl,
+  title: "Synthetic sensor observations",
+  excerpt: "02 11:00 42 43.5",
+  observedAt: "2026-01-02T12:00:00Z",
+  provider: "CLIENT_WEB_SEARCH",
+};
+const tableEvidence = {
+  title: observation.title,
+  url: pageUrl,
+  evidenceClass: "LIVE_DATA",
+  claimEventYear: 2026,
+  asOf: observation.observedAt,
+  claimExcerpt: "02 10:00 43.5 43.5",
+  relevance: "The 6-hour maximum was 43.5; the later reading was 42.",
+};
+const syntheticTarget = {
+  marketSlug: "synthetic-sensor-2026",
+  estimatedProbability: "0.71",
+  thesis:
+    "My inferred probability is 71%; the source reports observations, not this forecast.",
+  evidence: [tableEvidence],
+};
+const validateTable = (evidence, overrides = {}) =>
+  validateDecisionEvidence({
+    decision: {
+      portfolioTargets: [{ ...syntheticTarget, evidence: [evidence] }],
+      candidateDispositions: [],
+    },
+    observedSources: [observation],
+    marketsBySlug: new Map([
+      [
+        syntheticTarget.marketSlug,
+        {
+          slug: syntheticTarget.marketSlug,
+          title: "Synthetic sensor 2026",
+          description: "A synthetic threshold contract",
+          settlementRules: "The final reading determines settlement.",
+          closesAt: new Date("2026-01-03T00:00:00Z"),
+        },
+      ],
+    ]),
+    minimumIndependentSources: 1,
+    now: new Date(observation.observedAt),
+    evidencePageSnapshots: new Map([
+      [pageUrl, Promise.resolve({ finalUrl: pageUrl, text: tableSnapshot })],
+    ]),
+    fetchImplementation: async () => {
+      throw new Error("Validation must reuse the captured source");
+    },
+    ...overrides,
+  });
+const incompleteTable = await validateTable(tableEvidence);
+assert.equal(incompleteTable.valid, false);
+const numericIssue = incompleteTable.issues.find(
+  (issue) => issue.code === "CLAIM_NUMERIC_DETAIL_UNSUPPORTED",
+);
+assert.deepEqual(numericIssue.unsupportedNumericDetails, ["6", "42"]);
+assert.equal(numericIssue.repairContext.sourceKind, "PAGE_SNAPSHOT");
+assert.ok(
+  !incompleteTable.issues.some((issue) => issue.code === "SOURCE_FETCH_FAILED"),
+);
+for (const candidate of numericIssue.repairContext.claimExcerptCandidates) {
+  assert.ok(tableSnapshot.includes(candidate));
+  assert.ok(candidate.length <= 600);
+}
+const correctedTable = {
+  ...tableEvidence,
+  claimExcerpt: numericIssue.repairContext.claimExcerptCandidates[0],
+};
+assert.equal((await validateTable(correctedTable)).valid, true);
+assert.equal(
+  (
+    await validateTable({
+      ...correctedTable,
+      claimExcerpt: "Invented reading 999",
+    })
+  ).valid,
+  false,
+);
+assert.equal(
+  (
+    await validateTable({
+      ...correctedTable,
+      relevance: "The reading was 999.",
+    })
+  ).valid,
+  false,
+);
+assert.equal(
+  (await validateTable({ ...correctedTable, claimEventYear: 2025 })).valid,
+  false,
+);
+assert.equal(
+  (await validateTable({ ...correctedTable, asOf: "2025-01-02T12:00:00Z" }))
+    .valid,
+  false,
+);
+assert.equal(
+  (
+    await validateTable({
+      ...correctedTable,
+      relevance: "The source estimates 71%.",
+    })
+  ).valid,
+  false,
+  "The model's inferred probability belongs in its thesis, not the cited facts",
+);
+const unavailableTable = await validateTable(tableEvidence, {
+  evidencePageSnapshots: new Map([
+    [
+      pageUrl,
+      Promise.reject(new EvidencePageReadError("TIMEOUT", "Synthetic timeout")),
+    ],
+  ]),
+});
+assert.equal(
+  unavailableTable.issues.find((issue) => issue.code === "SOURCE_FETCH_FAILED")
+    .sourceFetchFailureReason,
+  "TIMEOUT",
+);
+
+// A new cycle cannot reuse or expose an earlier cycle's pages.
+cachedSuccessTools.createSession(DEFAULT_DECISION_LIMITS);
+assert.equal(cachedSuccessTools.evidencePageSnapshots.size, 0);
