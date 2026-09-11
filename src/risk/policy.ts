@@ -1,8 +1,17 @@
 import type { AgentConfig } from "../config/schema.js";
+import type { TradeAction } from "../domain/primitives.js";
 
 export type RiskPolicy = AgentConfig["risk"];
 
+export function positionReductionDisabled(
+  allowPositionReductions: boolean | undefined,
+  action: TradeAction,
+): boolean {
+  return allowPositionReductions === false && action === "SELL";
+}
+
 export type RiskRejectionCode =
+  | "POSITION_REDUCTION_DISABLED"
   | "MARKET_NOT_RESEARCHED"
   | "MARKET_NOT_FOUND"
   | "MARKET_INACTIVE"

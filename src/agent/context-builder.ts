@@ -48,6 +48,7 @@ export interface RiskConstraintsInput {
   readonly duplicateWindowMinutes: number;
   readonly minimumIndependentSources: number;
   readonly allowNakedShorts: false;
+  readonly allowPositionReductions?: boolean;
   readonly emergencyExitEnabled: boolean;
   readonly managedRestingBuyOrders: {
     readonly enabled: boolean;
@@ -270,6 +271,7 @@ export interface AgentContext {
     readonly duplicateWindowMinutes: number;
     readonly minimumIndependentSources: number;
     readonly allowNakedShorts: false;
+    readonly allowPositionReductions: boolean;
     readonly emergencyExitEnabled: boolean;
     readonly managedRestingBuyOrders: {
       readonly enabled: boolean;
@@ -634,6 +636,12 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
     ),
     "risk maximumCycleSpendUsd",
   );
+  const allowPositionReductions =
+    input.riskConstraints.allowPositionReductions ?? true;
+  const criticalLearning =
+    input.criticalLearningPolicy === undefined
+      ? buildCriticalLearning(performance)
+      : input.criticalLearningPolicy(performance, input.previousCycle);
 
   return {
     currentUtcTime,
@@ -760,10 +768,15 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
     ...(input.previousCycle === undefined
       ? {}
       : { previousCycle: input.previousCycle }),
-    criticalLearning:
-      input.criticalLearningPolicy === undefined
-        ? buildCriticalLearning(performance)
-        : input.criticalLearningPolicy(performance, input.previousCycle),
+    criticalLearning: allowPositionReductions
+      ? criticalLearning
+      : {
+          ...criticalLearning,
+          positionManagementReminders: [
+            ...criticalLearning.positionManagementReminders,
+            "risk.allowPositionReductions=false: canonical SELL YES and SELL NO are disabled, including trims, zero-target exits, and emergency exits. BUY YES and BUY NO remain subject to existing safeguards; raw exchange side does not determine this policy. Keep any requested reduction as blocked intent, not an intended hold; do not retry to override POSITION_REDUCTION_DISABLED. Cancellations and exchange settlement are unaffected.",
+          ],
+        },
     markets: {
       catalogCount: input.marketCatalog.count,
       categoryCounts: input.marketCatalog.categoryCounts,
@@ -816,6 +829,7 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
       minimumIndependentSources:
         input.riskConstraints.minimumIndependentSources,
       allowNakedShorts: input.riskConstraints.allowNakedShorts,
+      allowPositionReductions,
       emergencyExitEnabled: input.riskConstraints.emergencyExitEnabled,
       managedRestingBuyOrders: {
         enabled: input.riskConstraints.managedRestingBuyOrders.enabled,

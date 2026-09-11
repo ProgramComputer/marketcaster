@@ -14,7 +14,7 @@ import {
   estimateExchangeTakerFee,
   feeForEdgeEvaluation,
 } from "../risk/edge.js";
-import type { RiskPolicy } from "../risk/policy.js";
+import { positionReductionDisabled, type RiskPolicy } from "../risk/policy.js";
 import type {
   ManagedRestingBuyOrdersPolicy,
   ValidatedProposal,
@@ -112,7 +112,8 @@ interface ExecutionJournalSubmissionBase {
 export type ExecutionJournalSubmissionOutcome =
   | (ExecutionJournalSubmissionBase & {
       readonly kind: "NOT_SUBMITTED";
-      readonly reason: "ABORTED_BEFORE_SUBMISSION";
+      readonly reason:
+        "ABORTED_BEFORE_SUBMISSION" | "POSITION_REDUCTION_DISABLED";
     })
   | (ExecutionJournalSubmissionBase & {
       readonly kind: "RETURNED";
@@ -698,6 +699,14 @@ export async function executeValidatedOrders(
     let phase: ExecutionFailurePhase = "PRECHECK";
     let mutationMayHaveOccurred = false;
     try {
+      if (
+        positionReductionDisabled(
+          input.policy.allowPositionReductions,
+          validated.order.action,
+        )
+      ) {
+        throw new SafetyGuardError("POSITION_REDUCTION_DISABLED");
+      }
       let cooldown: ExecutionCooldown | undefined;
       try {
         cooldown = await executionHealth?.blockedUntil(
@@ -847,7 +856,18 @@ export async function executeValidatedOrders(
                 positionsBefore: positions,
               }),
       );
-      if (input.signal?.aborted === true) {
+      // Recheck the actual canonical order after preview and journal hooks;
+      // exchange SELL can also represent BUY NO and is not a reduction.
+      const notSubmittedReason =
+        input.signal?.aborted === true
+          ? "ABORTED_BEFORE_SUBMISSION"
+          : positionReductionDisabled(
+                input.policy.allowPositionReductions,
+                validated.order.action,
+              )
+            ? "POSITION_REDUCTION_DISABLED"
+            : undefined;
+      if (notSubmittedReason !== undefined) {
         const observedAt = safeJournalTimestamp(now, submittedAt);
         await recordJournalEvent(
           "PRE_SUBMISSION_OUTCOME",
@@ -858,14 +878,15 @@ export async function executeValidatedOrders(
                 journal.recordSubmissionOutcome({
                   ...identity,
                   kind: "NOT_SUBMITTED",
-                  reason: "ABORTED_BEFORE_SUBMISSION",
+                  reason: notSubmittedReason,
                   attemptSequence,
                   submittedAt,
                   observedAt,
                   validated,
                 }),
         );
-        input.signal.throwIfAborted();
+        input.signal?.throwIfAborted();
+        throw new SafetyGuardError(notSubmittedReason);
       }
 
       type PlacementOutcome =

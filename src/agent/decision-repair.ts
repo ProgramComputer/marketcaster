@@ -7,11 +7,55 @@ import type {
 import type { RiskRejectionCode } from "../risk/policy.js";
 
 export function isRepairableRiskRejection(code: RiskRejectionCode): boolean {
-  // Every named risk rejection is deterministic feedback the model can address
-  // by correcting, dropping, or replacing a proposal. EXCHANGE_ERROR is the
-  // catch-all for infrastructure/read failures and is deliberately not fed
-  // back as a repair opportunity.
-  return code !== "EXCHANGE_ERROR";
+  // Infrastructure failures and an operator-disabled capability cannot be
+  // repaired by changing the model's intended portfolio.
+  return code !== "EXCHANGE_ERROR" && code !== "POSITION_REDUCTION_DISABLED";
+}
+
+/** Keep policy-blocked intent visible while independent targets are repaired. */
+export function retainPositionReductionRequests(
+  decision: AgentDecision,
+  previous: AgentDecision | undefined,
+  blockedMarketSlugs: ReadonlySet<string>,
+): AgentDecision {
+  if (previous === undefined || blockedMarketSlugs.size === 0) return decision;
+  const targets = previous.portfolioTargets.filter((target) =>
+    blockedMarketSlugs.has(target.marketSlug),
+  );
+  const proposals = previous.proposals.filter((proposal) =>
+    blockedMarketSlugs.has(proposal.marketSlug),
+  );
+  const retainedBundleIds = new Set(
+    [...targets, ...proposals].flatMap((item) => item.evidenceBundleIds ?? []),
+  );
+  const retainedBundles = (previous.evidenceBundles ?? []).filter((bundle) =>
+    retainedBundleIds.has(bundle.id),
+  );
+  const evidenceBundles = [
+    ...(decision.evidenceBundles ?? []).filter(
+      (bundle) => !retainedBundleIds.has(bundle.id),
+    ),
+    ...retainedBundles,
+  ];
+  return {
+    ...decision,
+    portfolioTargets: [
+      ...decision.portfolioTargets.filter(
+        (target) => !blockedMarketSlugs.has(target.marketSlug),
+      ),
+      ...targets,
+    ],
+    proposals: [
+      ...decision.proposals.filter(
+        (proposal) => !blockedMarketSlugs.has(proposal.marketSlug),
+      ),
+      ...proposals,
+    ],
+    candidateDispositions: decision.candidateDispositions.filter(
+      (disposition) => !blockedMarketSlugs.has(disposition.marketSlug),
+    ),
+    ...(evidenceBundles.length === 0 ? {} : { evidenceBundles }),
+  };
 }
 
 export function buildTerminalDecisionRepairFeedback(
@@ -21,8 +65,10 @@ export function buildTerminalDecisionRepairFeedback(
   minimumIndependentSources: number,
 ): TerminalDecisionRepairFeedback | undefined {
   if (
-    !validation.rejected.some((rejection) =>
-      isRepairableRiskRejection(rejection.code),
+    !validation.rejected.some(
+      (rejection) =>
+        isRepairableRiskRejection(rejection.code) ||
+        rejection.code === "POSITION_REDUCTION_DISABLED",
     )
   ) {
     return undefined;
@@ -62,6 +108,13 @@ export function buildTerminalDecisionRepairFeedback(
     })),
     instructions: [
       "Resubmit the complete intended target portfolio, not only changed items; keep an accepted target only if it is still intended.",
+      ...(validation.rejected.some(
+        (rejection) => rejection.code === "POSITION_REDUCTION_DISABLED",
+      )
+        ? [
+            "POSITION_REDUCTION_DISABLED is a fixed runtime policy, not a repair opportunity. Its original requested reduction and rejection will be retained. Repair only independent issues; do not replace the blocked reduction with a hold or try to override the policy.",
+          ]
+        : []),
       "Use fresh evidence or research to correct a target, replace it, or omit it. Do not invent evidence or change a probability merely to force validation to pass.",
       ...(mustDropUnexecutableTargets
         ? [

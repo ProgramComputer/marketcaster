@@ -84,7 +84,10 @@ import {
   type BuildAgentContextInput,
   type DetailedMarketContext,
 } from "./context-builder.js";
-import { buildTerminalDecisionRepairFeedback } from "./decision-repair.js";
+import {
+  buildTerminalDecisionRepairFeedback,
+  retainPositionReductionRequests,
+} from "./decision-repair.js";
 import {
   captureDecisionSubmission,
   summarizeDecisionSubmissions,
@@ -1284,6 +1287,8 @@ export async function runCycle(
         minimumIndependentSources:
           dependencies.config.risk.minimumIndependentSources,
         allowNakedShorts: dependencies.config.risk.allowNakedShorts,
+        allowPositionReductions:
+          dependencies.config.risk.allowPositionReductions,
         emergencyExitEnabled: dependencies.config.risk.emergencyExitEnabled,
         managedRestingBuyOrders:
           dependencies.config.exchange.managedRestingBuyOrders,
@@ -1312,6 +1317,7 @@ export async function runCycle(
     const tradePreviewResolver = new AdvisoryTradePreviewResolver(
       dependencies.exchange,
       discovery.catalog.bySlug,
+      dependencies.config.risk.allowPositionReductions,
     );
     const currentMutationProvenanceContext = (): MutationProvenanceContext => ({
       // Advisory memory may cite an observed source; trade authorization retains
@@ -1674,7 +1680,10 @@ export async function runCycle(
         passEdgeAudit: passAudit,
       };
     };
-    const rawDecision = await withStageTimeout(
+    const blockedReductionMarketSlugs = new Set<string>();
+    let retainedReductionDecision: AgentDecision | undefined;
+    let reductionPolicyArtifactCount = 0;
+    const submittedDecision = await withStageTimeout(
       "agent-research",
       dependencies.config.cycle.stageBudgetsSeconds.agentResearch * 1000,
       (signal) =>
@@ -1688,6 +1697,12 @@ export async function runCycle(
           signal,
           reviewTerminalDecision: async (candidateDecision, reviewSignal) => {
             const submittedAt = safeTimestamp(now).toISOString();
+            const modelDecision = candidateDecision;
+            candidateDecision = retainPositionReductionRequests(
+              candidateDecision,
+              retainedReductionDecision,
+              blockedReductionMarketSlugs,
+            );
             const guards = await validateDecisionGuards(
               candidateDecision,
               reviewSignal,
@@ -1706,10 +1721,31 @@ export async function runCycle(
               candidatePlan.riskProposals,
               reviewSignal,
             );
+            for (const rejection of validation.rejected) {
+              if (rejection.code === "POSITION_REDUCTION_DISABLED") {
+                blockedReductionMarketSlugs.add(rejection.proposal.marketSlug);
+                retainedReductionDecision = candidateDecision;
+              }
+            }
+            const blockedReductions = validation.rejected.filter(
+              (rejection) => rejection.code === "POSITION_REDUCTION_DISABLED",
+            );
+            if (blockedReductions.length > 0) {
+              // Retain rejected intent even if an independent final safety
+              // guard aborts before the normal decision/report artifacts.
+              reductionPolicyArtifactCount += 1;
+              await journal?.recordArtifact(
+                `position-reduction-policy-${reductionPolicyArtifactCount}`,
+                {
+                  decision: candidateDecision,
+                  rejectedProposals: blockedReductions,
+                },
+              );
+            }
             const submission = captureDecisionSubmission({
               attempt: decisionSubmissions.length + 1,
               submittedAt,
-              decision: candidateDecision,
+              decision: modelDecision,
               evidence: guards.evidence,
               coverage: guards.coverage,
               validation,
@@ -1809,13 +1845,23 @@ export async function runCycle(
             // obtain fresh live evidence. Authoritative final validation still
             // runs, so a quote that returns before execution remains eligible.
             if (quoteMovedOnly) return { repair: false };
-            return feedback === undefined
+            return feedback === undefined ||
+              (guardFeedback === undefined &&
+                passFeedback === undefined &&
+                !feedback.rejectedProposals.some(
+                  (rejection) => rejection.repairable,
+                ))
               ? { repair: false }
               : { repair: true, feedback };
           },
           recordTranscriptRound,
         }),
       overallController.signal,
+    );
+    const rawDecision = retainPositionReductionRequests(
+      submittedDecision,
+      retainedReductionDecision,
+      blockedReductionMarketSlugs,
     );
     const decisionReturnedAt = safeTimestamp(now).toISOString();
     const finalGuards = await validateDecisionGuards(

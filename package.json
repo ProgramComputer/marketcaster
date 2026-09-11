@@ -10,6 +10,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "check:position-reductions": "node scripts/check-position-reductions.mjs && node scripts/check-position-reduction-context.mjs && node scripts/check-position-reduction-cycle.mjs",
     "check:overrides": "node scripts/check-runtime-overrides.mjs",
     "cycle": "node dist/src/index.js",
     "dev": "tsx src/index.ts",
