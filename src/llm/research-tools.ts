@@ -43,9 +43,10 @@ import type {
   AgentStateOperation,
   AgentStateOperationResult,
 } from "../agent/agent-state.js";
-import type {
-  AdvisoryTradePreviewRequest,
-  AdvisoryTradePreviewResult,
+import {
+  PositionReductionDisabledPreviewError,
+  type AdvisoryTradePreviewRequest,
+  type AdvisoryTradePreviewResult,
 } from "../agent/trade-preview.js";
 import type {
   PromptBundle,
@@ -3771,6 +3772,9 @@ export class DecisionResearchSession {
       };
     } catch (error) {
       if (signal.aborted) throw error;
+      if (error instanceof PositionReductionDisabledPreviewError) {
+        return safeToolError(error.code, error.message);
+      }
       return safeToolError(
         "TRADE_PREVIEW_FAILED",
         this.messages.tradePreviewFailed,

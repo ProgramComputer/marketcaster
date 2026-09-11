@@ -39,6 +39,9 @@ jobs:
       - name: Check runtime overrides
         run: npm run check:overrides
 
+      - name: Check position reductions
+        run: npm run check:position-reductions
+
       - name: Check extension and state boundaries
         run: |
           npm run check:policy

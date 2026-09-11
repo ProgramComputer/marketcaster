@@ -179,6 +179,7 @@ export const RepositoryConfigSchema = z
         duplicateWindowMinutes: PositiveIntegerSchema,
         minimumIndependentSources: z.number().int().nonnegative(),
         allowNakedShorts: z.literal(false),
+        allowPositionReductions: z.boolean().default(true),
         emergencyExitEnabled: z.boolean(),
       })
       .strict(),
