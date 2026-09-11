@@ -126,6 +126,30 @@ execution. When enabled, marketable quantity may fill immediately and any
 remainder may rest until the runtime-set expiration. Configuration limits that
 lifetime to at most 15 minutes.
 
+`risk.allowPositionReductions` defaults to `true`. Set it to `false` in the
+existing JSON configuration to reject canonical SELL YES and SELL NO actions,
+including trims, zero-target exits, and emergency exits, with
+`POSITION_REDUCTION_DISABLED`. BUY actions keep every existing safeguard; BUY
+NO remains a BUY even when its exchange order side is SELL. Cancellations and
+exchange settlement are unaffected. Validation excludes blocked sale proceeds
+from allocation, and execution independently checks the actual order before
+submission. Agent context (including custom prompts), previews, and observe
+mode use the same capability. Blocked targets remain recorded as requested
+reductions with their rejection and cannot be repaired into a policy override.
+
+Merge this single field into the existing `risk` object of the complete file
+selected by `MARKETCASTER_CONFIG_PATH`; no additional environment or prompt
+setting is needed. Omission or `true` preserves existing behavior; other types
+are invalid.
+
+```json
+{
+  "risk": {
+    "allowPositionReductions": false
+  }
+}
+```
+
 ## Safety and correctness
 
 Safety mechanisms remain part of the public engine:

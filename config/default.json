@@ -77,6 +77,7 @@
     "duplicateWindowMinutes": 30,
     "minimumIndependentSources": 1,
     "allowNakedShorts": false,
+    "allowPositionReductions": true,
     "emergencyExitEnabled": false
   },
   "exchange": {

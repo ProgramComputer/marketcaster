@@ -31,7 +31,11 @@ import {
   feeForEdgeEvaluation,
 } from "./edge.js";
 import { calculateKellyBudget } from "./kelly.js";
-import type { RiskPolicy, RiskRejectionCode } from "./policy.js";
+import {
+  positionReductionDisabled,
+  type RiskPolicy,
+  type RiskRejectionCode,
+} from "./policy.js";
 
 const MARKET_CLOSE_RESTING_SAFETY_MILLISECONDS = 60_000;
 const MINIMUM_USEFUL_RESTING_WINDOW_MILLISECONDS = 60_000;
@@ -1228,6 +1232,25 @@ export async function validateProposals(
     proposal: submittedProposal,
   } of indexedProposals) {
     input.signal?.throwIfAborted();
+    // Gate canonical reductions before they can reserve fees or contribute
+    // projected proceeds to the BUY allocation. Keep the requested proposal.
+    if (
+      positionReductionDisabled(
+        input.policy.allowPositionReductions,
+        submittedProposal.action,
+      )
+    ) {
+      indexedRejections.push({
+        proposalIndex,
+        rejection: {
+          proposal: submittedProposal,
+          code: "POSITION_REDUCTION_DISABLED",
+          reason:
+            "Canonical SELL actions are disabled by risk.allowPositionReductions",
+        },
+      });
+      continue;
+    }
     const freshProbability = input.freshProbabilityByMarketSlug?.get(
       submittedProposal.marketSlug,
     );
