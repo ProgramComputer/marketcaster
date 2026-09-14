@@ -962,7 +962,9 @@ export async function runCycle(
     );
     const discovery = await withStageTimeout(
       "market-discovery",
-      dependencies.config.cycle.stageBudgetsSeconds.marketDiscovery * 1000,
+      dependencies.config.cycle.stageBudgetsSeconds.marketDiscovery === null
+        ? null
+        : dependencies.config.cycle.stageBudgetsSeconds.marketDiscovery * 1000,
       async (signal) => {
         const catalog = await discoverMarketCatalog(
           dependencies.exchange,

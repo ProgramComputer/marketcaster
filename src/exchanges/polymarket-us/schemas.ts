@@ -278,11 +278,16 @@ export const OrderBookResponseSchema = z.union([
     .transform((value) => value.data),
 ]);
 
+const OptionalQuoteAmountSchema = z.preprocess(
+  (value) => (value === null ? undefined : value),
+  AmountSchema.optional(),
+);
+
 const BboPayloadSchema = z
   .object({
     marketSlug: NonEmptyStringSchema,
-    bestBid: AmountSchema.optional(),
-    bestAsk: AmountSchema.optional(),
+    bestBid: OptionalQuoteAmountSchema,
+    bestAsk: OptionalQuoteAmountSchema,
     transactTime: DateTimeSchema.optional(),
     observedAt: DateTimeSchema.optional(),
   })

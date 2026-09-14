@@ -7,15 +7,19 @@ export class StageTimeoutError extends Error {
 
 export async function withStageTimeout<T>(
   stage: string,
-  timeoutMilliseconds: number,
+  timeoutMilliseconds: number | null,
   operation: (signal: AbortSignal) => Promise<T>,
   parentSignal?: AbortSignal,
 ): Promise<T> {
+  parentSignal?.throwIfAborted();
   const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(new StageTimeoutError(stage)),
-    timeoutMilliseconds,
-  );
+  const timeout =
+    timeoutMilliseconds === null
+      ? undefined
+      : setTimeout(
+          () => controller.abort(new StageTimeoutError(stage)),
+          timeoutMilliseconds,
+        );
   const abortFromParent = (): void => controller.abort(parentSignal?.reason);
   parentSignal?.addEventListener("abort", abortFromParent, { once: true });
 
@@ -27,7 +31,7 @@ export async function withStageTimeout<T>(
     }
     throw error;
   } finally {
-    clearTimeout(timeout);
+    if (timeout !== undefined) clearTimeout(timeout);
     parentSignal?.removeEventListener("abort", abortFromParent);
   }
 }
