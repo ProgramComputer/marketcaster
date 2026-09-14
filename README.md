@@ -103,6 +103,13 @@ identity, source validity, correlation, executable liquidity, or permission to
 trade. Those facts are checked later against exact market details and refreshed
 exchange state.
 
+Set `cycle.stageBudgetsSeconds.marketDiscovery` to `null` in a deployment's
+complete configuration to use the overall cycle deadline without a separate
+discovery timer. A positive integer retains a discovery limit in seconds.
+The overall `cycle.timeoutSeconds` and other stage budgets still apply.
+Polymarket US quote sides returned as `null` are treated as absent liquidity;
+any present side retains the normal quote validation.
+
 Research tools support current web search, bounded reads of URLs already
 observed in the cycle, market analysis, and non-binding trade previews. Evidence
 used for a probability-bearing decision must match an observed URL and exact

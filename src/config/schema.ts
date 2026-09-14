@@ -112,7 +112,7 @@ export const RepositoryConfigSchema = z
         timeoutSeconds: PositiveIntegerSchema,
         stageBudgetsSeconds: z
           .object({
-            marketDiscovery: PositiveIntegerSchema,
+            marketDiscovery: PositiveIntegerSchema.nullable(),
             agentResearch: PositiveIntegerSchema,
             validationExecution: PositiveIntegerSchema,
             reconciliationReporting: PositiveIntegerSchema,
@@ -214,11 +214,13 @@ export const RepositoryConfigSchema = z
   })
   .strict()
   .superRefine((value, context) => {
-    const stageBudget = Object.values(value.cycle.stageBudgetsSeconds).reduce(
-      (total, seconds) => total + seconds,
-      0,
-    );
-    if (value.cycle.timeoutSeconds > stageBudget) {
+    const stageBudget = Object.values(
+      value.cycle.stageBudgetsSeconds,
+    ).reduce<number>((total, seconds) => total + (seconds ?? 0), 0);
+    if (
+      value.cycle.stageBudgetsSeconds.marketDiscovery !== null &&
+      value.cycle.timeoutSeconds > stageBudget
+    ) {
       context.addIssue({
         code: "custom",
         path: ["cycle", "timeoutSeconds"],
