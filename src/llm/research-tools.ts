@@ -7,8 +7,10 @@ import {
 import { Decimal } from "decimal.js";
 import { z } from "zod";
 import type { AgentDecision } from "../agent/decision-schema.js";
+import { MutationProvenanceError } from "../agent/persistence-transaction.js";
 import {
   canonicalEvidenceUrl,
+  evidencePageReadFailureReason,
   EvidenceSourceRegistry,
   fetchEvidencePage,
   type FetchedEvidencePage,
@@ -41,9 +43,10 @@ import type {
   AgentStateOperation,
   AgentStateOperationResult,
 } from "../agent/agent-state.js";
-import type {
-  AdvisoryTradePreviewRequest,
-  AdvisoryTradePreviewResult,
+import {
+  PositionReductionDisabledPreviewError,
+  type AdvisoryTradePreviewRequest,
+  type AdvisoryTradePreviewResult,
 } from "../agent/trade-preview.js";
 import type {
   PromptBundle,
@@ -286,11 +289,11 @@ const AgentNoteInputSchema = z.discriminatedUnion("action", [
       action: z.literal("UPDATE"),
       noteId: z.uuid(),
       content: z.string().trim().min(1).max(4_000),
-      evidenceUrls: z.array(z.url()).max(10).default([]),
+      evidenceUrls: z.array(z.url()).max(10).optional(),
       basisMarketSlugs: z
         .array(z.string().trim().min(1).max(500))
         .max(25)
-        .default([]),
+        .optional(),
     })
     .strict(),
   z
@@ -311,6 +314,9 @@ const AgentStateInputSchema = z.discriminatedUnion("action", [
   z
     .object({
       action: z.literal("ADD_BELIEF"),
+      thesisId: z.string().trim().min(1).max(200).optional(),
+      familyKey: z.string().trim().min(1).max(300).optional(),
+      forecastYesProbability: z.number().min(0).max(1).nullable().optional(),
       type: z.enum([
         "EVENT_ANALYSIS",
         "MARKET_STRUCTURE",
@@ -339,6 +345,9 @@ const AgentStateInputSchema = z.discriminatedUnion("action", [
   z
     .object({
       action: z.literal("UPDATE_BELIEF"),
+      thesisId: z.string().trim().min(1).max(200).optional(),
+      familyKey: z.string().trim().min(1).max(300).optional(),
+      forecastYesProbability: z.number().min(0).max(1).nullable().optional(),
       beliefId: z.uuid(),
       type: z
         .enum([
@@ -770,6 +779,7 @@ export type ToolExecutionResult =
       readonly kind: "TOOL_RESULT";
       readonly content: string;
       readonly isError: boolean;
+      readonly errorCode?: string;
     }
   | {
       readonly kind: "DECISION";
@@ -1012,6 +1022,27 @@ function agentStateInputJsonSchema(
     type: "object",
     additionalProperties: false,
     properties: {
+      thesisId: {
+        type: "string",
+        minLength: 1,
+        maxLength: 200,
+        description:
+          "Stable deployment-defined thesis identity shared by revisions; retain the same ID when updating a thesis.",
+      },
+      familyKey: {
+        type: "string",
+        minLength: 1,
+        maxLength: 300,
+        description:
+          "Optional common event-family identity for related beliefs.",
+      },
+      forecastYesProbability: {
+        type: ["number", "null"],
+        minimum: 0,
+        maximum: 1,
+        description:
+          "Current YES probability estimate for this thesis. This is not authoritative settlement evidence; null clears the estimate.",
+      },
       action: {
         type: "string",
         enum: [
@@ -1311,6 +1342,7 @@ function safeToolError(
     kind: "TOOL_RESULT",
     content: JSON.stringify({ ok: false, code, message, ...metadata }),
     isError: true,
+    errorCode: code,
   };
 }
 
@@ -1458,6 +1490,7 @@ function sanitizeExternalText(value: string): string {
 // Entry authorization independently enforces configured evidence requirements.
 const MINIMUM_PRIORITY_EVIDENCE_ATTEMPT_DOMAINS = 1;
 const MAXIMUM_EVIDENCE_SOURCE_OUTPUT_CHARACTERS = 24_000;
+const MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS = 600;
 const EVIDENCE_SOURCE_NO_MATCH_PREVIEW_CHARACTERS = 4_000;
 const EVIDENCE_SOURCE_MATCH_CONTEXT_CHARACTERS = 900;
 const MAXIMUM_EVIDENCE_SOURCE_MATCH_FRAGMENTS = 8;
@@ -1484,6 +1517,7 @@ const EVIDENCE_SOURCE_QUERY_STOP_TERMS = new Set([
 
 interface EvidenceSourceTextSelection {
   readonly text: string;
+  readonly claimExcerptCandidates: readonly string[];
   readonly sourceCharacters: number;
   readonly matchCount: number | null;
   readonly returnedFragments: number;
@@ -1491,6 +1525,79 @@ interface EvidenceSourceTextSelection {
   readonly selectionMode:
     "PREFIX" | "EXACT_PHRASE" | "QUERY_TERMS" | "NO_MATCH_PREFIX";
   readonly matchedTerms: readonly string[];
+}
+
+function claimExcerptCandidates(
+  source: string,
+  anchors: readonly { readonly start: number; readonly end: number }[],
+): readonly string[] {
+  return [
+    ...new Set(
+      anchors.flatMap(({ start: rawStart, end: rawEnd }) => {
+        const anchorStart = Math.max(0, Math.min(source.length, rawStart));
+        const anchorEnd = Math.max(
+          anchorStart,
+          Math.min(
+            source.length,
+            rawEnd,
+            anchorStart + MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS,
+          ),
+        );
+        const remaining =
+          MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS -
+          (anchorEnd - anchorStart);
+        let candidateStart = Math.max(
+          0,
+          anchorStart - Math.floor(remaining / 2),
+        );
+        let candidateEnd = Math.min(
+          source.length,
+          anchorEnd + Math.ceil(remaining / 2),
+        );
+        if (
+          candidateEnd - candidateStart <
+          MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS
+        ) {
+          candidateStart = Math.max(
+            0,
+            candidateEnd - MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS,
+          );
+          candidateEnd = Math.min(
+            source.length,
+            candidateStart + MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS,
+          );
+        }
+        const candidate = source.slice(candidateStart, candidateEnd).trim();
+        return candidate.length === 0 ? [] : [candidate];
+      }),
+    ),
+  ];
+}
+
+function queryTermCandidateAnchors(
+  source: string,
+  ranges: readonly { readonly start: number; readonly end: number }[],
+  queryTerms: readonly string[],
+): readonly { readonly start: number; readonly end: number }[] {
+  return ranges.flatMap(({ start, end }) => {
+    const matches = queryTerms.flatMap((term) => {
+      const match = literalPattern(term).exec(source.slice(start, end));
+      return match?.index === undefined
+        ? []
+        : [
+            {
+              start: start + match.index,
+              end: start + match.index + match[0].length,
+            },
+          ];
+    });
+    const anchor = matches.toSorted(
+      (left, right) =>
+        right.end - right.start - (left.end - left.start) ||
+        left.start - right.start,
+    )[0];
+    return anchor === undefined ? [] : [anchor];
+  });
 }
 
 function evidenceQueryTerms(value: string): readonly string[] {
@@ -1515,9 +1622,13 @@ function countTextOccurrences(value: string, term: string): number {
   }
 }
 
+function literalPattern(value: string, global = false): RegExp {
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(escaped, global ? "giu" : "iu");
+}
+
 function selectQueryTermRanges(
   source: string,
-  normalizedSource: string,
   queryTerms: readonly string[],
 ): {
   readonly ranges: readonly { readonly start: number; readonly end: number }[];
@@ -1542,7 +1653,7 @@ function selectQueryTermRanges(
       source.length,
       start + EVIDENCE_SOURCE_TERM_WINDOW_CHARACTERS,
     );
-    const window = normalizedSource.slice(start, end);
+    const window = source.slice(start, end).toLocaleLowerCase("en-US");
     const matchedTerms = queryTerms.filter((term) => window.includes(term));
     if (matchedTerms.length < minimumMatchedTerms) continue;
     const occurrenceScore = matchedTerms.reduce(
@@ -1581,7 +1692,7 @@ function selectQueryTermRanges(
   };
 }
 
-function selectEvidenceSourceText(
+export function selectEvidenceSourceText(
   rawText: string,
   find: string | null | undefined,
 ): EvidenceSourceTextSelection {
@@ -1589,6 +1700,15 @@ function selectEvidenceSourceText(
   if (find === null || find === undefined) {
     return {
       text: source.slice(0, MAXIMUM_EVIDENCE_SOURCE_OUTPUT_CHARACTERS),
+      claimExcerptCandidates: claimExcerptCandidates(source, [
+        {
+          start: 0,
+          end: Math.min(
+            source.length,
+            MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS,
+          ),
+        },
+      ]),
       sourceCharacters: source.length,
       matchCount: null,
       returnedFragments: source.length === 0 ? 0 : 1,
@@ -1598,22 +1718,24 @@ function selectEvidenceSourceText(
     };
   }
 
-  const normalizedSource = source.toLocaleLowerCase("en-US");
-  const normalizedNeedle = find.toLocaleLowerCase("en-US");
   const ranges: { start: number; end: number }[] = [];
+  const exactMatchAnchors: { start: number; end: number }[] = [];
   let matchCount = 0;
-  let offset = 0;
   let omittedRange = false;
-  for (;;) {
-    const match = normalizedSource.indexOf(normalizedNeedle, offset);
-    if (match < 0) break;
+  for (const matchResult of source.matchAll(literalPattern(find, true))) {
+    const match = matchResult.index;
+    const matchLength = matchResult[0].length;
     matchCount += 1;
+    if (exactMatchAnchors.length < MAXIMUM_EVIDENCE_SOURCE_MATCH_FRAGMENTS) {
+      exactMatchAnchors.push({
+        start: match,
+        end: match + matchLength,
+      });
+    }
     const start = Math.max(0, match - EVIDENCE_SOURCE_MATCH_CONTEXT_CHARACTERS);
     const end = Math.min(
       source.length,
-      match +
-        normalizedNeedle.length +
-        EVIDENCE_SOURCE_MATCH_CONTEXT_CHARACTERS,
+      match + matchLength + EVIDENCE_SOURCE_MATCH_CONTEXT_CHARACTERS,
     );
     const lastRange = ranges.at(-1);
     if (lastRange !== undefined && start <= lastRange.end) {
@@ -1623,15 +1745,11 @@ function selectEvidenceSourceText(
     } else {
       omittedRange = true;
     }
-    offset = match + normalizedNeedle.length;
   }
 
   if (ranges.length === 0) {
-    const termSelection = selectQueryTermRanges(
-      source,
-      normalizedSource,
-      evidenceQueryTerms(find),
-    );
+    const queryTerms = evidenceQueryTerms(find);
+    const termSelection = selectQueryTermRanges(source, queryTerms);
     if (termSelection.ranges.length > 0) {
       const fragments = termSelection.ranges.map(({ start, end }) =>
         source.slice(start, end),
@@ -1639,6 +1757,10 @@ function selectEvidenceSourceText(
       const selected = fragments.join("\n...\n");
       return {
         text: selected.slice(0, MAXIMUM_EVIDENCE_SOURCE_OUTPUT_CHARACTERS),
+        claimExcerptCandidates: claimExcerptCandidates(
+          source,
+          queryTermCandidateAnchors(source, termSelection.ranges, queryTerms),
+        ),
         sourceCharacters: source.length,
         matchCount: 0,
         returnedFragments: fragments.length,
@@ -1649,8 +1771,27 @@ function selectEvidenceSourceText(
         matchedTerms: termSelection.matchedTerms,
       };
     }
+    const prefix = source.slice(0, EVIDENCE_SOURCE_NO_MATCH_PREVIEW_CHARACTERS);
+    const candidateStride = MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS / 3;
     return {
-      text: source.slice(0, EVIDENCE_SOURCE_NO_MATCH_PREVIEW_CHARACTERS),
+      text: prefix,
+      claimExcerptCandidates: claimExcerptCandidates(
+        prefix,
+        Array.from(
+          {
+            length: Math.min(
+              MAXIMUM_EVIDENCE_SOURCE_MATCH_FRAGMENTS,
+              Math.ceil(prefix.length / candidateStride),
+            ),
+          },
+          (_, index) => ({
+            start: index * candidateStride,
+            end:
+              index * candidateStride +
+              MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS,
+          }),
+        ),
+      ),
       sourceCharacters: source.length,
       matchCount: 0,
       returnedFragments: 0,
@@ -1663,6 +1804,7 @@ function selectEvidenceSourceText(
   const selected = fragments.join("\n...\n");
   return {
     text: selected.slice(0, MAXIMUM_EVIDENCE_SOURCE_OUTPUT_CHARACTERS),
+    claimExcerptCandidates: claimExcerptCandidates(source, exactMatchAnchors),
     sourceCharacters: source.length,
     matchCount,
     returnedFragments: fragments.length,
@@ -2067,6 +2209,14 @@ export class DecisionResearchTools {
     return this.evidenceSources.sources;
   }
 
+  /** This cycle's snapshots, also used by terminal verification and repair. */
+  public get evidencePageSnapshots(): ReadonlyMap<
+    string,
+    Promise<FetchedEvidencePage>
+  > {
+    return this.activeSession?.evidencePageSnapshots ?? new Map();
+  }
+
   public recordProviderEvidenceSources(
     sources: readonly ObservedEvidenceSource[],
   ): void {
@@ -2382,9 +2532,6 @@ export class DecisionResearchSession {
             : { ...source, preview: linePreview.preview };
         } catch (error) {
           if (signal.aborted) throw error;
-          if (this.evidencePageCache.get(url) === pending) {
-            this.evidencePageCache.delete(url);
-          }
           return source;
         }
       }),
@@ -2419,6 +2566,13 @@ export class DecisionResearchSession {
       this.evidenceSourceReadCount >=
       this.limits.maximumEvidenceSourceReadRequests
     );
+  }
+
+  public get evidencePageSnapshots(): ReadonlyMap<
+    string,
+    Promise<FetchedEvidencePage>
+  > {
+    return new Map(this.evidencePageCache);
   }
 
   public reopenForTerminalDecisionRepair(maximumAttempts = 1): void {
@@ -3226,19 +3380,20 @@ export class DecisionResearchSession {
       }
     }
 
+    let pending = this.evidencePageCache.get(url);
+    const reusedSnapshot = pending !== undefined;
     if (
+      pending === undefined &&
       this.evidenceSourceReadCount >=
-      this.limits.maximumEvidenceSourceReadRequests
+        this.limits.maximumEvidenceSourceReadRequests
     ) {
       return safeToolError(
         "EVIDENCE_SOURCE_READ_LIMIT_REACHED",
-        "The cycle snapshot evidence-read limit was reached. Repeated reads cannot monitor or refresh a source; use the evidence already returned and submit the trade plan.",
+        "The cycle source-fetch limit was reached. You may select another passage from an already-read URL; cached reads do not refresh or monitor the source.",
       );
     }
-    this.evidenceSourceReadCount += 1;
-
-    let pending = this.evidencePageCache.get(url);
     if (pending === undefined) {
+      this.evidenceSourceReadCount += 1;
       pending = this.evidencePageReader(url, signal);
       this.evidencePageCache.set(url, pending);
     }
@@ -3256,17 +3411,21 @@ export class DecisionResearchSession {
           ? {
               ...rawSelection,
               text: "No matching live-score record was present in this feed snapshot.",
+              claimExcerptCandidates: [],
+              returnedFragments: 0,
               truncated: false,
             }
           : rawSelection;
       this.evidenceSources.register({
         ...observed,
-        excerpt: selection.text,
+        excerpt: selection.claimExcerptCandidates.join(
+          "\n[CONTIGUOUS EXCERPT BOUNDARY]\n",
+        ),
         ...(page.publishedAt === undefined
           ? {}
           : { publishedAt: page.publishedAt }),
       });
-      this.successfulEvidenceSourceReadCount += 1;
+      if (!reusedSnapshot) this.successfulEvidenceSourceReadCount += 1;
       return {
         kind: "TOOL_RESULT",
         content: JSON.stringify({
@@ -3274,6 +3433,7 @@ export class DecisionResearchSession {
           securityNotice: this.messages.evidenceSourceSecurityNotice,
           url,
           finalUrl,
+          reusedSnapshot,
           title: sanitizeExternalText(observed.title),
           observedAt: observed.observedAt,
           ...(attributedMarketSlug === undefined
@@ -3289,12 +3449,10 @@ export class DecisionResearchSession {
       };
     } catch (error) {
       if (signal.aborted) throw error;
-      if (this.evidencePageCache.get(url) === pending) {
-        this.evidencePageCache.delete(url);
-      }
       return safeToolError(
         "EVIDENCE_SOURCE_READ_FAILED",
         this.messages.evidenceSourceReadFailed,
+        { reason: evidencePageReadFailureReason(error) },
       );
     }
   }
@@ -3614,6 +3772,9 @@ export class DecisionResearchSession {
       };
     } catch (error) {
       if (signal.aborted) throw error;
+      if (error instanceof PositionReductionDisabledPreviewError) {
+        return safeToolError(error.code, error.message);
+      }
       return safeToolError(
         "TRADE_PREVIEW_FAILED",
         this.messages.tradePreviewFailed,
@@ -3658,11 +3819,46 @@ export class DecisionResearchSession {
           ok: true,
           securityNotice: this.messages.agentNotesSecurityNotice,
           ...result,
+          staged: parsed.data.action !== "LIST",
+          committed: false,
+          ...(parsed.data.action === "LIST"
+            ? {}
+            : {
+                persistenceNotice:
+                  "Staged for this cycle; persistence remains subject to final transaction validation.",
+              }),
         }),
         isError: false,
       };
     } catch (error) {
       if (signal.aborted) throw error;
+      if (error instanceof MutationProvenanceError) {
+        return safeToolError("MEMORY_PROVENANCE_REQUIRED", error.message, {
+          staged: false,
+          committed: false,
+          issues: error.issues.slice(0, 10).map((issue) => ({
+            ...issue,
+            ...(issue.references === undefined
+              ? {}
+              : {
+                  references: issue.references
+                    .slice(0, 10)
+                    .map((value) => value.slice(0, 512)),
+                  referencesTruncated:
+                    issue.references.length > 10 ||
+                    issue.references.some((value) => value.length > 512),
+                }),
+          })),
+          issueCount: error.issues.length,
+          issuesTruncated: error.issues.length > 10,
+          remainingMemoryOperations: Math.max(
+            0,
+            this.limits.maximumNoteOperations -
+              this.noteOperationCount -
+              this.stateOperationCount,
+          ),
+        });
+      }
       return safeToolError(
         "AGENT_NOTES_FAILED",
         this.messages.agentNotesFailed,
@@ -3707,11 +3903,46 @@ export class DecisionResearchSession {
           ok: true,
           securityNotice: this.messages.agentStateSecurityNotice,
           ...result,
+          staged: parsed.data.action !== "LIST",
+          committed: false,
+          ...(parsed.data.action === "LIST"
+            ? {}
+            : {
+                persistenceNotice:
+                  "Staged for this cycle; persistence remains subject to final transaction validation.",
+              }),
         }),
         isError: false,
       };
     } catch (error) {
       if (signal.aborted) throw error;
+      if (error instanceof MutationProvenanceError) {
+        return safeToolError("MEMORY_PROVENANCE_REQUIRED", error.message, {
+          staged: false,
+          committed: false,
+          issues: error.issues.slice(0, 10).map((issue) => ({
+            ...issue,
+            ...(issue.references === undefined
+              ? {}
+              : {
+                  references: issue.references
+                    .slice(0, 10)
+                    .map((value) => value.slice(0, 512)),
+                  referencesTruncated:
+                    issue.references.length > 10 ||
+                    issue.references.some((value) => value.length > 512),
+                }),
+          })),
+          issueCount: error.issues.length,
+          issuesTruncated: error.issues.length > 10,
+          remainingMemoryOperations: Math.max(
+            0,
+            this.limits.maximumNoteOperations -
+              this.noteOperationCount -
+              this.stateOperationCount,
+          ),
+        });
+      }
       return safeToolError(
         "AGENT_STATE_FAILED",
         this.messages.agentStateFailed,

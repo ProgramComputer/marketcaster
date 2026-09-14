@@ -1,7 +1,12 @@
 import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { BlockList, isIP, type LookupFunction } from "node:net";
+import { Agent, type Dispatcher } from "undici";
 import type { AgentDecision, DecisionEvidence } from "./decision-schema.js";
 import type { Market } from "../domain/market.js";
+import {
+  evidenceRepairContext,
+  type EvidenceRepairContext,
+} from "./evidence-repair.js";
 
 export type EvidenceSourceProvider =
   | "CLIENT_WEB_SEARCH"
@@ -17,6 +22,47 @@ export interface ObservedEvidenceSource {
   readonly publishedAt?: string;
   readonly pageAge?: string;
   readonly provider: EvidenceSourceProvider;
+}
+
+export type EvidencePageReadFailureReason =
+  | "ACCESS_DENIED"
+  | "FETCH_FAILED"
+  | "HTTP_ERROR"
+  | "RESPONSE_TOO_LARGE"
+  | "TIMEOUT"
+  | "UNSAFE_URL"
+  | "UNSUPPORTED_CONTENT";
+
+export class EvidencePageReadError extends Error {
+  public constructor(
+    public readonly reason: EvidencePageReadFailureReason,
+    message: string,
+  ) {
+    super(message);
+    this.name = "EvidencePageReadError";
+  }
+}
+
+export function evidencePageReadFailureReason(
+  error: unknown,
+): EvidencePageReadFailureReason {
+  let current = error;
+  const seen = new Set<unknown>();
+  while (current !== undefined && current !== null && !seen.has(current)) {
+    seen.add(current);
+    if (current instanceof EvidencePageReadError) return current.reason;
+    if (
+      current instanceof Error &&
+      (current.name === "AbortError" || current.name === "TimeoutError")
+    ) {
+      return "TIMEOUT";
+    }
+    current =
+      current instanceof Error
+        ? (current as Error & { readonly cause?: unknown }).cause
+        : undefined;
+  }
+  return "FETCH_FAILED";
 }
 
 export function canonicalEvidenceUrl(value: string): string {
@@ -242,43 +288,110 @@ export function xSnowflakeTimestamp(urlValue: string): Date | undefined {
   }
 }
 
-function privateIpv4(address: string): boolean {
-  const parts = address.split(".").map(Number);
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part)))
-    return true;
-  const [a = 0, b = 0] = parts;
-  return (
-    a === 0 ||
-    a === 10 ||
-    a === 127 ||
-    (a === 100 && b >= 64 && b <= 127) ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 0) ||
-    (a === 192 && b === 168) ||
-    (a === 198 && (b === 18 || b === 19)) ||
-    a >= 224
-  );
+function buildNonPublicIpBlockList(): BlockList {
+  const blockList = new BlockList();
+  const ipv4Subnets = [
+    ["0.0.0.0", 8],
+    ["10.0.0.0", 8],
+    ["100.64.0.0", 10],
+    ["127.0.0.0", 8],
+    ["169.254.0.0", 16],
+    ["172.16.0.0", 12],
+    ["192.0.0.0", 16],
+    ["192.168.0.0", 16],
+    ["198.18.0.0", 15],
+    ["224.0.0.0", 3],
+  ] as const;
+  const ipv6Subnets = [
+    ["64:ff9b:1::", 48],
+    ["fc00::", 7],
+    ["fec0::", 10],
+    ["fe80::", 10],
+    ["ff00::", 8],
+    ["2001:db8::", 32],
+  ] as const;
+  for (const [network, prefix] of ipv4Subnets) {
+    blockList.addSubnet(network, prefix, "ipv4");
+  }
+  blockList.addAddress("::", "ipv6");
+  blockList.addAddress("::1", "ipv6");
+  for (const [network, prefix] of ipv6Subnets) {
+    blockList.addSubnet(network, prefix, "ipv6");
+  }
+  return blockList;
 }
 
-function privateIpv6(address: string): boolean {
-  const normalized = address.toLowerCase();
-  return (
-    normalized === "::" ||
-    normalized === "::1" ||
-    normalized.startsWith("fc") ||
-    normalized.startsWith("fd") ||
-    /^fe[89ab]/u.test(normalized) ||
-    normalized.startsWith("ff") ||
-    normalized.startsWith("2001:db8") ||
-    (normalized.startsWith("::ffff:") && privateIpv4(normalized.slice(7)))
-  );
+const NON_PUBLIC_IP_ADDRESSES = buildNonPublicIpBlockList();
+const IPV4_TRANSLATION_PREFIXES = new BlockList();
+IPV4_TRANSLATION_PREFIXES.addSubnet("64:ff9b::", 96, "ipv6");
+IPV4_TRANSLATION_PREFIXES.addSubnet("::ffff:0:0:0", 96, "ipv6");
+
+function unbracketIpLiteral(value: string): string {
+  return value.startsWith("[") && value.endsWith("]")
+    ? value.slice(1, -1)
+    : value;
+}
+
+function ipv6Words(address: string): readonly number[] | undefined {
+  let canonical: string;
+  try {
+    canonical = unbracketIpLiteral(
+      new URL(`http://[${unbracketIpLiteral(address)}]/`).hostname,
+    );
+  } catch {
+    return undefined;
+  }
+  const halves = canonical.split("::");
+  if (halves.length > 2) return undefined;
+  const words = (value: string): number[] =>
+    value.length === 0
+      ? []
+      : value.split(":").map((word) => Number.parseInt(word, 16));
+  const left = words(halves[0] ?? "");
+  const right = words(halves[1] ?? "");
+  const expanded =
+    halves.length === 1
+      ? left
+      : [
+          ...left,
+          ...Array.from({ length: 8 - left.length - right.length }, () => 0),
+          ...right,
+        ];
+  return expanded.length === 8 &&
+    expanded.every(
+      (word) => Number.isInteger(word) && word >= 0 && word <= 0xffff,
+    )
+    ? expanded
+    : undefined;
+}
+
+function translatedIpv4Address(address: string): string | undefined {
+  if (!IPV4_TRANSLATION_PREFIXES.check(address, "ipv6")) return undefined;
+  const words = ipv6Words(address);
+  if (words === undefined) return undefined;
+  const high = words[6] ?? 0;
+  const low = words[7] ?? 0;
+  return [
+    Math.floor(high / 256),
+    high % 256,
+    Math.floor(low / 256),
+    low % 256,
+  ].join(".");
 }
 
 export function isPublicIpAddress(address: string): boolean {
-  const family = isIP(address);
-  if (family === 4) return !privateIpv4(address);
-  if (family === 6) return !privateIpv6(address);
+  const normalized = unbracketIpLiteral(address);
+  const family = isIP(normalized);
+  if (family === 4) return !NON_PUBLIC_IP_ADDRESSES.check(normalized, "ipv4");
+  if (family === 6) {
+    if (NON_PUBLIC_IP_ADDRESSES.check(normalized, "ipv6")) return false;
+    if (!IPV4_TRANSLATION_PREFIXES.check(normalized, "ipv6")) return true;
+    const translatedIpv4 = translatedIpv4Address(normalized);
+    return (
+      translatedIpv4 !== undefined &&
+      !NON_PUBLIC_IP_ADDRESSES.check(translatedIpv4, "ipv4")
+    );
+  }
   return false;
 }
 
@@ -286,20 +399,37 @@ export async function assertPublicEvidenceUrl(
   urlValue: string,
   lookupImplementation: typeof lookup = lookup,
 ): Promise<URL> {
-  const url = new URL(urlValue);
+  let url: URL;
+  try {
+    url = new URL(urlValue);
+  } catch {
+    throw new EvidencePageReadError("UNSAFE_URL", "Evidence URL is invalid");
+  }
   if (url.protocol !== "https:" && url.protocol !== "http:") {
-    throw new Error("Only HTTP(S) evidence URLs are fetchable");
+    throw new EvidencePageReadError(
+      "UNSAFE_URL",
+      "Only HTTP(S) evidence URLs are fetchable",
+    );
   }
   if (url.username.length > 0 || url.password.length > 0) {
-    throw new Error("Evidence URLs cannot contain credentials");
+    throw new EvidencePageReadError(
+      "UNSAFE_URL",
+      "Evidence URLs cannot contain credentials",
+    );
   }
-  const hostname = url.hostname.toLowerCase();
+  const hostname = unbracketIpLiteral(url.hostname.toLowerCase());
   if (hostname === "localhost" || hostname.endsWith(".localhost")) {
-    throw new Error("Evidence URL resolves to a local hostname");
+    throw new EvidencePageReadError(
+      "UNSAFE_URL",
+      "Evidence URL resolves to a local hostname",
+    );
   }
   if (isIP(hostname) !== 0) {
     if (!isPublicIpAddress(hostname)) {
-      throw new Error("Evidence URL resolves to a non-public address");
+      throw new EvidencePageReadError(
+        "UNSAFE_URL",
+        "Evidence URL resolves to a non-public address",
+      );
     }
     return url;
   }
@@ -311,7 +441,10 @@ export async function assertPublicEvidenceUrl(
     addresses.length === 0 ||
     addresses.some(({ address }) => !isPublicIpAddress(address))
   ) {
-    throw new Error("Evidence URL DNS includes a non-public address");
+    throw new EvidencePageReadError(
+      "UNSAFE_URL",
+      "Evidence URL DNS includes a non-public address",
+    );
   }
   return url;
 }
@@ -326,12 +459,20 @@ function pageText(source: string): string {
   return source
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/giu, " ")
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/giu, " ")
+    .replace(/<(?:br|hr)\b[^>]*\/?\s*>/giu, "\n")
+    .replace(
+      /<\/(?:address|article|aside|blockquote|div|footer|h[1-6]|header|li|main|nav|ol|p|pre|section|table|tr|ul)\s*>/giu,
+      "\n",
+    )
     .replace(/<[^>]+>/gu, " ")
     .replace(/&nbsp;/giu, " ")
     .replace(/&amp;/giu, "&")
     .replace(/&quot;/giu, '"')
     .replace(/&#39;/giu, "'")
-    .replace(/\s+/gu, " ")
+    .replace(/\r\n?/gu, "\n")
+    .replace(/[^\S\n]+/gu, " ")
+    .replace(/ *\n */gu, "\n")
+    .replace(/\n{3,}/gu, "\n\n")
     .trim();
 }
 
@@ -480,9 +621,118 @@ function structuredPublishedAt(source: string): string | undefined {
   return undefined;
 }
 
+const MAXIMUM_EVIDENCE_RESPONSE_BYTES = 4 * 1_048_576;
+const EVIDENCE_READER_USER_AGENT =
+  "MarketCaster/0.1 evidence-reader (+https://github.com/ProgramComputer/marketcaster)";
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Releasing a rejected or redirect response is best-effort only.
+  }
+}
+
+function normalizedError(reason: unknown, message: string): Error {
+  return reason instanceof Error
+    ? reason
+    : new Error(message, { cause: reason });
+}
+
+async function awaitWithSignal<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => {
+      signal.removeEventListener("abort", aborted);
+      reject(normalizedError(signal.reason, "Evidence operation aborted"));
+    };
+    void operation.then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", aborted);
+        reject(normalizedError(error, "Evidence operation failed"));
+      },
+    );
+    signal.addEventListener("abort", aborted, { once: true });
+    if (signal.aborted) aborted();
+  });
+}
+
+function guardedLookup(
+  lookupImplementation: typeof lookup,
+  signal: AbortSignal,
+): LookupFunction {
+  return (hostname, options, callback) => {
+    void awaitWithSignal(
+      lookupImplementation(hostname, { all: true, verbatim: true }),
+      signal,
+    ).then(
+      (addresses) => {
+        if (
+          addresses.length === 0 ||
+          addresses.some(({ address }) => !isPublicIpAddress(address))
+        ) {
+          callback(
+            new EvidencePageReadError(
+              "UNSAFE_URL",
+              "Evidence URL DNS includes a non-public address",
+            ),
+            "",
+          );
+          return;
+        }
+        const requestedFamily =
+          options.family === 4 || options.family === 6
+            ? options.family
+            : undefined;
+        const eligible =
+          requestedFamily === undefined
+            ? addresses
+            : addresses.filter(({ family }) => family === requestedFamily);
+        const selected = eligible[0];
+        if (selected === undefined) {
+          callback(
+            new EvidencePageReadError(
+              "FETCH_FAILED",
+              "Evidence URL DNS did not return the requested address family",
+            ),
+            "",
+          );
+          return;
+        }
+        if (options.all === true) {
+          callback(null, eligible);
+          return;
+        }
+        callback(null, selected.address, selected.family);
+      },
+      (error: unknown) => {
+        callback(
+          error instanceof Error ? error : new Error("Evidence DNS failed"),
+          "",
+        );
+      },
+    );
+  };
+}
+
+function fetchWithDispatcher(dispatcher: Dispatcher): typeof fetch {
+  return (input, init) =>
+    fetch(input, {
+      ...init,
+      dispatcher,
+    } as RequestInit & { readonly dispatcher: Dispatcher });
+}
+
 async function readBoundedBody(
   response: Response,
-  maximumBytes = 1_048_576,
+  signal: AbortSignal,
+  maximumBytes = MAXIMUM_EVIDENCE_RESPONSE_BYTES,
 ): Promise<string> {
   if (response.body === null) return "";
   const reader =
@@ -491,12 +741,20 @@ async function readBoundedBody(
   let total = 0;
   let source = "";
   for (;;) {
-    const chunk = await reader.read();
+    const chunk = await awaitWithSignal(reader.read(), signal).catch(
+      (error: unknown) => {
+        void reader.cancel().catch(() => undefined);
+        throw error;
+      },
+    );
     if (chunk.done) break;
     total += chunk.value.byteLength;
     if (total > maximumBytes) {
       await reader.cancel();
-      throw new Error("Evidence page exceeded the one-megabyte limit");
+      throw new EvidencePageReadError(
+        "RESPONSE_TOO_LARGE",
+        `Evidence page exceeded the ${maximumBytes}-byte limit`,
+      );
     }
     source += decoder.decode(chunk.value, { stream: true });
   }
@@ -512,71 +770,120 @@ export async function fetchEvidencePage(
     readonly signal?: AbortSignal;
   } = {},
 ): Promise<FetchedEvidencePage> {
-  const fetchImplementation = options.fetchImplementation ?? fetch;
-  let current = await assertPublicEvidenceUrl(
-    urlValue,
-    options.lookupImplementation ?? lookup,
-  );
+  const lookupImplementation = options.lookupImplementation ?? lookup;
   const timeoutSignal = AbortSignal.timeout(10_000);
   const fetchSignal =
     options.signal === undefined
       ? timeoutSignal
       : AbortSignal.any([options.signal, timeoutSignal]);
-  for (let redirects = 0; redirects <= 3; redirects += 1) {
-    const response = await fetchImplementation(current, {
-      method: "GET",
-      redirect: "manual",
-      headers: { accept: "text/html,text/plain,application/json" },
-      signal: fetchSignal,
+  let dispatcher: Agent | undefined;
+  let fetchImplementation = options.fetchImplementation;
+  if (fetchImplementation === undefined) {
+    dispatcher = new Agent({
+      connect: {
+        lookup: guardedLookup(lookupImplementation, fetchSignal),
+      },
     });
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("location");
-      if (location === null || redirects === 3) {
-        throw new Error("Evidence redirect chain is invalid or too long");
-      }
-      current = await assertPublicEvidenceUrl(
-        new URL(location, current).toString(),
-        options.lookupImplementation ?? lookup,
-      );
-      continue;
-    }
-    if (!response.ok)
-      throw new Error(`Evidence fetch failed with HTTP ${response.status}`);
-    const contentType =
-      response.headers.get("content-type")?.toLowerCase() ?? "";
-    if (
-      !/^(?:text\/(?:html|plain)|application\/(?:json|ld\+json))(?:;|$)/u.test(
-        contentType,
-      )
-    ) {
-      throw new Error("Evidence response has an unsupported content type");
-    }
-    const source = await readBoundedBody(response);
-    const publishedAt = structuredPublishedAt(source);
-    const hostname = current.hostname.toLowerCase();
-    const pathname = current.pathname.toLowerCase();
-    const structuredFeed =
-      hostname === "site.web.api.espn.com" &&
-      pathname.includes("/sports/tennis/")
-        ? espnScoreboardText(source)
-        : hostname === "tabletennis.setkacup.com" &&
-            pathname.startsWith("/api/matches/")
-          ? setkaMatchFeedText(source)
-          : undefined;
-    // Source selection belongs to the caller. A page's evidence text must not
-    // silently acquire claims fetched from a different URL.
-    const text =
-      structuredFeed ??
-      (contentType.startsWith("text/html")
-        ? pageText(source)
-        : source.replace(/\s+/gu, " ").trim());
-    return {
-      text,
-      ...(publishedAt === undefined ? {} : { publishedAt }),
-      finalUrl: current.toString(),
-    };
+    fetchImplementation = fetchWithDispatcher(dispatcher);
   }
-  throw new Error("Evidence redirect resolution failed");
+  try {
+    let current = await awaitWithSignal(
+      assertPublicEvidenceUrl(urlValue, lookupImplementation),
+      fetchSignal,
+    );
+    for (let redirects = 0; redirects <= 3; redirects += 1) {
+      const response = await fetchImplementation(current, {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          accept: "text/html,text/plain,application/json",
+          "accept-language": "en-US,en;q=0.8",
+          "user-agent": EVIDENCE_READER_USER_AGENT,
+        },
+        signal: fetchSignal,
+      });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        await cancelResponseBody(response);
+        if (location === null || redirects === 3) {
+          throw new EvidencePageReadError(
+            "HTTP_ERROR",
+            "Evidence redirect chain is invalid or too long",
+          );
+        }
+        current = await awaitWithSignal(
+          assertPublicEvidenceUrl(
+            new URL(location, current).toString(),
+            lookupImplementation,
+          ),
+          fetchSignal,
+        );
+        continue;
+      }
+      if (!response.ok) {
+        await cancelResponseBody(response);
+        throw new EvidencePageReadError(
+          response.status === 401 || response.status === 403
+            ? "ACCESS_DENIED"
+            : "HTTP_ERROR",
+          `Evidence fetch failed with HTTP ${response.status}`,
+        );
+      }
+      const contentType =
+        response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (
+        !/^(?:text\/(?:html|plain)|application\/(?:json|ld\+json))(?:;|$)/u.test(
+          contentType,
+        )
+      ) {
+        await cancelResponseBody(response);
+        throw new EvidencePageReadError(
+          "UNSUPPORTED_CONTENT",
+          "Evidence response has an unsupported content type",
+        );
+      }
+      const declaredLength = Number(response.headers.get("content-length"));
+      if (
+        Number.isFinite(declaredLength) &&
+        declaredLength > MAXIMUM_EVIDENCE_RESPONSE_BYTES
+      ) {
+        await cancelResponseBody(response);
+        throw new EvidencePageReadError(
+          "RESPONSE_TOO_LARGE",
+          `Evidence page declared more than ${MAXIMUM_EVIDENCE_RESPONSE_BYTES} bytes`,
+        );
+      }
+      const source = await readBoundedBody(response, fetchSignal);
+      const publishedAt = structuredPublishedAt(source);
+      const hostname = current.hostname.toLowerCase();
+      const pathname = current.pathname.toLowerCase();
+      const structuredFeed =
+        hostname === "site.web.api.espn.com" &&
+        pathname.includes("/sports/tennis/")
+          ? espnScoreboardText(source)
+          : hostname === "tabletennis.setkacup.com" &&
+              pathname.startsWith("/api/matches/")
+            ? setkaMatchFeedText(source)
+            : undefined;
+      // Source selection belongs to the caller; never enrich from a second URL.
+      const text =
+        structuredFeed ??
+        (contentType.startsWith("text/html")
+          ? pageText(source)
+          : source.replace(/\r\n?/gu, "\n").trim());
+      return {
+        text,
+        ...(publishedAt === undefined ? {} : { publishedAt }),
+        finalUrl: current.toString(),
+      };
+    }
+    throw new EvidencePageReadError(
+      "HTTP_ERROR",
+      "Evidence redirect resolution failed",
+    );
+  } finally {
+    await dispatcher?.destroy();
+  }
 }
 
 export type EvidenceValidationIssueCode =
@@ -598,6 +905,9 @@ export interface EvidenceValidationIssue {
   readonly marketSlug: string;
   readonly url?: string;
   readonly message: string;
+  readonly unsupportedNumericDetails?: readonly string[];
+  readonly sourceFetchFailureReason?: EvidencePageReadFailureReason;
+  readonly repairContext?: EvidenceRepairContext;
 }
 
 export interface VerifiedEvidenceSource {
@@ -847,6 +1157,11 @@ function currentEvidenceRequired(item: {
 export async function validateDecisionEvidence(input: {
   readonly decision: AgentDecision;
   readonly observedSources: readonly ObservedEvidenceSource[];
+  /** Already-read pages from this cycle; no second fetch or newer snapshot. */
+  readonly evidencePageSnapshots?: ReadonlyMap<
+    string,
+    Promise<FetchedEvidencePage>
+  >;
   readonly marketsBySlug: ReadonlyMap<string, Market>;
   readonly minimumIndependentSources: number;
   /** Targets that currently derive an exchange order and therefore authorize action. */
@@ -863,7 +1178,7 @@ export async function validateDecisionEvidence(input: {
   const advisoryIssues: EvidenceValidationIssue[] = [];
   const verified: VerifiedEvidenceSource[] = [];
   const verifiedKeys = new Set<string>();
-  const fetchCache = new Map<string, Promise<FetchedEvidencePage>>();
+  const fetchCache = new Map(input.evidencePageSnapshots);
   const decisionItems = [
     ...input.decision.portfolioTargets.map((target) => ({
       kind: "TARGET" as const,
@@ -931,7 +1246,7 @@ export async function validateDecisionEvidence(input: {
           !searchable.includes(normalizedExcerpt(excerpt))) ||
         (evidence.evidenceClass === "CURRENT_REPORT" &&
           authoritativeDate === undefined);
-      if (needsBody) {
+      if (needsBody || fetchCache.has(canonicalEvidenceUrl(evidence.url))) {
         try {
           const key = canonicalEvidenceUrl(evidence.url);
           let pending = fetchCache.get(key);
@@ -960,12 +1275,15 @@ export async function validateDecisionEvidence(input: {
             authoritativeDate = new Date(fetched.publishedAt);
           }
         } catch (error) {
-          issues.push({
-            code: "SOURCE_FETCH_FAILED",
-            marketSlug: item.marketSlug,
-            url: evidence.url,
-            message: `The source could not be safely fetched for verification: ${error instanceof Error ? error.message : "unknown failure"}`,
-          });
+          if (needsBody) {
+            issues.push({
+              code: "SOURCE_FETCH_FAILED",
+              marketSlug: item.marketSlug,
+              url: evidence.url,
+              message: `The source could not be safely fetched for verification: ${error instanceof Error ? error.message : "unknown failure"}`,
+              sourceFetchFailureReason: evidencePageReadFailureReason(error),
+            });
+          }
         }
       }
       if (
@@ -980,6 +1298,12 @@ export async function validateDecisionEvidence(input: {
           url: evidence.url,
           message:
             "claimExcerpt was not found in provider evidence or the safely fetched page",
+          repairContext: evidenceRepairContext({
+            sourceText: fetched?.text ?? observed.excerpt ?? "",
+            sourceKind:
+              fetched === undefined ? "PROVIDER_EXCERPT" : "PAGE_SNAPSHOT",
+            claimExcerpt: excerpt,
+          }),
         });
         continue;
       }
@@ -1006,6 +1330,14 @@ export async function validateDecisionEvidence(input: {
             marketSlug: item.marketSlug,
             url: evidence.url,
             message: `Numeric fact(s) ${unsupportedNumbers.join(", ")} appear in relevance but not in claimExcerpt`,
+            unsupportedNumericDetails: unsupportedNumbers,
+            repairContext: evidenceRepairContext({
+              sourceText: fetched?.text ?? observed.excerpt ?? "",
+              sourceKind:
+                fetched === undefined ? "PROVIDER_EXCERPT" : "PAGE_SNAPSHOT",
+              claimExcerpt: excerpt,
+              unsupportedNumericDetails: unsupportedNumbers,
+            }),
           });
           continue;
         }

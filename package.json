@@ -10,7 +10,9 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "check:position-reductions": "node scripts/check-position-reductions.mjs && node scripts/check-position-reduction-context.mjs && node scripts/check-position-reduction-cycle.mjs",
     "check:overrides": "node scripts/check-runtime-overrides.mjs",
+    "check:discovery-compatibility": "node scripts/check-null-quotes.mjs && node scripts/check-discovery-timeout.mjs",
     "cycle": "node dist/src/index.js",
     "dev": "tsx src/index.ts",
     "experiment:market-selection": "node dist/src/experiments/market-selection.js",
@@ -22,21 +24,27 @@
     "check:state-lifecycle": "node --import tsx scripts/check-state-lifecycle.mjs",
     "check:execution-health": "node --import tsx scripts/check-execution-health.mjs",
     "check:observe": "node scripts/check-observe-policy.mjs",
-    "check:source-and-reconciliation": "node --import tsx scripts/check-source-and-reconciliation.mjs"
+    "check:source-and-reconciliation": "node --import tsx scripts/check-source-and-reconciliation.mjs",
+    "check:memory-feedback": "node --import tsx scripts/check-memory-feedback.mjs",
+    "check:risk-edge": "node scripts/check-risk-edge.mjs",
+    "check:evidence-reading": "node scripts/check-evidence-reading.mjs",
+    "check:schema-correction": "node scripts/check-schema-correction.mjs",
+    "check:resolution-review": "node scripts/check-resolution-review.mjs"
   },
   "dependencies": {
     "decimal.js": "10.6.0",
     "p-limit": "6.2.0",
     "pino": "9.14.0",
     "polymarket-us": "0.1.1",
-    "zod": "4.4.3"
+    "undici": "6.28.0",
+    "zod": "4.6.2"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@types/node": "22.20.1",
+    "@types/node": "22.20.2",
     "eslint": "10.9.1",
     "prettier": "3.9.6",
-    "tsx": "4.23.11",
+    "tsx": "4.23.12",
     "typescript": "5.9.3",
     "typescript-eslint": "8.67.0"
   }

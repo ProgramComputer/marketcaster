@@ -103,6 +103,13 @@ identity, source validity, correlation, executable liquidity, or permission to
 trade. Those facts are checked later against exact market details and refreshed
 exchange state.
 
+Set `cycle.stageBudgetsSeconds.marketDiscovery` to `null` in a deployment's
+complete configuration to use the overall cycle deadline without a separate
+discovery timer. A positive integer retains a discovery limit in seconds.
+The overall `cycle.timeoutSeconds` and other stage budgets still apply.
+Polymarket US quote sides returned as `null` are treated as absent liquidity;
+any present side retains the normal quote validation.
+
 Research tools support current web search, bounded reads of URLs already
 observed in the cycle, market analysis, and non-binding trade previews. Evidence
 used for a probability-bearing decision must match an observed URL and exact
@@ -139,6 +146,30 @@ Polymarket US also supports deployment-configured, bounded good-till-date BUY
 execution. When enabled, marketable quantity may fill immediately and any
 remainder may rest until the runtime-set expiration. Configuration limits that
 lifetime to at most 15 minutes.
+
+`risk.allowPositionReductions` defaults to `true`. Set it to `false` in the
+existing JSON configuration to reject canonical SELL YES and SELL NO actions,
+including trims, zero-target exits, and emergency exits, with
+`POSITION_REDUCTION_DISABLED`. BUY actions keep every existing safeguard; BUY
+NO remains a BUY even when its exchange order side is SELL. Cancellations and
+exchange settlement are unaffected. Validation excludes blocked sale proceeds
+from allocation, and execution independently checks the actual order before
+submission. Agent context (including custom prompts), previews, and observe
+mode use the same capability. Blocked targets remain recorded as requested
+reductions with their rejection and cannot be repaired into a policy override.
+
+Merge this single field into the existing `risk` object of the complete file
+selected by `MARKETCASTER_CONFIG_PATH`; no additional environment or prompt
+setting is needed. Omission or `true` preserves existing behavior; other types
+are invalid.
+
+```json
+{
+  "risk": {
+    "allowPositionReductions": false
+  }
+}
+```
 
 ## Safety and correctness
 

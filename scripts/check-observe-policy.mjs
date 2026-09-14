@@ -9,6 +9,11 @@ import pino from "pino";
 import { runCycle } from "../dist/src/agent/cycle.js";
 import { loadRuntimeConfiguration } from "../dist/src/config/runtime-overrides.js";
 import {
+  captureDecisionSubmission,
+  summarizeDecisionSubmissions,
+} from "../dist/src/agent/decision-submission-audit.js";
+import { renderJobSummary } from "../dist/src/reporting/job-summary.js";
+import {
   applyFreshForecastProbability,
   riskAdjustedProbability,
   validateProposals,
@@ -146,7 +151,54 @@ export default api => ({
   assert.equal(report.status, "PASS", JSON.stringify(report));
   assert.equal(placements, 0);
   assert.equal(cancellations, 0);
+  assert.equal(report.agent.decisionAudit.submissions.attempts.length, 1);
+  assert.equal(report.agent.decisionAudit.submissions.omittedTargets.length, 0);
   for (const count of Object.values(calls)) assert(count > 0);
+
+  // A final empty plan must not erase an earlier factual rejection or turn it
+  // into a source-fetch error. An unrelated retained target stays independent.
+  const target = {
+    marketSlug: "synthetic-observation",
+    side: "YES",
+    estimatedProbability: new Decimal("0.72"),
+    targetCostBasisFraction: new Decimal("0.12"),
+  };
+  const retained = { ...target, marketSlug: "synthetic-retained" };
+  const mismatch = {
+    marketSlug: target.marketSlug,
+    code: "CLAIM_NUMERIC_DETAIL_UNSUPPORTED",
+    message: "Numeric detail 14 was absent from the selected source excerpt",
+    url: "https://example.com/observations",
+  };
+  const firstAttempt = captureDecisionSubmission({
+    attempt: 1,
+    submittedAt: observedAt.toISOString(),
+    decision: { portfolioTargets: [target, retained] },
+    evidence: { issues: [mismatch] },
+    coverage: { issues: [] },
+    validation: { rejected: [] },
+  });
+  const history = summarizeDecisionSubmissions([firstAttempt], [retained]);
+  assert.deepEqual(history.omittedTargets, [
+    {
+      marketSlug: target.marketSlug,
+      side: "YES",
+      estimatedProbability: "0.72",
+      targetCostBasisFraction: "0.12",
+      priorIssueCodes: [mismatch.code],
+    },
+  ]);
+  const summary = renderJobSummary({
+    ...report,
+    agent: {
+      ...report.agent,
+      decisionAudit: { ...report.agent.decisionAudit, submissions: history },
+    },
+  });
+  assert.match(summary, /Targets omitted after submission/u);
+  assert.match(summary, /CLAIM_NUMERIC_DETAIL_UNSUPPORTED/u);
+  assert.doesNotMatch(summary, /SOURCE_FETCH_FAILED/u);
+  assert.equal(firstAttempt.targets[0].estimatedProbability, "0.72");
 
   // A refreshed point must retain the downside/upside risk envelope.
   const proposal = {

@@ -4,6 +4,7 @@ import type { ImmediateOrder } from "../domain/order.js";
 import type { OutcomeSide, TradeAction } from "../domain/primitives.js";
 import { serializeDecimal } from "../domain/primitives.js";
 import type { PredictionExchange } from "../exchanges/exchange.js";
+import { positionReductionDisabled } from "../risk/policy.js";
 import {
   canonicalBookLevels,
   totalEligibleQuantity,
@@ -58,10 +59,22 @@ export interface AdvisoryTradePreviewResult {
   readonly warnings: readonly string[];
 }
 
+export class PositionReductionDisabledPreviewError extends Error {
+  public readonly code = "POSITION_REDUCTION_DISABLED";
+
+  public constructor() {
+    super(
+      "Canonical SELL actions on YES and NO, including trims and emergency exits, are disabled by risk.allowPositionReductions; do not retry to override this policy",
+    );
+    this.name = "PositionReductionDisabledPreviewError";
+  }
+}
+
 export class AdvisoryTradePreviewResolver {
   public constructor(
     private readonly exchange: PredictionExchange,
     private readonly marketsBySlug: ReadonlyMap<string, Market>,
+    private readonly allowPositionReductions = true,
   ) {}
 
   public async preview(
@@ -71,6 +84,11 @@ export class AdvisoryTradePreviewResolver {
     const market = this.marketsBySlug.get(request.marketSlug);
     if (market === undefined) {
       throw new Error(`Market ${request.marketSlug} is not in the catalog`);
+    }
+    if (
+      positionReductionDisabled(this.allowPositionReductions, request.action)
+    ) {
+      throw new PositionReductionDisabledPreviewError();
     }
     const order: ImmediateOrder = {
       marketId: market.id,

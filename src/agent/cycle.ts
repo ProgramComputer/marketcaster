@@ -5,6 +5,7 @@ import {
   referenceStrategy,
   type StrategyPolicy,
 } from "../strategy/policy.js";
+import { reviewResolvedTargets } from "../strategy/resolution-review.js";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { Decimal } from "decimal.js";
@@ -83,7 +84,15 @@ import {
   type BuildAgentContextInput,
   type DetailedMarketContext,
 } from "./context-builder.js";
-import { buildTerminalDecisionRepairFeedback } from "./decision-repair.js";
+import {
+  buildTerminalDecisionRepairFeedback,
+  retainPositionReductionRequests,
+} from "./decision-repair.js";
+import {
+  captureDecisionSubmission,
+  summarizeDecisionSubmissions,
+  type DecisionSubmissionAudit,
+} from "./decision-submission-audit.js";
 import {
   discoverMarketCatalog,
   MarketDetailResolver,
@@ -118,12 +127,21 @@ import {
 } from "./agent-state.js";
 import { buildCandidateFunnel } from "./candidate-funnel.js";
 import {
+  reviewForecastMemory,
+  type ForecastMemoryReview,
+} from "./forecast-memory.js";
+import {
   auditNoPositiveEdgePasses,
   type PassEdgeAuditReport,
 } from "./pass-edge-audit.js";
 import {
   PersistenceTransaction,
   StagedMutationLedger,
+  MutationProvenanceError,
+  validateMutationProvenance,
+  type MutationProvenanceContext,
+  type StagedMutationReference,
+  type StagedMutationValidator,
   type MutationProvenanceReport,
 } from "./persistence-transaction.js";
 import {
@@ -635,6 +653,9 @@ function mergeTerminalDecisionRepairFeedback(
       .filter((index) => !rejectedIndexes.has(index))
       .toSorted((left, right) => left - right),
     rejectedProposals,
+    evidenceIssues: present.flatMap(
+      (feedback) => feedback.evidenceIssues ?? [],
+    ),
     instructions: [
       ...new Set(present.flatMap((feedback) => feedback.instructions)),
     ],
@@ -650,11 +671,33 @@ export async function runCycle(
     );
   }
   const strategy = dependencies.strategy ?? referenceStrategy;
-  const refreshForecasts = (
+  let forecastRefreshSequence = 0;
+  let resolutionReviewSequence = 0;
+  let allocationReviewSequence = 0;
+  const refreshForecasts = async (
     ...args: Parameters<
       NonNullable<StrategyPolicy["forecast"]>["refreshForecasts"]
     >
-  ) => refreshPolicyForecasts(strategy.forecast, ...args);
+  ) => {
+    const result = await refreshPolicyForecasts(strategy.forecast, ...args);
+    const [requests, , observedAt] = args;
+    await journal?.recordArtifact(
+      `forecast-refresh-${++forecastRefreshSequence}`,
+      {
+        observedAt: observedAt.toISOString(),
+        requiredMarketSlugs: [...result.requiredMarketSlugs],
+        estimates: requests.flatMap((request) => {
+          const probability = result.selectedSideProbabilityByMarketSlug.get(
+            request.marketSlug,
+          );
+          return probability === undefined
+            ? []
+            : [{ ...request, kind: "ESTIMATE", probability }];
+        }),
+      },
+    );
+    return result;
+  };
   const now = dependencies.now ?? (() => new Date());
   const startedAt = now();
   const suppliedManifest = dependencies.journal?.currentManifest;
@@ -754,6 +797,14 @@ export async function runCycle(
         exchangeId: dependencies.exchange.id,
         accountScope,
         now,
+      });
+      const validSha = (value: string | undefined) =>
+        value !== undefined && /^[a-f0-9]{40}$/iu.test(value) ? value : null;
+      await journal.recordArtifact("runtime-provenance", {
+        productionSha: validSha(process.env.MARKETCASTER_DEPLOYMENT_SHA),
+        engineSha: validSha(process.env.MARKETCASTER_ENGINE_SHA),
+        provider: dependencies.decisionProvider.providerId,
+        model: dependencies.decisionProvider.modelId,
       });
     }
     if (dependencies.mode === "live") {
@@ -858,6 +909,9 @@ export async function runCycle(
       (dependencies.config.agent.state.enabled &&
       dependencies.writeReports !== false
         ? new FileAgentState({
+            ...(strategy.selectMemoryContext === undefined
+              ? {}
+              : { selectContextBeliefs: strategy.selectMemoryContext }),
             filePath:
               persistenceTransaction?.stagedStateFilePath ?? stateFilePath,
             maximumBeliefs: dependencies.config.agent.state.maximumBeliefs,
@@ -884,6 +938,10 @@ export async function runCycle(
       (!memory.persistent || usesFileMemory) &&
       (!agentState.persistent || usesFileState);
     let stagedPersistenceDiscarded = false;
+    const agentStateAuditBefore =
+      agentState.loadAudit === undefined
+        ? agentStateContext
+        : await agentState.loadAudit();
     stageLogger(dependencies.logger, "account-reconstruction").info(
       "Reconstructing authoritative account state",
     );
@@ -904,7 +962,9 @@ export async function runCycle(
     );
     const discovery = await withStageTimeout(
       "market-discovery",
-      dependencies.config.cycle.stageBudgetsSeconds.marketDiscovery * 1000,
+      dependencies.config.cycle.stageBudgetsSeconds.marketDiscovery === null
+        ? null
+        : dependencies.config.cycle.stageBudgetsSeconds.marketDiscovery * 1000,
       async (signal) => {
         const catalog = await discoverMarketCatalog(
           dependencies.exchange,
@@ -943,13 +1003,19 @@ export async function runCycle(
                 marketSlug,
                 enrichmentSignal,
               );
+              const quoteStatus =
+                details.bbo === undefined
+                  ? "UNAVAILABLE"
+                  : details.bbo.yes.ask === undefined &&
+                      details.bbo.no.ask === undefined
+                    ? "EMPTY"
+                    : "AVAILABLE";
+              let bookStatus: "AVAILABLE" | "UNAVAILABLE" | "NOT_REQUESTED" =
+                quoteStatus === "AVAILABLE" ? "UNAVAILABLE" : "NOT_REQUESTED";
               let nearTouchTwoSidedDepth: number | undefined;
               let yesNearTouchBuyNotionalUsd: number | undefined;
               let noNearTouchBuyNotionalUsd: number | undefined;
-              if (
-                details.bbo?.yes.bid !== undefined &&
-                details.bbo.yes.ask !== undefined
-              ) {
+              if (quoteStatus === "AVAILABLE" && details.bbo !== undefined) {
                 try {
                   enrichmentSignal?.throwIfAborted();
                   const book = await dependencies.exchange.getOrderBook(
@@ -966,34 +1032,42 @@ export async function runCycle(
                     "NO",
                     strategy.selection.depthPriceBand ?? new Decimal(0),
                   ).toNumber();
-                  const bidFloor = details.bbo.yes.bid.minus(
-                    strategy.selection.depthPriceBand ?? 0,
-                  );
-                  const askCeiling = details.bbo.yes.ask.plus(
-                    strategy.selection.depthPriceBand ?? 0,
-                  );
-                  const bidDepth = book.yesBids
-                    .filter((level) => level.price.gte(bidFloor))
-                    .reduce(
-                      (total, level) => total.plus(level.quantity),
-                      details.bbo.yes.bid.mul(0),
+                  bookStatus = "AVAILABLE";
+                  if (
+                    details.bbo.yes.bid !== undefined &&
+                    details.bbo.yes.ask !== undefined
+                  ) {
+                    const bidFloor = details.bbo.yes.bid.minus(
+                      strategy.selection.depthPriceBand ?? 0,
                     );
-                  const askDepth = book.yesAsks
-                    .filter((level) => level.price.lte(askCeiling))
-                    .reduce(
-                      (total, level) => total.plus(level.quantity),
-                      details.bbo.yes.ask.mul(0),
+                    const askCeiling = details.bbo.yes.ask.plus(
+                      strategy.selection.depthPriceBand ?? 0,
                     );
-                  nearTouchTwoSidedDepth = Decimal.min(
-                    bidDepth,
-                    askDepth,
-                  ).toNumber();
+                    const bidDepth = book.yesBids
+                      .filter((level) => level.price.gte(bidFloor))
+                      .reduce(
+                        (total, level) => total.plus(level.quantity),
+                        details.bbo.yes.bid.mul(0),
+                      );
+                    const askDepth = book.yesAsks
+                      .filter((level) => level.price.lte(askCeiling))
+                      .reduce(
+                        (total, level) => total.plus(level.quantity),
+                        details.bbo.yes.ask.mul(0),
+                      );
+                    nearTouchTwoSidedDepth = Decimal.min(
+                      bidDepth,
+                      askDepth,
+                    ).toNumber();
+                  }
                 } catch (error) {
                   if (enrichmentSignal?.aborted === true) throw error;
                 }
               }
               return {
                 market: details.market,
+                quoteStatus,
+                bookStatus,
                 ...(yesNearTouchBuyNotionalUsd === undefined
                   ? {}
                   : { yesNearTouchBuyNotionalUsd }),
@@ -1172,6 +1246,13 @@ export async function runCycle(
       modelSnapshot,
       initialValuation,
     );
+    const memoryContextScope = {
+      marketSlugs: opportunityBoard.map((market) => market.slug),
+      heldMarketSlugs: [...visibleHeldSlugs],
+    };
+    if (agentState.persistent && strategy.selectMemoryContext !== undefined) {
+      agentStateContext = await agentState.load(memoryContextScope);
+    }
     const contextInput: BuildAgentContextInput = {
       ...(strategy.selection.buildCriticalLearning === undefined
         ? {}
@@ -1208,6 +1289,8 @@ export async function runCycle(
         minimumIndependentSources:
           dependencies.config.risk.minimumIndependentSources,
         allowNakedShorts: dependencies.config.risk.allowNakedShorts,
+        allowPositionReductions:
+          dependencies.config.risk.allowPositionReductions,
         emergencyExitEnabled: dependencies.config.risk.emergencyExitEnabled,
         managedRestingBuyOrders:
           dependencies.config.exchange.managedRestingBuyOrders,
@@ -1236,7 +1319,41 @@ export async function runCycle(
     const tradePreviewResolver = new AdvisoryTradePreviewResolver(
       dependencies.exchange,
       discovery.catalog.bySlug,
+      dependencies.config.risk.allowPositionReductions,
     );
+    const currentMutationProvenanceContext = (): MutationProvenanceContext => ({
+      // Advisory memory may cite an observed source; trade authorization retains
+      // its stricter excerpt, freshness, and source-independence validation.
+      observedCurrentUrls: new Set(
+        researchTools.observedEvidenceSources.map((source) => source.url),
+      ),
+      currentCycleMarketBasisSlugs: new Set([
+        ...discovery.preloadedHeld.map(({ market }) => market.slug),
+        ...researchTools.inspectedMarketSlugs,
+      ]),
+    });
+    const manageAdvisoryMutation = async <T>(
+      apply: (beforePersist: StagedMutationValidator) => Promise<T>,
+      usesStagedFile: boolean,
+    ): Promise<T> => {
+      let effectiveReference: StagedMutationReference | undefined;
+      const result = await apply((reference) => {
+        const issues = validateMutationProvenance(
+          reference,
+          currentMutationProvenanceContext(),
+        );
+        if (issues.length > 0) throw new MutationProvenanceError(issues);
+        effectiveReference = reference;
+      });
+      if (effectiveReference === undefined) {
+        throw new Error(
+          "Persistent memory adapter did not validate its mutation before writing",
+        );
+      }
+      mutationLedger.record(effectiveReference);
+      if (usesStagedFile) persistenceTransaction?.markMutated();
+      return result;
+    };
     const researchTools = new DecisionResearchTools({
       ...(strategy.selection.shouldEnforceRequiredResearch === undefined
         ? {}
@@ -1283,48 +1400,13 @@ export async function runCycle(
         ? {
             agentNotesHandler: async (
               operation: Parameters<AgentMemory["manage"]>[0],
-            ) => {
-              if (operation.action === "ADD" || operation.action === "UPDATE") {
-                const {
-                  evidenceUrls = [],
-                  basisMarketSlugs = [],
-                  ...persisted
-                } = operation;
-                const result = await memory.manage(persisted);
-                const mutatedNoteId =
-                  result.mutatedNoteId ??
-                  (operation.action === "UPDATE"
-                    ? operation.noteId
-                    : undefined);
-                if (mutatedNoteId === undefined) {
-                  throw new Error(
-                    "Persistent note mutation did not identify its effective note",
-                  );
-                }
-                mutationLedger.record({
-                  kind: "NOTE",
-                  action: operation.action,
-                  identity: `NOTE:${mutatedNoteId}`,
-                  evidenceUrls,
-                  basisMarketSlugs,
-                });
-                if (usesFileMemory) persistenceTransaction?.markMutated();
-                return result;
-              }
-              if (operation.action === "DELETE") {
-                const result = await memory.manage(operation);
-                mutationLedger.record({
-                  kind: "DESTRUCTIVE",
-                  action: operation.action,
-                  identity: `NOTE:${operation.noteId}`,
-                  evidenceUrls: [],
-                  basisMarketSlugs: [],
-                });
-                if (usesFileMemory) persistenceTransaction?.markMutated();
-                return result;
-              }
-              return memory.manage(operation);
-            },
+            ) =>
+              operation.action === "LIST"
+                ? memory.manage(operation)
+                : manageAdvisoryMutation(
+                    (beforePersist) => memory.manage(operation, beforePersist),
+                    usesFileMemory,
+                  ),
           }
         : {}),
       ...(agentState.persistent
@@ -1332,80 +1414,14 @@ export async function runCycle(
             agentStateHandler: async (
               operation: Parameters<AgentState["manage"]>[0],
               signal: AbortSignal,
-            ) => {
-              if (
-                operation.action === "ADD_BELIEF" ||
-                operation.action === "UPDATE_BELIEF"
-              ) {
-                const {
-                  evidenceUrls = [],
-                  basisMarketSlugs = [],
-                  ...persisted
-                } = operation;
-                const result = await agentState.manage(persisted, signal);
-                const mutatedBeliefId =
-                  result.mutatedBeliefId ??
-                  (operation.action === "UPDATE_BELIEF"
-                    ? operation.beliefId
-                    : undefined);
-                if (mutatedBeliefId === undefined) {
-                  throw new Error(
-                    "Persistent belief mutation did not identify its effective belief",
-                  );
-                }
-                mutationLedger.record({
-                  kind: "BELIEF",
-                  action: operation.action,
-                  identity: `BELIEF:${mutatedBeliefId}`,
-                  evidenceUrls,
-                  basisMarketSlugs,
-                });
-                if (usesFileState) persistenceTransaction?.markMutated();
-                return result;
-              }
-              if (
-                operation.action === "SET_NEXT_CYCLE_PLAN" ||
-                operation.action === "SET_LONG_TERM_PLAN"
-              ) {
-                const {
-                  evidenceUrls = [],
-                  basisMarketSlugs = [],
-                  ...persisted
-                } = operation;
-                const result = await agentState.manage(persisted, signal);
-                mutationLedger.record({
-                  kind: "PLAN",
-                  action: operation.action,
-                  identity:
-                    operation.action === "SET_NEXT_CYCLE_PLAN"
-                      ? "PLAN:NEXT_CYCLE"
-                      : "PLAN:LONG_TERM",
-                  evidenceUrls,
-                  basisMarketSlugs,
-                });
-                if (usesFileState) persistenceTransaction?.markMutated();
-                return result;
-              }
-              if (
-                operation.action === "DELETE_BELIEF" ||
-                operation.action === "CLEAR_NEXT_CYCLE_PLAN"
-              ) {
-                const result = await agentState.manage(operation, signal);
-                mutationLedger.record({
-                  kind: "DESTRUCTIVE",
-                  action: operation.action,
-                  identity:
-                    operation.action === "DELETE_BELIEF"
-                      ? `BELIEF:${operation.beliefId}`
-                      : "PLAN:NEXT_CYCLE",
-                  evidenceUrls: [],
-                  basisMarketSlugs: [],
-                });
-                if (usesFileState) persistenceTransaction?.markMutated();
-                return result;
-              }
-              return agentState.manage(operation, signal);
-            },
+            ) =>
+              operation.action === "LIST"
+                ? agentState.manage(operation, signal)
+                : manageAdvisoryMutation(
+                    (beforePersist) =>
+                      agentState.manage(operation, signal, beforePersist),
+                    usesFileState,
+                  ),
           }
         : {}),
       candidateFamilies: [
@@ -1459,8 +1475,20 @@ export async function runCycle(
         now(),
         signal,
       );
-      return validateProposals({
-        allocationPolicy: strategy.allocation,
+      const allocationAssessments: unknown[] = [];
+      const result = await validateProposals({
+        allocationPolicy: (input) => {
+          const assessedInput: unknown = JSON.parse(JSON.stringify(input));
+          const instructions = strategy.allocation(input);
+          const returnedInstructions: unknown = JSON.parse(
+            JSON.stringify(instructions),
+          );
+          allocationAssessments.push({
+            input: assessedInput,
+            instructions: returnedInstructions,
+          });
+          return instructions;
+        },
         minimumNearTouchBuyNotionalUsd:
           dependencies.config.marketSelection.minimumNearTouchBuyNotionalUsd,
         depthPriceBand: strategy.selection.depthPriceBand,
@@ -1485,8 +1513,18 @@ export async function runCycle(
         now,
         signal,
       });
+      await journal?.recordArtifact(
+        `allocation-review-${++allocationReviewSequence}`,
+        {
+          observedAt: now().toISOString(),
+          assessments: allocationAssessments,
+          executionAuthorization: false,
+        },
+      );
+      return result;
     };
     let evidenceValidation: EvidenceValidationReport | undefined;
+    const decisionSubmissions: DecisionSubmissionAudit[] = [];
     let decisionCoverage: DecisionCoverageReport | undefined;
     let passEdgeAudit: PassEdgeAuditReport | undefined;
     const passEdgeAuditHistory: PassEdgeAuditReport[] = [];
@@ -1525,6 +1563,7 @@ export async function runCycle(
           validateDecisionEvidence({
             decision: candidateDecision,
             observedSources: researchTools.observedEvidenceSources,
+            evidencePageSnapshots: researchTools.evidencePageSnapshots,
             marketsBySlug,
             minimumIndependentSources:
               dependencies.config.risk.minimumIndependentSources,
@@ -1572,6 +1611,25 @@ export async function runCycle(
           }),
         ]);
       const liveCoverageIssues: DecisionCoverageReport["issues"][number][] = [];
+      const resolutionReview = await reviewResolvedTargets({
+        policy: strategy.resolutionReview,
+        targets: candidateDecision.portfolioTargets,
+        forecasts: freshTargetLive,
+        details: resolvedMarketDetailsBySlug,
+        exchange: dependencies.exchange,
+        now,
+        signal,
+      });
+      await journal?.recordArtifact(
+        `resolution-review-${++resolutionReviewSequence}`,
+        resolutionReview,
+      );
+      liveCoverageIssues.push(
+        ...resolutionReview.issues.map((issue) => ({
+          code: "RESOLUTION_POLICY_REVIEW_REQUIRED" as const,
+          ...issue,
+        })),
+      );
       for (const target of candidateDecision.portfolioTargets) {
         if (!freshTargetLive.requiredMarketSlugs.has(target.marketSlug)) {
           continue;
@@ -1614,21 +1672,9 @@ export async function runCycle(
         ],
       };
       passEdgeAuditHistory.push(passAudit);
-      const provenance = mutationLedger.validate({
-        // Advisory memory has a deliberately weaker trust boundary than trade
-        // authorization. A source must have been observed this cycle (so the
-        // model cannot persist invented URLs), but it need not satisfy the
-        // stricter excerpt, freshness, and independence rules required to put
-        // capital at risk. Persisted state remains untrusted and never
-        // authorizes an order without fresh terminal evidence.
-        observedCurrentUrls: new Set(
-          researchTools.observedEvidenceSources.map((source) => source.url),
-        ),
-        currentCycleMarketBasisSlugs: new Set([
-          ...discovery.preloadedHeld.map(({ market }) => market.slug),
-          ...researchTools.inspectedMarketSlugs,
-        ]),
-      });
+      const provenance = mutationLedger.validate(
+        currentMutationProvenanceContext(),
+      );
       return {
         evidence,
         coverage,
@@ -1636,7 +1682,10 @@ export async function runCycle(
         passEdgeAudit: passAudit,
       };
     };
-    const rawDecision = await withStageTimeout(
+    const blockedReductionMarketSlugs = new Set<string>();
+    let retainedReductionDecision: AgentDecision | undefined;
+    let reductionPolicyArtifactCount = 0;
+    const submittedDecision = await withStageTimeout(
       "agent-research",
       dependencies.config.cycle.stageBudgetsSeconds.agentResearch * 1000,
       (signal) =>
@@ -1649,6 +1698,13 @@ export async function runCycle(
           limits: liveDecisionLimits,
           signal,
           reviewTerminalDecision: async (candidateDecision, reviewSignal) => {
+            const submittedAt = safeTimestamp(now).toISOString();
+            const modelDecision = candidateDecision;
+            candidateDecision = retainPositionReductionRequests(
+              candidateDecision,
+              retainedReductionDecision,
+              blockedReductionMarketSlugs,
+            );
             const guards = await validateDecisionGuards(
               candidateDecision,
               reviewSignal,
@@ -1666,6 +1722,40 @@ export async function runCycle(
             const validation = await validateDecisionProposals(
               candidatePlan.riskProposals,
               reviewSignal,
+            );
+            for (const rejection of validation.rejected) {
+              if (rejection.code === "POSITION_REDUCTION_DISABLED") {
+                blockedReductionMarketSlugs.add(rejection.proposal.marketSlug);
+                retainedReductionDecision = candidateDecision;
+              }
+            }
+            const blockedReductions = validation.rejected.filter(
+              (rejection) => rejection.code === "POSITION_REDUCTION_DISABLED",
+            );
+            if (blockedReductions.length > 0) {
+              // Retain rejected intent even if an independent final safety
+              // guard aborts before the normal decision/report artifacts.
+              reductionPolicyArtifactCount += 1;
+              await journal?.recordArtifact(
+                `position-reduction-policy-${reductionPolicyArtifactCount}`,
+                {
+                  decision: candidateDecision,
+                  rejectedProposals: blockedReductions,
+                },
+              );
+            }
+            const submission = captureDecisionSubmission({
+              attempt: decisionSubmissions.length + 1,
+              submittedAt,
+              decision: modelDecision,
+              evidence: guards.evidence,
+              coverage: guards.coverage,
+              validation,
+            });
+            decisionSubmissions.push(submission);
+            await journal?.recordArtifact(
+              `decision-submission-${submission.attempt}`,
+              submission,
             );
             const validationFeedback = targetRepairFeedback(
               candidatePlan,
@@ -1719,17 +1809,18 @@ export async function runCycle(
               ...evidenceRepairMarketSlugs,
             ].map(
               (marketSlug) =>
-                `Evidence repair fallback for ${marketSlug}: either correct every cited source issue with exact provider-verifiable current excerpts, or remove this target and submit a PASS disposition using INSUFFICIENT_CURRENT_EVIDENCE with null probability fields, empty evidence, and no evidence bundle IDs. Do not label an evidence-blocked market NO_POSITIVE_EDGE.`,
+                `For ${marketSlug}, correct source claims using the exact available passages in evidenceIssues[].repairContext or reselect the cached page. A claim mismatch is not a fetch failure. Keep your inferred probability and calculations in the thesis, separate from source facts. If the factual support remains unavailable, remove the target and submit INSUFFICIENT_CURRENT_EVIDENCE with null probability fields, empty evidence, and no evidence bundle IDs.`,
             );
             const guardFeedback =
               guardInstructions.length > 0
                 ? ({
                     acceptedProposalIndexes: [],
                     rejectedProposals: [],
+                    evidenceIssues: guards.evidence.issues,
                     instructions: [
                       "Resubmit the complete intended trade plan. Every held position requires a target; use its supplied current cost-basis fraction for an unchanged hold or zero to exit. Every seriously evaluated non-held candidate requires either a target or a compact pass disposition.",
                       "Use only sources observed in this cycle. Current evidence needs an exact excerpt, correct event year, and a provider-verifiable publication/as-of date; do not copy a search result from another year.",
-                      "Rejected-candidate evidence cannot authorize exposure. Do not spend repair rounds rescuing a source for a candidate you will not trade; omit that candidate.",
+                      "Evidence checks validate factual inputs, not the inferred probability of an unresolved outcome. Do not invent a source fact or change the forecast just to pass validation.",
                       "For a held market, retain the target after decision-relevant inspection even when holding unchanged. Do not synthesize or paraphrase an exact excerpt.",
                       ...evidenceRepairInstructions,
                       ...guardInstructions,
@@ -1744,7 +1835,6 @@ export async function runCycle(
             const quoteMovedOnly =
               guardFeedback === undefined &&
               passFeedback === undefined &&
-              guards.mutationProvenance.valid &&
               validation.rejected.length > 0 &&
               validation.rejected.every((rejection) =>
                 TRANSIENT_MARKET_STRUCTURE_REJECTIONS.has(rejection.code),
@@ -1757,7 +1847,12 @@ export async function runCycle(
             // obtain fresh live evidence. Authoritative final validation still
             // runs, so a quote that returns before execution remains eligible.
             if (quoteMovedOnly) return { repair: false };
-            return feedback === undefined
+            return feedback === undefined ||
+              (guardFeedback === undefined &&
+                passFeedback === undefined &&
+                !feedback.rejectedProposals.some(
+                  (rejection) => rejection.repairable,
+                ))
               ? { repair: false }
               : { repair: true, feedback };
           },
@@ -1765,10 +1860,26 @@ export async function runCycle(
         }),
       overallController.signal,
     );
+    const rawDecision = retainPositionReductionRequests(
+      submittedDecision,
+      retainedReductionDecision,
+      blockedReductionMarketSlugs,
+    );
+    const decisionReturnedAt = safeTimestamp(now).toISOString();
     const finalGuards = await validateDecisionGuards(
       rawDecision,
       overallController.signal,
     );
+    const submissionHistory = summarizeDecisionSubmissions(
+      decisionSubmissions,
+      rawDecision.portfolioTargets,
+    );
+    await journal?.recordArtifact("decision-submissions", submissionHistory);
+    for (const target of submissionHistory.omittedTargets) {
+      warnings.push(
+        `Final plan omitted previously submitted ${target.marketSlug} ${target.side}; earlier validation codes: ${target.priorIssueCodes.join(", ") || "none"}. See decision-submissions for the recorded attempts.`,
+      );
+    }
     // A pass-edge contradiction challenges a non-ordering disposition. Keep it
     // blocking throughout bounded model repair, then retain it as an audited
     // advisory instead of letting that PASS veto unrelated valid targets.
@@ -1832,6 +1943,57 @@ export async function runCycle(
         `Discarded all staged advisory-memory changes because ${finalGuards.mutationProvenance.issues.length} provenance check${finalGuards.mutationProvenance.issues.length === 1 ? "" : "s"} failed; the trade decision remained eligible for independent validation`,
       );
     }
+    // Advisory diagnostics never revise the target or add a trading gate.
+    // Only staged, current-cycle scalar claims are compared; older forecasts
+    // remain historical observations rather than constraints on new judgment.
+    let forecastMemoryReview: ForecastMemoryReview | undefined;
+    let quarantinedForecastBeliefIds: readonly string[] = [];
+    if (agentState.persistent && !stagedPersistenceDiscarded) {
+      try {
+        const stateForReview =
+          agentState.loadAudit === undefined
+            ? await agentState.load(memoryContextScope)
+            : await agentState.loadAudit();
+        forecastMemoryReview = reviewForecastMemory({
+          beliefs: stateForReview.beliefs,
+          cycleStartedAt: startedAt.toISOString(),
+          submittedForecasts: [
+            ...decisionSubmissions.flatMap((submission) =>
+              submission.targets.map((target) => ({
+                ...target,
+                submittedAt: submission.submittedAt,
+              })),
+            ),
+            ...rawDecision.portfolioTargets.map((target) => ({
+              ...target,
+              submittedAt: decisionReturnedAt,
+            })),
+          ],
+        });
+        await journal?.recordArtifact(
+          "forecast-memory-review",
+          forecastMemoryReview,
+        );
+        if (forecastMemoryReview.issues.length > 0) {
+          quarantinedForecastBeliefIds =
+            (await agentState.quarantineForecasts?.(
+              forecastMemoryReview.issues,
+              overallController.signal,
+            )) ?? [];
+          if (quarantinedForecastBeliefIds.length > 0) {
+            persistenceTransaction?.markMutated();
+          }
+          warnings.push(
+            `Advisory forecast review found ${forecastMemoryReview.issues.length} inconsistent or ambiguous scalar(s); quarantined ${quarantinedForecastBeliefIds.length}. Original values remain in the audit; trade eligibility was unchanged.`,
+          );
+        }
+      } catch (error) {
+        if (overallController.signal.aborted) throw error;
+        warnings.push(
+          `Advisory forecast review could not complete; trade validation remains independent: ${safeErrorMessage(error)}`,
+        );
+      }
+    }
     const targetPlan = materializeTargetDecision(
       rawDecision,
       initialSnapshot,
@@ -1893,10 +2055,13 @@ export async function runCycle(
         detailedMarketsBySlug.get(market.slug) ?? market,
       ),
     );
-    let agentStateAfter = agentStateContext;
+    let agentStateAfter = agentStateAuditBefore;
     if (agentState.persistent && !stagedPersistenceDiscarded) {
       try {
-        agentStateAfter = await agentState.load();
+        agentStateAfter =
+          agentState.loadAudit === undefined
+            ? await agentState.load(memoryContextScope)
+            : await agentState.loadAudit();
       } catch (error) {
         warnings.push(
           `Structured agent state could not be reloaded after research: ${safeErrorMessage(error)}`,
@@ -1904,7 +2069,7 @@ export async function runCycle(
       }
     }
     await journal?.recordArtifact("agent-state", {
-      before: agentStateContext,
+      before: agentStateAuditBefore,
       after: agentStateAfter,
     });
     const observedPassResearchGate = researchTools.strictPassResearchReadiness;
@@ -2307,12 +2472,28 @@ export async function runCycle(
       valuation: finalValuation,
     });
     await persistenceTransaction?.commit();
+    await journal?.recordArtifact("advisory-persistence", {
+      status: stagedPersistenceDiscarded ? "DISCARDED" : "COMMITTED",
+      mutationCount: finalGuards.mutationProvenance.mutationCount,
+    });
     persistenceTransaction = undefined;
     const completedAt = now();
     const counts = researchTools.totalCounts;
     const tokenUsage = aggregateTokenUsage(transcriptRounds);
     const cacheDiagnostics = aggregateCacheDiagnostics(transcriptRounds);
     const decisionAudit = {
+      submissions: submissionHistory,
+      ...(forecastMemoryReview === undefined
+        ? {}
+        : {
+            forecastMemory: {
+              checkedBeliefCount: forecastMemoryReview.checkedBeliefIds.length,
+              issueCount: forecastMemoryReview.issues.length,
+              quarantinedBeliefIds: quarantinedForecastBeliefIds,
+              unverifiedBeliefCount:
+                forecastMemoryReview.unverifiedBeliefs.length,
+            },
+          }),
       evidence: {
         valid: evidenceValidation.valid,
         verifiedSourceCount: evidenceValidation.verifiedSources.length,
@@ -2349,7 +2530,7 @@ export async function runCycle(
       accountAfter: finalSnapshot,
       valuationBefore: initialValuation,
       valuationAfter: finalValuation,
-      agentStateBefore: agentStateContext,
+      agentStateBefore: agentStateAuditBefore,
       agentStateAfter,
       marketDiscovery: {
         catalogued: discovery.catalog.markets.length,

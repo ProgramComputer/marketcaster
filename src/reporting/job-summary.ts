@@ -158,6 +158,22 @@ export function renderJobSummary(report: CycleReport): string {
       "",
       `Decision audit: evidence valid **${audit.evidence.valid ? "yes" : "no"}** (${audit.evidence.verifiedSourceCount} verified sources, ${audit.evidence.blockingIssueCount} blocking and ${audit.evidence.advisoryIssueCount} advisory issues); coverage valid **${audit.coverage.valid ? "yes" : "no"}** (${audit.coverage.requiredMarketCount} required markets, ${audit.coverage.issueCount} issues); persistence provenance valid **${audit.persistence.valid ? "yes" : "no"}** (${audit.persistence.issueCount} issues).`,
     );
+    const omittedTargets = audit.submissions?.omittedTargets ?? [];
+    if (omittedTargets.length > 0) {
+      lines.push(
+        "",
+        "## Targets omitted after submission",
+        "",
+        "Earlier validation failures remain recorded even when the final plan passes. These are prior failures, not proof of why the model changed its mind.",
+        "",
+        "| Market | Side | Earlier validation codes |",
+        "| --- | --- | --- |",
+        ...omittedTargets.map(
+          (target) =>
+            `| ${escapeCell(target.marketSlug)} | ${target.side} | ${escapeCell(target.priorIssueCodes.join(", ") || "No prior validation issue")} |`,
+        ),
+      );
+    }
   }
 
   if (report.risk.rejected.length > 0) {
