@@ -3,6 +3,7 @@ import type { AgentConfig } from "../config/schema.js";
 import type { AgentDecision } from "../agent/decision-schema.js";
 import type { EvidenceValidationIssue } from "../agent/evidence-provenance.js";
 import type { DecisionPrompt } from "../agent/prompt-builder.js";
+import type { DecisionRequestProvenance } from "../reporting/decision-input-provenance.js";
 import type {
   DecisionResearchTools,
   ToolExecutionResult,
@@ -85,6 +86,12 @@ export interface AgentInput {
   ) => Promise<TerminalDecisionReview>;
   readonly recordTranscriptRound?: (
     round: DecisionTranscriptRound,
+  ) => void | Promise<void>;
+  /** Known credential values for runtime-artifact redaction only. */
+  readonly provenanceSecretValues?: readonly string[];
+  /** Awaited before HTTP, including requests which later fail without a response. */
+  readonly recordModelRequest?: (
+    request: DecisionRequestProvenance,
   ) => void | Promise<void>;
 }
 

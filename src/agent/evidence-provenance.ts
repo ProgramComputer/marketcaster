@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { BlockList, isIP, type LookupFunction } from "node:net";
 import { Agent, type Dispatcher } from "undici";
@@ -18,7 +19,11 @@ export interface ObservedEvidenceSource {
   readonly url: string;
   readonly title: string;
   readonly excerpt?: string;
+  /** Legacy name for when the engine discovered this source, not its data time. */
   readonly observedAt: string;
+  readonly discoveredAt?: string;
+  readonly retrieval?: EvidencePageRetrieval;
+  readonly sourceTimestamps?: readonly EvidenceSourceTimestamp[];
   readonly publishedAt?: string;
   readonly pageAge?: string;
   readonly provider: EvidenceSourceProvider;
@@ -117,16 +122,23 @@ export class EvidenceSourceRegistry {
       validTimestamp(source.publishedAt) ?? existing?.publishedAt;
     const pageAge = source.pageAge ?? existing?.pageAge;
     const suppliedTitle = source.title.trim();
+    const discoveredAt =
+      existing === undefined ||
+      Date.parse(observedAt) < Date.parse(existing.observedAt)
+        ? observedAt
+        : existing.observedAt;
+    const retrieval = source.retrieval ?? existing?.retrieval;
+    const sourceTimestamps =
+      source.sourceTimestamps ?? existing?.sourceTimestamps;
     this.#sources.set(key, {
       url: key,
       title:
         suppliedTitle.length > 0 ? suppliedTitle : (existing?.title ?? key),
       ...(excerpt === undefined ? {} : { excerpt }),
-      observedAt:
-        existing === undefined ||
-        Date.parse(observedAt) < Date.parse(existing.observedAt)
-          ? observedAt
-          : existing.observedAt,
+      observedAt: discoveredAt,
+      discoveredAt,
+      ...(retrieval === undefined ? {} : { retrieval }),
+      ...(sourceTimestamps === undefined ? {} : { sourceTimestamps }),
       ...(publishedAt === undefined ? {} : { publishedAt }),
       ...(pageAge === undefined ? {} : { pageAge }),
       provider: source.provider,
@@ -449,10 +461,35 @@ export async function assertPublicEvidenceUrl(
   return url;
 }
 
+export interface EvidenceSourceTimestamp {
+  readonly field: string;
+  readonly role: "PUBLICATION" | "MODIFICATION" | "UNSPECIFIED";
+  readonly rawValue: string;
+  /** Absent when the source omits an offset or has an unparseable value. */
+  readonly timestamp?: string;
+}
+
+export interface EvidencePageRetrieval {
+  readonly fetchId: string;
+  readonly fetchStartedAt: string;
+  /** Completion of the HTTP body read, not a source publication/observation time. */
+  readonly fetchedAt: string;
+  readonly requestedUrl: string;
+  readonly finalUrl: string;
+  readonly responseContentType: string;
+  readonly responseLastModified?: string;
+  readonly decodedBodySha256: string;
+  readonly extractedTextSha256: string;
+  readonly extractionMethod: "HTML_TEXT" | "PLAIN_TEXT" | "STRUCTURED_FEED";
+}
+
 export interface FetchedEvidencePage {
   readonly text: string;
   readonly publishedAt?: string;
   readonly finalUrl: string;
+  /** Optional for custom readers that cannot attest to a network retrieval. */
+  readonly retrieval?: EvidencePageRetrieval;
+  readonly sourceTimestamps?: readonly EvidenceSourceTimestamp[];
 }
 
 function pageText(source: string): string {
@@ -476,17 +513,64 @@ function pageText(source: string): string {
     .trim();
 }
 
-function structuredPublishedAt(source: string): string | undefined {
-  const patterns = [
-    /(?:article:published_time|datePublished)[^>\n]{0,200}?(?:content=|:\s*)["']?([^"'<>,}]+?\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)/iu,
-    /<time[^>]+datetime=["']([^"']+)["']/iu,
-  ];
-  for (const pattern of patterns) {
-    const value = pattern.exec(source)?.[1];
-    const timestamp = validTimestamp(value);
-    if (timestamp !== undefined) return timestamp;
+function structuredSourceTimestamps(
+  source: string,
+): readonly EvidenceSourceTimestamp[] {
+  const result: EvidenceSourceTimestamp[] = [];
+  const add = (
+    field: string,
+    role: EvidenceSourceTimestamp["role"],
+    rawValue: string,
+  ): void => {
+    if (
+      result.length >= 40 ||
+      result.some(
+        (entry) => entry.field === field && entry.rawValue === rawValue,
+      )
+    )
+      return;
+    // An unspecified time zone must not silently become the host's time zone.
+    const timestamp = /(?:Z|[+-]\d{2}:?\d{2})$/iu.test(rawValue.trim())
+      ? validTimestamp(rawValue)
+      : undefined;
+    result.push({
+      field,
+      role,
+      rawValue,
+      ...(timestamp === undefined ? {} : { timestamp }),
+    });
+  };
+  for (const match of source.matchAll(/<meta\b[^>]*>/giu)) {
+    const tag = match[0];
+    const field = /(?:property|name|itemprop)\s*=\s*["']([^"']+)["']/iu.exec(
+      tag,
+    )?.[1];
+    const value = /content\s*=\s*["']([^"']+)["']/iu.exec(tag)?.[1];
+    if (field === undefined || value === undefined) continue;
+    if (/^(?:article:published_time|datePublished)$/iu.test(field))
+      add(field, "PUBLICATION", value);
+    if (/^(?:article:modified_time|dateModified)$/iu.test(field))
+      add(field, "MODIFICATION", value);
   }
-  return undefined;
+  for (const match of source.matchAll(
+    /["'](datePublished|dateModified)["']\s*:\s*["']([^"']+)["']/giu,
+  )) {
+    const field = match[1];
+    const value = match[2];
+    if (field === undefined || value === undefined) continue;
+    add(
+      field,
+      field.toLowerCase() === "datepublished" ? "PUBLICATION" : "MODIFICATION",
+      value,
+    );
+  }
+  for (const match of source.matchAll(
+    /<time\b[^>]*\bdatetime\s*=\s*["']([^"']+)["']/giu,
+  )) {
+    const value = match[1];
+    if (value !== undefined) add("time.datetime", "UNSPECIFIED", value);
+  }
+  return result;
 }
 
 const MAXIMUM_EVIDENCE_RESPONSE_BYTES = 4 * 1_048_576;
@@ -638,6 +722,8 @@ export async function fetchEvidencePage(
     readonly signal?: AbortSignal;
   } = {},
 ): Promise<FetchedEvidencePage> {
+  const fetchId = randomUUID();
+  const fetchStartedAt = new Date().toISOString();
   const lookupImplementation = options.lookupImplementation ?? lookup;
   const timeoutSignal = AbortSignal.timeout(10_000);
   const fetchSignal =
@@ -722,15 +808,36 @@ export async function fetchEvidencePage(
         );
       }
       const source = await readBoundedBody(response, fetchSignal);
-      const publishedAt = structuredPublishedAt(source);
+      const fetchedAt = new Date().toISOString();
+      const sourceTimestamps = structuredSourceTimestamps(source);
+      const publishedAt = sourceTimestamps.find(
+        (entry) =>
+          entry.role === "PUBLICATION" && entry.timestamp !== undefined,
+      )?.timestamp;
       // Source selection belongs to the caller; never enrich from a second URL.
       const text = contentType.startsWith("text/html")
         ? pageText(source)
         : source.replace(/\r\n?/gu, "\n").trim();
+      const responseLastModified = response.headers.get("last-modified");
       return {
         text,
         ...(publishedAt === undefined ? {} : { publishedAt }),
         finalUrl: current.toString(),
+        sourceTimestamps,
+        retrieval: {
+          fetchId,
+          fetchStartedAt,
+          fetchedAt,
+          requestedUrl: urlValue,
+          finalUrl: current.toString(),
+          responseContentType: contentType,
+          ...(responseLastModified === null ? {} : { responseLastModified }),
+          decodedBodySha256: createHash("sha256").update(source).digest("hex"),
+          extractedTextSha256: createHash("sha256").update(text).digest("hex"),
+          extractionMethod: contentType.startsWith("text/html")
+            ? "HTML_TEXT"
+            : "PLAIN_TEXT",
+        },
       };
     }
     throw new EvidencePageReadError(

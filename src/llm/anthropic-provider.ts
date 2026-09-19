@@ -1,3 +1,4 @@
+import { decisionRequestProvenance } from "../reporting/decision-input-provenance.js";
 import { z } from "zod";
 import type { AgentDecision } from "../agent/decision-schema.js";
 import { extractAnthropicEvidenceSources } from "../agent/evidence-provenance.js";
@@ -465,6 +466,41 @@ export class AnthropicDecisionProvider implements DecisionProvider {
               ? { type: "tool", name: "submit_trade_plan" }
               : { type: "any" };
           const comparedMessageId = diagnosticsPreviousMessageId;
+          const requestBody = {
+            model: requestModelId,
+            max_tokens: contextPressure
+              ? Math.min(
+                  limits.maximumOutputTokens,
+                  ANTHROPIC_CONTEXT_PRESSURE_OUTPUT_TOKENS,
+                )
+              : limits.maximumOutputTokens,
+            system: [
+              {
+                type: "text",
+                text: input.prompt.system,
+                cache_control: ANTHROPIC_STABLE_CACHE_CONTROL,
+              },
+            ],
+            messages,
+            tools: providerTools,
+            cache_control: { type: "ephemeral" },
+            diagnostics: { previous_message_id: comparedMessageId },
+            tool_choice: toolChoice,
+          };
+          await input.recordModelRequest?.(
+            decisionRequestProvenance({
+              round: transcriptRound,
+              provider: this.providerId,
+              model: requestModelId,
+              endpoint: ANTHROPIC_MESSAGES_ENDPOINT,
+              body: requestBody,
+              limits,
+              secretValues: [
+                ...(input.provenanceSecretValues ?? []),
+                this.#apiKey,
+              ],
+            }),
+          );
           const providerRequest = await fetchProviderResponse({
             providerName: "Anthropic",
             fetchImplementation: this.#fetch,
@@ -477,27 +513,7 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                 "anthropic-beta": ANTHROPIC_CACHE_DIAGNOSTICS_BETA,
                 "content-type": "application/json",
               },
-              body: JSON.stringify({
-                model: requestModelId,
-                max_tokens: contextPressure
-                  ? Math.min(
-                      limits.maximumOutputTokens,
-                      ANTHROPIC_CONTEXT_PRESSURE_OUTPUT_TOKENS,
-                    )
-                  : limits.maximumOutputTokens,
-                system: [
-                  {
-                    type: "text",
-                    text: input.prompt.system,
-                    cache_control: ANTHROPIC_STABLE_CACHE_CONTROL,
-                  },
-                ],
-                messages,
-                tools: providerTools,
-                cache_control: { type: "ephemeral" },
-                diagnostics: { previous_message_id: comparedMessageId },
-                tool_choice: toolChoice,
-              }),
+              body: JSON.stringify(requestBody),
               signal,
             },
           });
