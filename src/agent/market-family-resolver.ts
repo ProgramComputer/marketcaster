@@ -33,6 +33,10 @@ export type MarketFamilyDiscoveryBasis =
   | "EXCHANGE_GROUP_AND_CATALOG_METADATA"
   | "SEED_ONLY";
 
+/** Enumeration of a native group does not prove a shared settlement event. */
+export type MarketFamilyMembershipCompleteness =
+  "EXCHANGE_GROUP_ENUMERATED" | "PARTIAL" | "UNKNOWN";
+
 export interface ResolvedMarketFamilyMember {
   readonly market: Market;
   readonly bbo?: MarketBbo;
@@ -45,6 +49,7 @@ export interface ResolvedMarketFamily {
   readonly seedMarketSlug: string;
   readonly members: readonly ResolvedMarketFamilyMember[];
   readonly discoveryBasis: MarketFamilyDiscoveryBasis;
+  readonly membershipCompleteness: MarketFamilyMembershipCompleteness;
   /** True when the hard member/page bound prevented complete enumeration. */
   readonly truncated: boolean;
   readonly warnings: readonly string[];
@@ -53,6 +58,7 @@ export interface ResolvedMarketFamily {
 interface DiscoveredFamilySlugs {
   readonly slugs: readonly string[];
   readonly discoveryBasis: MarketFamilyDiscoveryBasis;
+  readonly membershipCompleteness: MarketFamilyMembershipCompleteness;
   readonly truncated: boolean;
   readonly warnings: readonly string[];
 }
@@ -165,6 +171,7 @@ export class MarketFamilyResolver {
     let truncated = false;
     let usedExchangeGroup = false;
     let usedCatalog = false;
+    let exchangeEnumerationComplete = false;
 
     const append = (rawSlug: string): boolean => {
       const slug = rawSlug.trim();
@@ -217,7 +224,10 @@ export class MarketFamilyResolver {
             }
           }
           if (!consumedEveryItem) break;
-          if (page.eof) break;
+          if (page.eof) {
+            exchangeEnumerationComplete = true;
+            break;
+          }
           if (slugs.length >= this.maximumMembers) {
             truncated = true;
             break;
@@ -264,6 +274,11 @@ export class MarketFamilyResolver {
     return {
       slugs: Object.freeze(slugs),
       discoveryBasis: discoveryBasis(usedExchangeGroup, usedCatalog),
+      membershipCompleteness: truncated
+        ? "PARTIAL"
+        : exchangeEnumerationComplete && !usedCatalog
+          ? "EXCHANGE_GROUP_ENUMERATED"
+          : "UNKNOWN",
       truncated,
       warnings: Object.freeze(warnings),
     };
@@ -347,6 +362,10 @@ export class MarketFamilyResolver {
       seedMarketSlug: resolvedSeed.slug,
       members: Object.freeze(members),
       discoveryBasis: discovery.discoveryBasis,
+      membershipCompleteness:
+        members.length < discovery.slugs.length
+          ? "PARTIAL"
+          : discovery.membershipCompleteness,
       truncated: discovery.truncated,
       warnings: Object.freeze(warnings),
     };
