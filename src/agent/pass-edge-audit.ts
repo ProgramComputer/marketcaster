@@ -16,12 +16,15 @@ export interface PassEdgeAuditCheck {
     | "SPREAD_UNAVAILABLE"
     | "SPREAD_TOO_WIDE"
     | "NON_POSITIVE"
+    | "POSITIVE_NOT_MATERIAL"
     | "MATERIAL_POSITIVE";
   readonly authorizationProbability?: string;
   readonly ask?: string;
   readonly spread?: string;
   readonly estimatedFeePerContract?: string;
   readonly netEdgePerContract?: string;
+  /** Material feedback requires edge strictly above this bound, not merely positive. */
+  readonly materialEdgeThreshold?: string;
 }
 
 export interface PassEdgeAuditReport {
@@ -195,19 +198,26 @@ export async function auditNoPositiveEdgePasses(input: {
       );
       const fee = estimateExchangeTakerFeePerContract(input.exchange.id, ask);
       const edge = authorization.minus(ask).minus(fee);
-      const material = edge.gt(
-        Decimal.max(market.priceTick, input.minimumMaterialEdge ?? 0),
+      const materialEdgeThreshold = Decimal.max(
+        market.priceTick,
+        input.minimumMaterialEdge ?? 0,
       );
+      const material = edge.gt(materialEdgeThreshold);
       checks.push({
         marketSlug: disposition.marketSlug,
         dispositionSide: disposition.side,
         evaluatedSide: side,
-        status: material ? "MATERIAL_POSITIVE" : "NON_POSITIVE",
+        status: material
+          ? "MATERIAL_POSITIVE"
+          : edge.gt(0)
+            ? "POSITIVE_NOT_MATERIAL"
+            : "NON_POSITIVE",
         authorizationProbability: authorization.toFixed(),
         ask: ask.toFixed(),
         spread: spread.toFixed(),
         estimatedFeePerContract: fee.toFixed(),
         netEdgePerContract: edge.toFixed(),
+        materialEdgeThreshold: materialEdgeThreshold.toFixed(),
       });
       if (material) {
         candidates.push({ side, authorization, ask, spread, fee, edge });

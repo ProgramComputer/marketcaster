@@ -86,6 +86,16 @@ function optional<T>(key: string, value: T | undefined): Record<string, T> {
 
 export function mapMarket(value: PolymarketMarket): Market {
   const title = requiredDefined("market title", value.title, value.question);
+  const ruleField = (
+    [
+      "settlementRules",
+      "resolutionRules",
+      "rules",
+      "rulesDescription",
+      "rulesDisclaimer",
+      "description",
+    ] as const
+  ).find((field) => value[field] !== undefined);
   const settlementRules = requiredDefined(
     "settlement rules",
     value.settlementRules,
@@ -132,6 +142,16 @@ export function mapMarket(value: PolymarketMarket): Market {
     title,
     description: value.description ?? "",
     settlementRules,
+    settlementRulesProvenance: {
+      sourceFields: ruleField === undefined ? [] : [ruleField],
+      origin:
+        ruleField === "description"
+          ? "DESCRIPTION_FALLBACK"
+          : ruleField === "rulesDisclaimer"
+            ? "DISCLAIMER_FALLBACK"
+            : "RULE_FIELDS",
+      completeness: "UNKNOWN",
+    },
     active: value.active,
     closed: value.closed,
     archived: value.archived,

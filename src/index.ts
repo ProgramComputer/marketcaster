@@ -20,6 +20,7 @@ import { UnresolvedLiveJournalError } from "./reporting/journal-recovery.js";
 import { LiveCycleLockError } from "./reporting/live-cycle-lock.js";
 import { createLogger } from "./reporting/logger.js";
 import { createRunJournal, type RunJournal } from "./reporting/run-journal.js";
+import { provenanceIdentityFromEnvironment } from "./reporting/decision-input-provenance.js";
 import { safeErrorCauses, safeErrorMessage } from "./utilities/redaction.js";
 
 export const EXIT_CODE = {
@@ -105,6 +106,7 @@ export async function main(env = process.env): Promise<number> {
       runId,
       cycleId,
       journal,
+      provenanceIdentity: provenanceIdentityFromEnvironment(environment),
     });
     if (report.status === "AMBIGUOUS") return EXIT_CODE.AMBIGUOUS_ORDER;
     if (report.status === "SAFETY_STOP") return EXIT_CODE.SAFETY_GUARD;

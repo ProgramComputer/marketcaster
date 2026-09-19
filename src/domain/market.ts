@@ -11,6 +11,18 @@ export interface MarketTag {
   readonly label?: string;
 }
 
+export interface SettlementRulesProvenance {
+  /** Exact API fields used to construct settlementRules, in precedence order. */
+  readonly sourceFields: readonly string[];
+  readonly origin:
+    | "RULE_FIELDS"
+    | "DESCRIPTION_FALLBACK"
+    | "DISCLAIMER_FALLBACK"
+    | "AUXILIARY_ONLY";
+  /** Field presence does not establish that the governing contract is complete. */
+  readonly completeness: "UNKNOWN";
+}
+
 export interface Market {
   readonly id: MarketId;
   readonly slug: string;
@@ -22,6 +34,7 @@ export interface Market {
   readonly title: string;
   readonly description: string;
   readonly settlementRules: string;
+  readonly settlementRulesProvenance?: SettlementRulesProvenance;
   readonly resolutionSource?: string;
   readonly category?: string;
   readonly subcategory?: string;

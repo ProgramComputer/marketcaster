@@ -109,6 +109,13 @@ import {
   type EvidenceValidationReport,
 } from "./evidence-provenance.js";
 import { buildDecisionPrompt } from "./prompt-builder.js";
+import {
+  provenanceIdentityFromEnvironment,
+  renderedInputProvenance,
+  runtimeInputProvenance,
+  type ProvenanceIdentity,
+} from "../reporting/decision-input-provenance.js";
+import { decisionRequestRoundArtifactKind } from "../reporting/run-journal.js";
 import { MarketAnalysisResolver } from "./market-analysis.js";
 import { MarketFamilyResolver } from "./market-family-resolver.js";
 import { familyScoutResearchKey } from "./family-scout.js";
@@ -165,6 +172,7 @@ export interface CycleDependencies {
   readonly journal?: RunJournal;
   readonly memory?: AgentMemory;
   readonly agentState?: AgentState;
+  readonly provenanceIdentity?: ProvenanceIdentity;
 }
 
 function valuationContext(
@@ -720,6 +728,9 @@ export async function runCycle(
         })
       : undefined;
   const warnings: string[] = [];
+  const provenanceIdentity =
+    dependencies.provenanceIdentity ??
+    provenanceIdentityFromEnvironment(process.env);
   let journal =
     dependencies.writeReports === false ? undefined : dependencies.journal;
   const transcriptRounds: DecisionTranscriptRound[] = [];
@@ -798,14 +809,19 @@ export async function runCycle(
         accountScope,
         now,
       });
-      const validSha = (value: string | undefined) =>
-        value !== undefined && /^[a-f0-9]{40}$/iu.test(value) ? value : null;
-      await journal.recordArtifact("runtime-provenance", {
-        productionSha: validSha(process.env.MARKETCASTER_DEPLOYMENT_SHA),
-        engineSha: validSha(process.env.MARKETCASTER_ENGINE_SHA),
-        provider: dependencies.decisionProvider.providerId,
-        model: dependencies.decisionProvider.modelId,
-      });
+      await journal.recordArtifact(
+        "runtime-provenance",
+        runtimeInputProvenance({
+          identity: provenanceIdentity,
+          provider: dependencies.decisionProvider.providerId,
+          model: dependencies.decisionProvider.modelId,
+          ...(dependencies.decisionProvider.catalogModelId === undefined
+            ? {}
+            : { catalogModel: dependencies.decisionProvider.catalogModelId }),
+          config: dependencies.config,
+          strategy,
+        }),
+      );
     }
     if (dependencies.mode === "live") {
       await assertNoUnresolvedLiveJournals({
@@ -1685,18 +1701,41 @@ export async function runCycle(
     const blockedReductionMarketSlugs = new Set<string>();
     let retainedReductionDecision: AgentDecision | undefined;
     let reductionPolicyArtifactCount = 0;
+    const decisionPrompt = buildDecisionPrompt(
+      agentContext,
+      dependencies.prompts.decision,
+    );
+    await journal?.recordArtifact(
+      "decision-input",
+      renderedInputProvenance(decisionPrompt, provenanceIdentity.secretValues),
+    );
     const submittedDecision = await withStageTimeout(
       "agent-research",
       dependencies.config.cycle.stageBudgetsSeconds.agentResearch * 1000,
       (signal) =>
         dependencies.decisionProvider.decide({
-          prompt: buildDecisionPrompt(
-            agentContext,
-            dependencies.prompts.decision,
-          ),
+          prompt: decisionPrompt,
           researchTools,
           limits: liveDecisionLimits,
           signal,
+          ...(journal === undefined
+            ? {}
+            : {
+                provenanceSecretValues: provenanceIdentity.secretValues,
+                recordModelRequest: async (request) => {
+                  const activeJournal = journal;
+                  // Share the failure-path flush with response telemetry so a
+                  // deadline cannot finalize the journal ahead of this write.
+                  const pending = transcriptJournalQueue.then(async () => {
+                    await activeJournal?.recordArtifact(
+                      decisionRequestRoundArtifactKind(request.round),
+                      request,
+                    );
+                  });
+                  transcriptJournalQueue = pending;
+                  await pending;
+                },
+              }),
           reviewTerminalDecision: async (candidateDecision, reviewSignal) => {
             const submittedAt = safeTimestamp(now).toISOString();
             const modelDecision = candidateDecision;
