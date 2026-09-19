@@ -55,5 +55,7 @@ jobs:
           npm run check:memory-feedback
           npm run check:risk-edge
           npm run check:evidence-reading
+          npm run check:source-provenance
+          npm run check:input-provenance
           npm run check:schema-correction
           npm run check:resolution-review
