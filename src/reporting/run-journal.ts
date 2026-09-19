@@ -134,6 +134,13 @@ export function decisionTranscriptRoundArtifactKind(round: number): string {
   return `decision-transcript.round-${round.toString().padStart(4, "0")}`;
 }
 
+export function decisionRequestRoundArtifactKind(round: number): string {
+  return decisionTranscriptRoundArtifactKind(round).replace(
+    "decision-transcript.",
+    "decision-request.",
+  );
+}
+
 function toPortableRelativePath(from: string, to: string): string {
   return relative(from, to).replaceAll("\\", "/");
 }
