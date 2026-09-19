@@ -8,6 +8,7 @@ import type {
   MarketMetricWindow,
   OrderBook,
   MarketTag,
+  SettlementRulesProvenance,
 } from "../domain/market.js";
 import type {
   ExchangeId,
@@ -130,6 +131,7 @@ export interface DetailedMarketContext {
   readonly title: string;
   readonly description: string;
   readonly settlementRules: string;
+  readonly settlementRulesProvenance?: SettlementRulesProvenance;
   readonly resolutionSource?: string;
   readonly category: string;
   readonly subcategory?: string;
@@ -517,6 +519,9 @@ function buildDetailedMarket(
     title: market.title,
     description: market.description,
     settlementRules: market.settlementRules,
+    ...(market.settlementRulesProvenance === undefined
+      ? {}
+      : { settlementRulesProvenance: market.settlementRulesProvenance }),
     ...(market.resolutionSource === undefined
       ? {}
       : { resolutionSource: market.resolutionSource }),

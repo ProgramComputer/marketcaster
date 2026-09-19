@@ -1,3 +1,4 @@
+import { decisionRequestProvenance } from "../reporting/decision-input-provenance.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
@@ -354,6 +355,47 @@ export class OpenAIDecisionProvider implements DecisionProvider {
             tools: providerTools,
             instructions: input.prompt.system,
           });
+          const requestBody = {
+            model: requestModelId,
+            prompt_cache_key: promptCacheKey,
+            instructions: input.prompt.system,
+            input: conversationInput,
+            tools: providerTools,
+            tool_choice: schemaCorrectionRound
+              ? { type: "function", name: "submit_trade_plan" }
+              : "required",
+            parallel_tool_calls: false,
+            ...(serverWebSearchEnabled
+              ? {
+                  max_tool_calls: Math.min(
+                    limits.maximumProviderWebSearchesPerResponse,
+                    remainingWebSearches,
+                  ),
+                }
+              : {}),
+            max_output_tokens: limits.maximumOutputTokens,
+            store: false,
+            context_management: [
+              {
+                type: "compaction",
+                compact_threshold: this.#compactThresholdTokens,
+              },
+            ],
+          };
+          await input.recordModelRequest?.(
+            decisionRequestProvenance({
+              round: transcriptRound,
+              provider: this.providerId,
+              model: requestModelId,
+              endpoint: this.#responsesEndpoint,
+              body: requestBody,
+              limits,
+              secretValues: [
+                ...(input.provenanceSecretValues ?? []),
+                this.#apiKey,
+              ],
+            }),
+          );
           const providerRequest = await fetchProviderResponse({
             providerName: "OpenAI",
             fetchImplementation: this.#fetch,
@@ -364,33 +406,7 @@ export class OpenAIDecisionProvider implements DecisionProvider {
                 authorization: `Bearer ${this.#apiKey}`,
                 "content-type": "application/json",
               },
-              body: JSON.stringify({
-                model: requestModelId,
-                prompt_cache_key: promptCacheKey,
-                instructions: input.prompt.system,
-                input: conversationInput,
-                tools: providerTools,
-                tool_choice: schemaCorrectionRound
-                  ? { type: "function", name: "submit_trade_plan" }
-                  : "required",
-                parallel_tool_calls: false,
-                ...(serverWebSearchEnabled
-                  ? {
-                      max_tool_calls: Math.min(
-                        limits.maximumProviderWebSearchesPerResponse,
-                        remainingWebSearches,
-                      ),
-                    }
-                  : {}),
-                max_output_tokens: limits.maximumOutputTokens,
-                store: false,
-                context_management: [
-                  {
-                    type: "compaction",
-                    compact_threshold: this.#compactThresholdTokens,
-                  },
-                ],
-              }),
+              body: JSON.stringify(requestBody),
               signal,
             },
           });

@@ -54,6 +54,7 @@ import type {
   ResearchToolPrompts,
 } from "../config/prompts.js";
 import {
+  deriveNativeMarketFamily,
   isInNativeMarketFamily,
   nativeMarketFamilyKey,
   type MarketFamilySeed,
@@ -502,6 +503,19 @@ const DetailedMarketContextSchema = z
     title: z.string(),
     description: z.string(),
     settlementRules: z.string(),
+    settlementRulesProvenance: z
+      .object({
+        sourceFields: z.array(z.string().min(1)),
+        origin: z.enum([
+          "RULE_FIELDS",
+          "DESCRIPTION_FALLBACK",
+          "DISCLAIMER_FALLBACK",
+          "AUXILIARY_ONLY",
+        ]),
+        completeness: z.literal("UNKNOWN"),
+      })
+      .strict()
+      .optional(),
     resolutionSource: z.string().optional(),
     category: z.string(),
     subcategory: z.string().optional(),
@@ -576,6 +590,9 @@ const MarketFamilyDetailsResultSchema = z
       "EXCHANGE_GROUP_AND_CATALOG_METADATA",
       "SEED_ONLY",
     ]),
+    membershipCompleteness: z
+      .enum(["EXCHANGE_GROUP_ENUMERATED", "PARTIAL", "UNKNOWN"])
+      .optional(),
     truncated: z.boolean(),
     warnings: z.array(z.string()),
   })
@@ -622,6 +639,8 @@ export interface MarketFamilyDetailsResult {
     | "CATALOG_METADATA"
     | "EXCHANGE_GROUP_AND_CATALOG_METADATA"
     | "SEED_ONLY";
+  readonly membershipCompleteness?:
+    "EXCHANGE_GROUP_ENUMERATED" | "PARTIAL" | "UNKNOWN";
   readonly truncated: boolean;
   readonly warnings: readonly string[];
 }
@@ -692,7 +711,9 @@ export interface PassResearchReadiness {
   readonly inspectedMarkets: number;
   readonly availableDistinctEventFamilies: number;
   readonly requiredDistinctEventFamilies: number;
+  /** Legacy gate counter; includes series, market fallbacks and advisory aliases. */
   readonly inspectedDistinctEventFamilies: number;
+  readonly groupingDiagnostics: ResearchGroupingDiagnostics;
   readonly qualifiedCandidates: number;
   readonly webSearches: number;
   readonly qualifiedMarketAnalyses: number;
@@ -702,6 +723,44 @@ export interface PassResearchReadiness {
   readonly requiredPriorityEvidenceMarketSlugs: readonly string[];
   readonly priorityEvidenceAttemptedMarketSlugs: readonly string[];
   readonly priorityEvidenceAttemptCounts: Readonly<Record<string, number>>;
+}
+
+export interface ResearchGroupingDiagnostics {
+  readonly legacyGateCountBasis: "RESEARCH_GROUP_KEYS_NOT_INDEPENDENT_EVENTS";
+  readonly nativeEventGroups: number;
+  readonly nativeSeriesGroups: number;
+  readonly marketFallbackGroups: number;
+  /** May overlap native kinds; aliases are not evidence of independence. */
+  readonly advisoryAliasGroups: number;
+  readonly inspectedMarkets: readonly {
+    readonly marketSlug: string;
+    readonly researchGroupKey: string;
+    readonly nativeFamily: NativeMarketFamily;
+    readonly usesAdvisoryAlias: boolean;
+  }[];
+}
+
+function researchGroupingDiagnostics(
+  inspectedMarkets: ResearchGroupingDiagnostics["inspectedMarkets"],
+): ResearchGroupingDiagnostics {
+  const countKind = (kind: NativeMarketFamily["kind"]): number =>
+    new Set(
+      inspectedMarkets
+        .filter((item) => item.nativeFamily.kind === kind)
+        .map((item) => item.nativeFamily.key),
+    ).size;
+  return {
+    legacyGateCountBasis: "RESEARCH_GROUP_KEYS_NOT_INDEPENDENT_EVENTS",
+    nativeEventGroups: countKind("EVENT"),
+    nativeSeriesGroups: countKind("SERIES"),
+    marketFallbackGroups: countKind("MARKET"),
+    advisoryAliasGroups: new Set(
+      inspectedMarkets
+        .filter((item) => item.usesAdvisoryAlias)
+        .map((item) => item.researchGroupKey),
+    ).size,
+    inspectedMarkets,
+  };
 }
 
 export interface DecisionResearchToolsOptions {
@@ -1519,6 +1578,43 @@ interface EvidenceSourceTextSelection {
   readonly selectionMode:
     "PREFIX" | "EXACT_PHRASE" | "QUERY_TERMS" | "NO_MATCH_PREFIX";
   readonly matchedTerms: readonly string[];
+  /** Offsets in the sanitized source text; omitted passages remain unknown. */
+  readonly textRanges: readonly {
+    readonly start: number;
+    readonly end: number;
+  }[];
+  readonly sourceTextSha256: string;
+  readonly textCoverage: "FULL_EXTRACTED_TEXT" | "PARTIAL_EXTRACTED_TEXT";
+}
+
+function selectionContext(
+  source: string,
+  ranges: readonly { readonly start: number; readonly end: number }[],
+  maximumCharacters = MAXIMUM_EVIDENCE_SOURCE_OUTPUT_CHARACTERS,
+): Pick<
+  EvidenceSourceTextSelection,
+  "textRanges" | "sourceTextSha256" | "textCoverage"
+> {
+  let remaining = maximumCharacters;
+  const textRanges: { start: number; end: number }[] = [];
+  for (const range of ranges) {
+    if (textRanges.length > 0) remaining -= "\n...\n".length;
+    if (remaining <= 0) break;
+    const end = Math.min(range.end, range.start + remaining);
+    if (end > range.start) textRanges.push({ start: range.start, end });
+    remaining -= end - range.start;
+  }
+  return {
+    textRanges,
+    sourceTextSha256: createHash("sha256").update(source).digest("hex"),
+    textCoverage:
+      source.length === 0 ||
+      (textRanges.length === 1 &&
+        textRanges[0]?.start === 0 &&
+        textRanges[0].end === source.length)
+        ? "FULL_EXTRACTED_TEXT"
+        : "PARTIAL_EXTRACTED_TEXT",
+  };
 }
 
 function claimExcerptCandidates(
@@ -1693,6 +1789,7 @@ export function selectEvidenceSourceText(
   const source = sanitizeExternalText(rawText).trim();
   if (find === null || find === undefined) {
     return {
+      ...selectionContext(source, [{ start: 0, end: source.length }]),
       text: source.slice(0, MAXIMUM_EVIDENCE_SOURCE_OUTPUT_CHARACTERS),
       claimExcerptCandidates: claimExcerptCandidates(source, [
         {
@@ -1750,6 +1847,7 @@ export function selectEvidenceSourceText(
       );
       const selected = fragments.join("\n...\n");
       return {
+        ...selectionContext(source, termSelection.ranges),
         text: selected.slice(0, MAXIMUM_EVIDENCE_SOURCE_OUTPUT_CHARACTERS),
         claimExcerptCandidates: claimExcerptCandidates(
           source,
@@ -1768,6 +1866,7 @@ export function selectEvidenceSourceText(
     const prefix = source.slice(0, EVIDENCE_SOURCE_NO_MATCH_PREVIEW_CHARACTERS);
     const candidateStride = MAXIMUM_CLAIM_EXCERPT_CANDIDATE_CHARACTERS / 3;
     return {
+      ...selectionContext(source, [{ start: 0, end: prefix.length }]),
       text: prefix,
       claimExcerptCandidates: claimExcerptCandidates(
         prefix,
@@ -1797,6 +1896,7 @@ export function selectEvidenceSourceText(
   const fragments = ranges.map(({ start, end }) => source.slice(start, end));
   const selected = fragments.join("\n...\n");
   return {
+    ...selectionContext(source, ranges),
     text: selected.slice(0, MAXIMUM_EVIDENCE_SOURCE_OUTPUT_CHARACTERS),
     claimExcerptCandidates: claimExcerptCandidates(source, exactMatchAnchors),
     sourceCharacters: source.length,
@@ -2177,6 +2277,7 @@ export class DecisionResearchTools {
           )
         : 0,
       inspectedDistinctEventFamilies: 0,
+      groupingDiagnostics: researchGroupingDiagnostics([]),
       qualifiedCandidates: 0,
       webSearches: 0,
       qualifiedMarketAnalyses: 0,
@@ -2670,6 +2771,25 @@ export class DecisionResearchSession {
         this.candidateFamilyBySlug.values(),
       ).size,
       inspectedDistinctEventFamilies: this.inspectedFamilies.size,
+      groupingDiagnostics: researchGroupingDiagnostics(
+        [...this.inspectedSlugs].flatMap((marketSlug) => {
+          const details = this.detailsBySlug.get(marketSlug);
+          if (details === undefined) return [];
+          const nativeFamily = deriveNativeMarketFamily(
+            detailedMarketFamilySeed(details),
+          );
+          const researchGroupKey =
+            this.candidateFamilyBySlug.get(marketSlug) ?? nativeFamily.key;
+          return [
+            {
+              marketSlug,
+              researchGroupKey,
+              nativeFamily,
+              usesAdvisoryAlias: researchGroupKey !== nativeFamily.key,
+            },
+          ];
+        }),
+      ),
       qualifiedCandidates: this.qualifiedSlugs.size,
       webSearches: this.successfulWebSearchCount,
       qualifiedMarketAnalyses: this.qualifiedAnalysisSlugs.size,
@@ -3402,12 +3522,18 @@ export class DecisionResearchSession {
               ...rawSelection,
               text: "No matching live-score record was present in this feed snapshot.",
               claimExcerptCandidates: [],
+              textRanges: [],
+              textCoverage: "PARTIAL_EXTRACTED_TEXT" as const,
               returnedFragments: 0,
               truncated: false,
             }
           : rawSelection;
       this.evidenceSources.register({
         ...observed,
+        ...(page.retrieval === undefined ? {} : { retrieval: page.retrieval }),
+        ...(page.sourceTimestamps === undefined
+          ? {}
+          : { sourceTimestamps: page.sourceTimestamps }),
         excerpt: selection.claimExcerptCandidates.join(
           "\n[CONTIGUOUS EXCERPT BOUNDARY]\n",
         ),
@@ -3426,6 +3552,9 @@ export class DecisionResearchSession {
           reusedSnapshot,
           title: sanitizeExternalText(observed.title),
           observedAt: observed.observedAt,
+          discoveredAt: observed.discoveredAt ?? observed.observedAt,
+          retrieval: page.retrieval ?? null,
+          sourceTimestamps: page.sourceTimestamps ?? [],
           ...(attributedMarketSlug === undefined
             ? {}
             : { attributedMarketSlug }),

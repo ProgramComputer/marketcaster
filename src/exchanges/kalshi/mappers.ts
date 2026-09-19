@@ -162,6 +162,21 @@ export function mapMarket(value: KalshiMarket): Market {
     title: marketTitle(value),
     description,
     settlementRules: settlementRules(value),
+    settlementRulesProvenance: {
+      sourceFields: (
+        ["rules_primary", "rules_secondary", "early_close_condition"] as const
+      ).filter((field) =>
+        field === "early_close_condition"
+          ? value[field] !== undefined
+          : (value[field]?.trim().length ?? 0) > 0,
+      ),
+      origin: [value.rules_primary, value.rules_secondary].some(
+        (part) => (part?.trim().length ?? 0) > 0,
+      )
+        ? "RULE_FIELDS"
+        : "AUXILIARY_ONLY",
+      completeness: "UNKNOWN",
+    },
     active: status.active,
     closed: status.closed,
     archived: status.archived,
