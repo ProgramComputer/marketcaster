@@ -205,6 +205,13 @@ export function runtimeInputProvenance(input: {
         },
         strategy: {
           apiVersion: input.strategy.apiVersion,
+          evidenceContentAdapter:
+            input.strategy.evidenceContentAdapter === undefined
+              ? undefined
+              : selectedPolicyFields(input.strategy.evidenceContentAdapter, [
+                  "apiVersion",
+                  "extractText",
+                ]),
           selection: selectedPolicyFields(input.strategy.selection, [
             "depthPriceBand",
             "buildFamilyScout",

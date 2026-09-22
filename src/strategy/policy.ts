@@ -1,3 +1,7 @@
+import {
+  assertEvidenceContentAdapter,
+  type EvidenceContentAdapter,
+} from "../agent/evidence-provenance.js";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Decimal } from "decimal.js";
@@ -26,6 +30,7 @@ export interface StrategyPolicy {
   readonly apiVersion: 1;
   readonly selection: SelectionPolicy;
   readonly forecast?: ForecastPolicy;
+  readonly evidenceContentAdapter?: EvidenceContentAdapter;
   readonly selectMemoryContext?: AgentBeliefContextSelector;
   readonly resolutionReview?: ResolutionReviewPolicy;
   readonly allocation: BatchAllocationPolicy;
@@ -96,6 +101,8 @@ export function assertStrategyPolicy(
       policy.forecast.forecastTolerance.gt(1))
   )
     throw new TypeError("Strategy forecast contract is invalid");
+  if (policy.evidenceContentAdapter !== undefined)
+    assertEvidenceContentAdapter(policy.evidenceContentAdapter);
   for (const name of [
     "buildFamilyScout",
     "shouldFetchFamilyBook",

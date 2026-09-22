@@ -213,5 +213,9 @@ export async function appendJobSummary(
   summaryPath = process.env.GITHUB_STEP_SUMMARY,
 ): Promise<void> {
   if (summaryPath === undefined || summaryPath.length === 0) return;
-  await appendFile(summaryPath, renderJobSummary(report), "utf8");
+  const content =
+    process.env.MARKETCASTER_SUMMARY_DETAIL === "full"
+      ? renderJobSummary(report)
+      : "# Application run\n\nRun completed. Detailed output is available in the configured report destination.\n";
+  await appendFile(summaryPath, content, "utf8");
 }

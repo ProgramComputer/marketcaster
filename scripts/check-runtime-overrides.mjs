@@ -32,13 +32,14 @@ try {
     resolve("config", "default.json"),
     "utf8",
   );
-  const alternateConfig = defaultConfig
-    .replace('"maximumPromptMarkets": 20', '"maximumPromptMarkets": 23')
-    .replace(
-      '"enabled": false,\n      "maximumLifetimeMinutes": 15',
-      '"enabled": true,\n      "maximumLifetimeMinutes": 10',
-    )
-    .replace('"directory": "reports"', '"directory": "from-explicit-config"');
+  const alternateValue = JSON.parse(defaultConfig);
+  alternateValue.marketSelection.maximumPromptMarkets = 23;
+  alternateValue.exchange.managedRestingBuyOrders = {
+    enabled: true,
+    maximumLifetimeMinutes: 10,
+  };
+  alternateValue.reporting.directory = "from-explicit-config";
+  const alternateConfig = JSON.stringify(alternateValue);
   assert.notEqual(alternateConfig, defaultConfig);
   await writeFile(alternateConfigPath, alternateConfig, "utf8");
 

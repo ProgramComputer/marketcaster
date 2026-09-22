@@ -483,6 +483,36 @@ export interface EvidencePageRetrieval {
   readonly extractionMethod: "HTML_TEXT" | "PLAIN_TEXT" | "STRUCTURED_FEED";
 }
 
+/** A synchronous, network-free extractor for one already acquired response.
+ * Implementations may format observed fields, never add estimates or fetch data.
+ * URL identity, timestamps, bounds, and hashes remain owned by the reader.
+ */
+export interface EvidenceContentAdapter {
+  readonly apiVersion: 1;
+  extractText(
+    input: Readonly<{
+      source: string;
+      requestedUrl: string;
+      finalUrl: string;
+      contentType: string;
+    }>,
+  ): string | undefined;
+}
+
+export function assertEvidenceContentAdapter(
+  value: unknown,
+): asserts value is EvidenceContentAdapter {
+  if (
+    !isRecord(value) ||
+    value.apiVersion !== 1 ||
+    typeof value.extractText !== "function"
+  ) {
+    throw new TypeError(
+      "Evidence content adapter must implement the version 1 contract",
+    );
+  }
+}
+
 export interface FetchedEvidencePage {
   readonly text: string;
   readonly publishedAt?: string;
@@ -717,11 +747,14 @@ async function readBoundedBody(
 export async function fetchEvidencePage(
   urlValue: string,
   options: {
+    readonly contentAdapter?: EvidenceContentAdapter;
     readonly fetchImplementation?: typeof fetch;
     readonly lookupImplementation?: typeof lookup;
     readonly signal?: AbortSignal;
   } = {},
 ): Promise<FetchedEvidencePage> {
+  if (options.contentAdapter !== undefined)
+    assertEvidenceContentAdapter(options.contentAdapter);
   const fetchId = randomUUID();
   const fetchStartedAt = new Date().toISOString();
   const lookupImplementation = options.lookupImplementation ?? lookup;
@@ -814,10 +847,26 @@ export async function fetchEvidencePage(
         (entry) =>
           entry.role === "PUBLICATION" && entry.timestamp !== undefined,
       )?.timestamp;
+      const structuredFeed = options.contentAdapter?.extractText(
+        Object.freeze({
+          source,
+          requestedUrl: urlValue,
+          finalUrl: current.toString(),
+          contentType,
+        }),
+      );
+      if (structuredFeed !== undefined && typeof structuredFeed !== "string") {
+        throw new TypeError(
+          "Evidence content adapter must return text synchronously",
+        );
+      }
+      fetchSignal.throwIfAborted();
       // Source selection belongs to the caller; never enrich from a second URL.
-      const text = contentType.startsWith("text/html")
-        ? pageText(source)
-        : source.replace(/\r\n?/gu, "\n").trim();
+      const text =
+        structuredFeed ??
+        (contentType.startsWith("text/html")
+          ? pageText(source)
+          : source.replace(/\r\n?/gu, "\n").trim());
       const responseLastModified = response.headers.get("last-modified");
       return {
         text,
@@ -834,9 +883,12 @@ export async function fetchEvidencePage(
           ...(responseLastModified === null ? {} : { responseLastModified }),
           decodedBodySha256: createHash("sha256").update(source).digest("hex"),
           extractedTextSha256: createHash("sha256").update(text).digest("hex"),
-          extractionMethod: contentType.startsWith("text/html")
-            ? "HTML_TEXT"
-            : "PLAIN_TEXT",
+          extractionMethod:
+            structuredFeed !== undefined
+              ? "STRUCTURED_FEED"
+              : contentType.startsWith("text/html")
+                ? "HTML_TEXT"
+                : "PLAIN_TEXT",
         },
       };
     }
@@ -1119,6 +1171,7 @@ function currentEvidenceRequired(item: {
 /** Validates source observation, authoritative dates, freshness, and event year. */
 export async function validateDecisionEvidence(input: {
   readonly decision: AgentDecision;
+  readonly contentAdapter?: EvidenceContentAdapter;
   readonly observedSources: readonly ObservedEvidenceSource[];
   /** Already-read pages from this cycle; no second fetch or newer snapshot. */
   readonly evidencePageSnapshots?: ReadonlyMap<
@@ -1220,6 +1273,9 @@ export async function validateDecisionEvidence(input: {
               );
             }
             pending = fetchEvidencePage(key, {
+              ...(input.contentAdapter === undefined
+                ? {}
+                : { contentAdapter: input.contentAdapter }),
               ...(input.fetchImplementation === undefined
                 ? {}
                 : { fetchImplementation: input.fetchImplementation }),
