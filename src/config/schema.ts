@@ -22,6 +22,9 @@ const FamilyScoutConfigSchema = z
     minimumFamilyMembers: PositiveIntegerSchema.max(30),
     enrichmentRequestBudget: z.number().int().nonnegative().max(24).optional(),
     maximumMarketsPerCategory: PositiveIntegerSchema.max(100).optional(),
+    maximumMarketsByCategory: z
+      .record(z.string().min(1), z.number().int().nonnegative().max(100))
+      .optional(),
   })
   .strict();
 

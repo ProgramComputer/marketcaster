@@ -49,6 +49,9 @@ const FrozenFamilyScoutPolicySchema = z.object({
   minimumFamilyMembers: z.number().int().positive(),
   enrichmentRequestBudget: z.number().int().nonnegative().optional(),
   maximumMarketsPerCategory: z.number().int().positive().optional(),
+  maximumMarketsByCategory: z
+    .record(z.string().min(1), z.number().int().nonnegative())
+    .optional(),
   scoringWeights: z.object({
     liquidityOrDepth: DecimalStringSchema,
     volume24h: DecimalStringSchema,
@@ -204,6 +207,12 @@ function freezePolicy(
               : {
                   maximumMarketsPerCategory:
                     policy.familyScouts.maximumMarketsPerCategory,
+                }),
+            ...(policy.familyScouts.maximumMarketsByCategory === undefined
+              ? {}
+              : {
+                  maximumMarketsByCategory:
+                    policy.familyScouts.maximumMarketsByCategory,
                 }),
             scoringWeights: {
               liquidityOrDepth:

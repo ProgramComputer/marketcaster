@@ -1130,7 +1130,7 @@ export async function runCycle(
       "market-selection-snapshot",
       discovery.marketSelectionSnapshot,
     );
-    // A private policy may require bounded inspection of selected candidates.
+    // A configured policy may require bounded inspection of selected candidates.
     const requiredPassedPriorityMarketSlugs = new Set(
       strategy.selection
         .selectRequiredMarketSlugs(opportunityBoard)
@@ -1371,6 +1371,9 @@ export async function runCycle(
       return result;
     };
     const researchTools = new DecisionResearchTools({
+      ...(strategy.evidenceContentAdapter === undefined
+        ? {}
+        : { evidenceContentAdapter: strategy.evidenceContentAdapter }),
       ...(strategy.selection.shouldEnforceRequiredResearch === undefined
         ? {}
         : {
@@ -1577,6 +1580,9 @@ export async function runCycle(
       const [evidence, baseCoverage, freshTargetLive, passAudit] =
         await Promise.all([
           validateDecisionEvidence({
+            ...(strategy.evidenceContentAdapter === undefined
+              ? {}
+              : { contentAdapter: strategy.evidenceContentAdapter }),
             decision: candidateDecision,
             observedSources: researchTools.observedEvidenceSources,
             evidencePageSnapshots: researchTools.evidencePageSnapshots,

@@ -7,8 +7,8 @@ exposures, reconciles those targets against current positions, and applies
 deterministic validation before any order can reach an exchange.
 
 MarketCaster runs in observe mode by default. Its reference mode presents the
-exchange catalog and allocates no BUY capital. Optional modules customize
-selection, forecasting, and allocation through a versioned interface.
+exchange catalog and allocates no BUY capital. Optional modules provide
+selection, forecast, and allocation policies through a versioned interface.
 
 > [!WARNING]
 > MarketCaster is experimental software, not financial, investment, legal, or
@@ -17,19 +17,18 @@ selection, forecasting, and allocation through a versioned interface.
 > responsible for exchange rules and applicable law. Use this software at your
 > own risk.
 
-## Components and extensions
+## Reference behavior and extensions
 
 MarketCaster includes exchange adapters, account reconstruction, market
 discovery, research tools, provider integrations, portfolio reconciliation,
-risk and evidence validation, execution guards, reporting, state/memory, and
-the CLI.
+risk and evidence validation, execution guards, reporting, persistent state,
+and a command-line interface.
 
-The repository includes reference configuration, prompt contracts, and synthetic
-checks. A trusted policy module receives a versioned API; it cannot replace
-risk assessment or submit orders through that API.
-
-A policy module is optional for catalog-only reference runs. A configured custom
-selection variant without a policy module fails before exchange initialization.
+The reference configuration and prompt support catalog inspection and request
+no BUY allocations. Optional trusted policy modules can customize selection,
+forecasting, and allocation through a [versioned contract](docs/strategy-policy.md).
+They cannot replace deterministic validation or submit orders through that API.
+An explicitly configured missing or invalid module stops initialization.
 
 ## Supported exchanges
 
@@ -80,16 +79,16 @@ event, series, keyword, volume, movement, spread, depth, open-interest, price,
 expiry, and data-age filters can explore the wider universe. Exact market and
 market-family tools fetch settlement rules and current quotes on demand.
 
-The reference board uses exchange order. Optional grouping and bounded
-enrichment mechanisms accept callbacks. Configuration controls safety and
-resource limits.
+The public reference board uses exchange order. Optional grouping and bounded
+enrichment mechanisms accept optional callbacks. Reference configuration
+values are illustrative safety and resource limits.
 
 Discovery output is untrusted catalog evidence. It never establishes settlement
 identity, source validity, correlation, executable liquidity, or permission to
 trade. Those facts are checked later against exact market details and refreshed
 exchange state.
 
-Set `cycle.stageBudgetsSeconds.marketDiscovery` to `null` in a deployment's
+Set `cycle.stageBudgetsSeconds.marketDiscovery` to `null` in the
 complete configuration to use the overall cycle deadline without a separate
 discovery timer. A positive integer retains a discovery limit in seconds.
 The overall `cycle.timeoutSeconds` and other stage budgets still apply.
@@ -126,9 +125,9 @@ cycle spend, spread, fees, source requirements, and book depth can shrink or
 reject it. A later cycle recomputes only the remaining gap from newly
 reconstructed exchange state.
 
-Live orders use marketable limits. SELLs and deployments without managed
+Live orders use marketable limits. SELLs and configurations without managed
 resting BUYs use immediate-or-cancel, so any unfilled remainder is canceled.
-Polymarket US also supports deployment-configured, bounded good-till-date BUY
+Polymarket US also supports configurable, bounded good-till-date BUY
 execution. When enabled, marketable quantity may fill immediately and any
 remainder may rest until the runtime-set expiration. Configuration limits that
 lifetime to at most 15 minutes.
@@ -173,7 +172,7 @@ are invalid.
 
 ## Safety and correctness
 
-Safety mechanisms remain part of the public engine:
+Safety mechanisms remain part of the application:
 
 - Observe mode submits no orders.
 - Prices, quantities, fees, PnL, and exposure use decimal arithmetic.
@@ -216,7 +215,7 @@ npm run build
 node --env-file=.env dist/src/index.js
 ```
 
-The public checkout is sufficient for all three commands.
+All three commands run from this checkout.
 
 ## Observe and live modes
 
@@ -233,7 +232,7 @@ selected exchange key if an active process must lose access immediately.
 
 ## Configuration
 
-The full public schema and reference defaults live in
+The full schema and reference defaults live in
 [`config/default.json`](config/default.json). Runtime settings are supplied by
 environment variables:
 
@@ -262,29 +261,32 @@ paths are also supported. An override is used only when explicitly supplied:
 
 ```text
 override supplied -> read and validate that exact file/path
-override absent   -> use the checked-in public default
+override absent   -> use the checked-in default
 ```
 
 An explicit missing file, malformed JSON document, or schema-invalid
-configuration fails the cycle. MarketCaster never silently falls back from a
-requested file. `MARKETCASTER_CONFIG_PATH` replaces the complete config
+configuration fails the cycle. MarketCaster never silently falls back from an
+explicitly requested file. `MARKETCASTER_CONFIG_PATH` replaces the complete config
 rather than merging fragments, which keeps validation deterministic.
 
 `MARKETCASTER_REPORT_DIR` changes the root without changing report or state
 schemas. Notes, beliefs, advisories, histories, journals, locks, and the shadow
 ledger keep their existing relative layout beneath that root.
 
-## Strategy configuration
+## Policy and prompt configuration
 
-The public reference prompt is
+The reference system prompt is
 [`config/prompt/decision/reference/system.md`](config/prompt/decision/reference/system.md).
-The adjacent user template, research-tool descriptions, and tool messages are
-part of the engine contract and remain public.
+The adjacent user template, research-tool descriptions, and tool messages define
+the application contract. `MARKETCASTER_DECISION_PROMPT_PATH` selects an optional
+system-prompt file. It does not replace the agent loop, deterministic validation,
+or execution checks.
 
-Set the documented path variables to select a configuration file, trusted
-policy module, decision system prompt, or report directory. Relative paths
-resolve from the working directory. The same validation and execution checks
-apply to all configurations.
+Set `MARKETCASTER_STRATEGY_PATH` to a trusted ESM policy factory when using custom
+selection, forecast, or allocation behavior. See the
+[policy extension contract](docs/strategy-policy.md) for supported hooks and
+failure behavior. Configuration overrides replace complete JSON documents;
+they do not merge fragments.
 
 ## Reports and persistent state
 
@@ -300,18 +302,21 @@ account-scoped locations. Missing, corrupt, incompatible, or cross-account
 advisory state is ignored or quarantined according to the existing fail-closed
 rules; it never changes exchange balances or positions.
 
-`reports/` is ignored by Git. Keep the entire report root in access-restricted
-storage. Reports may contain positions, trades, theses, probabilities, beliefs,
-and execution history.
+`reports/` is ignored by Git, but ignoring a path does not make it confidential.
+Reports can contain account balances, positions, trades, evidence, model output,
+and execution history. Restrict filesystem access and never upload report roots
+as public build artifacts. Preserve the complete report root when changing its
+location, including order-intent journals and lock files. Advisory caches do not
+replace durable recovery records.
 
-Preserve the complete report root when changing `MARKETCASTER_REPORT_DIR`.
-Complete prior journals are required for recovery from an ambiguous order
-submission.
+GitHub job summaries contain only a generic completion message by default.
+Detailed reports remain in the configured report root. Setting
+`MARKETCASTER_SUMMARY_DETAIL=full` includes account information in job summaries;
+review access controls before enabling it in an automated environment.
 
 ## Development and contributions
 
-There is currently no general automated test suite. Use the checks that exist in
-`package.json`:
+Regression scripts are defined in `package.json`:
 
 ```sh
 npm ci
@@ -322,13 +327,14 @@ npm run build
 npm run check:overrides
 ```
 
-`check:overrides` is a small migration regression check. It verifies default
+`check:overrides` is a configuration regression check. It verifies default
 loading, explicit config and prompt selection, report-root precedence, fallback
 restoration after removing overrides, malformed configuration failure, and
 explicit missing-file failure.
 
-For runtime changes, perform an observe-mode cycle with public defaults and then
-with temporary override files. Do not use live execution as a smoke test.
+For runtime changes, use offline fixtures and mocked exchange/provider responses
+with reference defaults and temporary override files. Do not use a live cycle
+as a smoke test.
 
 Contributions should keep exchange behavior, reconciliation, deterministic
 validation, report formats, state isolation, and failure semantics explicit and

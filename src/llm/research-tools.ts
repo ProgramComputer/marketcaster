@@ -13,6 +13,7 @@ import {
   evidencePageReadFailureReason,
   EvidenceSourceRegistry,
   fetchEvidencePage,
+  type EvidenceContentAdapter,
   type FetchedEvidencePage,
   type ObservedEvidenceSource,
 } from "../agent/evidence-provenance.js";
@@ -783,6 +784,7 @@ export interface DecisionResearchToolsOptions {
   readonly prompts: PromptBundle["research"];
   readonly webSearch?: WebSearchHandler;
   readonly evidencePageReader?: EvidencePageReader;
+  readonly evidenceContentAdapter?: EvidenceContentAdapter;
   readonly forecastPolicy?: ForecastPolicy;
   readonly maximumResultsPerSearch?: number;
 }
@@ -2166,7 +2168,13 @@ export class DecisionResearchTools {
     this.requiredResearchGate = options.requiredResearchGate;
     this.evidencePageReader =
       options.evidencePageReader ??
-      ((url, signal) => fetchEvidencePage(url, { signal }));
+      ((url, signal) =>
+        fetchEvidencePage(url, {
+          signal,
+          ...(options.evidenceContentAdapter === undefined
+            ? {}
+            : { contentAdapter: options.evidenceContentAdapter }),
+        }));
     this.maximumResultsPerSearch = maximumResultsPerSearch;
   }
 
