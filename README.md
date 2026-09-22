@@ -133,6 +133,20 @@ execution. When enabled, marketable quantity may fill immediately and any
 remainder may rest until the runtime-set expiration. Configuration limits that
 lifetime to at most 15 minutes.
 
+A verified current-cycle GTD BUY does not stop later independent BUYs. Before
+continuing, execution reconciles every tracked order by ID and verifies that
+its fills explain the account's positions and cash. Full submission cost
+remains reserved through the batch, including unfilled quantity. Available
+capital is bounded by both fresh exchange buying power and the batch's cash
+budget; exchange collateral is not deducted twice. This continuation applies
+only to current-cycle buys in distinct markets. Existing or unknown open
+orders, unexplained state changes, and ambiguous outcomes still stop execution.
+No working remainder is automatically cancelled or resubmitted.
+
+Reports distinguish processing every accepted proposal with working remainders
+from an early stop. `executionCompletion` identifies unattempted proposals and
+the stop reason; `ORDER_WORKING` alone does not mean the batch stopped early.
+
 `risk.allowPositionReductions` defaults to `true`. Set it to `false` in the
 existing JSON configuration to reject canonical SELL YES and SELL NO actions,
 including trims, zero-target exits, and emergency exits, with
