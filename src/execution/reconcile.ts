@@ -65,7 +65,7 @@ function recentMatchingTrade(
   );
 }
 
-function matchesSubmittedOrder(
+export function matchesSubmittedOrder(
   reported: ExchangeOrder,
   submitted: ImmediateOrder,
 ): boolean {
