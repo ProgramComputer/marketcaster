@@ -4,6 +4,7 @@ import type { ShadowLedgerCycleReport } from "./shadow-ledger.js";
 import type { AgentBelief, AgentPlan } from "../agent/agent-state.js";
 import type { DecisionSubmissionHistory } from "../agent/decision-submission-audit.js";
 import type { Position } from "../domain/position.js";
+import type { ExecutionCompletion } from "../execution/executor.js";
 import type {
   ExecutionCooldown,
   ExecutionFailure,
@@ -306,6 +307,7 @@ export interface CycleReport {
     | "AMBIGUOUS"
     | "SAFETY_STOP";
   readonly completionReason: string;
+  readonly executionCompletion?: ExecutionCompletion;
   readonly startedAt: string;
   readonly completedAt: string;
   readonly durationMilliseconds: number;
