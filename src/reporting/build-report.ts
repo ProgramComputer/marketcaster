@@ -730,6 +730,7 @@ function cycleOutcome(
   if (input.statusOverride === "SAFETY_STOP") return "SAFETY_STOP";
   if (
     input.statusOverride === "AMBIGUOUS" ||
+    input.execution.stoppedForAmbiguity ||
     executions.some((execution) => execution.status === "AMBIGUOUS")
   ) {
     return "AMBIGUOUS";
@@ -771,6 +772,9 @@ function completionReason(
       execution.status === "FILLED" || execution.status === "PARTIAL",
   ).length;
   const targetMode = input.targetReconciliation !== undefined;
+  if (input.execution.completion?.stopReason !== undefined) {
+    return `Execution stopped: ${input.execution.completion.stopReason}. ${input.execution.completion.unattempted.length} accepted proposals were not reached.`;
+  }
   switch (outcome) {
     case "NO_PROPOSAL":
       return targetMode
@@ -785,7 +789,7 @@ function completionReason(
     case "NO_FILL":
       return `${executions.length} current-cycle execution attempts completed without a fill.`;
     case "ORDER_WORKING":
-      return "A bounded GTD order was accepted and its unfilled quantity remains working until the reported expiration.";
+      return `${input.execution.completion?.processedAll === true ? "All accepted proposals were processed; " : ""}${executions.filter((execution) => execution.status === "WORKING").length} bounded GTD orders were still working at their last reconciliation. Unfilled remainders retain their reported expirations.`;
     case "FILLED":
       return `${filledCount} current-cycle orders filled or partially filled.`;
     case "FAILED":
@@ -828,6 +832,9 @@ export function buildCycleReport(input: BuildCycleReportInput): CycleReport {
     status,
     outcome,
     completionReason: completionReason(input, outcome, executions),
+    ...(input.execution.completion === undefined
+      ? {}
+      : { executionCompletion: input.execution.completion }),
     startedAt: input.startedAt.toISOString(),
     completedAt: input.completedAt.toISOString(),
     durationMilliseconds:

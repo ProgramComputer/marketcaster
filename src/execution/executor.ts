@@ -28,6 +28,12 @@ import {
 } from "./idempotency.js";
 import { reconcileAmbiguousSubmission } from "./reconcile.js";
 import {
+  ManagedBuyBatch,
+  ManagedBuyStateError,
+  managedBuyResult,
+  type ManagedBuyCheck,
+} from "./managed-buy-batch.js";
+import {
   executionFailureCode,
   type ExecutionCooldown,
   type ExecutionFailure,
@@ -69,6 +75,7 @@ export class ExecutionJournalError extends Error {
 }
 
 export interface ExecutionAttempt {
+  readonly proposalIndex?: number;
   readonly intentId?: string;
   readonly failure?: ExecutionFailure;
   readonly cooldown?: ExecutionCooldown;
@@ -82,6 +89,20 @@ export interface ExecutionAttempt {
 export interface ExecutionRun {
   readonly attempts: readonly ExecutionAttempt[];
   readonly stoppedForAmbiguity: boolean;
+  readonly completion?: ExecutionCompletion;
+  readonly managedOrderChecks?: readonly ManagedBuyCheck[];
+}
+
+export interface ExecutionCompletion {
+  readonly processedAll: boolean;
+  readonly stopReason?: string;
+  readonly unattempted: readonly {
+    readonly proposalIndex: number;
+    readonly marketSlug: string;
+    readonly side: OutcomeSide;
+    readonly action: "BUY" | "SELL";
+    readonly reason: string;
+  }[];
 }
 
 export interface ExecutionJournalIntent {
@@ -687,13 +708,45 @@ export async function executeValidatedOrders(
     input.policy.maximumCycleSpendFraction,
   );
   let committedCycleSpend = new Decimal(0);
+  let managedBatch: ManagedBuyBatch | undefined;
+  const managedOrderChecks: ManagedBuyCheck[] = [];
+  const finish = (
+    stopReason?: string,
+    stoppedForAmbiguity = false,
+  ): ExecutionRun => {
+    const processed = new Set(attempts.map((attempt) => attempt.proposalIndex));
+    return {
+      attempts,
+      stoppedForAmbiguity,
+      completion: {
+        processedAll: stopReason === undefined,
+        ...(stopReason === undefined ? {} : { stopReason }),
+        unattempted: input.validated.flatMap((validated, proposalIndex) =>
+          processed.has(proposalIndex)
+            ? []
+            : [
+                {
+                  proposalIndex,
+                  marketSlug: validated.order.marketSlug,
+                  side: validated.order.side,
+                  action: validated.order.action,
+                  reason: stopReason ?? "Execution did not reach this proposal",
+                },
+              ],
+        ),
+      },
+      ...(managedOrderChecks.length === 0 ? {} : { managedOrderChecks }),
+    };
+  };
 
   for (const [validatedIndex, validated] of input.validated.entries()) {
     const attemptSequence = validatedIndex + 1;
-    const identity =
-      input.intentIdPrefix === undefined
+    const identity = {
+      proposalIndex: validatedIndex,
+      ...(input.intentIdPrefix === undefined
         ? {}
-        : { intentId: `${input.intentIdPrefix}:${attemptSequence}` };
+        : { intentId: `${input.intentIdPrefix}:${attemptSequence}` }),
+    };
     input.signal?.throwIfAborted();
     const checkedAt = now();
     let phase: ExecutionFailurePhase = "PRECHECK";
@@ -725,14 +778,33 @@ export async function executeValidatedOrders(
         });
         continue;
       }
+      if (
+        managedBatch !== undefined &&
+        (validated.order.action !== "BUY" ||
+          managedBatch.hasMarket(validated.order.marketSlug))
+      ) {
+        attempts.push({
+          ...identity,
+          validated,
+          skippedReason:
+            "Managed BUY continuation requires a BUY in an independent market",
+        });
+        continue;
+      }
       const targetAccount =
-        validated.proposal.portfolioTargetPlan === undefined
+        managedBatch !== undefined
           ? Promise.resolve(undefined)
-          : input.exchange.getAccountSnapshot();
-      const [openOrders, positions, activities, freshAccount] =
+          : validated.proposal.portfolioTargetPlan === undefined
+            ? Promise.resolve(undefined)
+            : input.exchange.getAccountSnapshot();
+      const [readOpenOrders, readPositions, activities, readAccount] =
         await Promise.all([
-          input.exchange.getOpenOrders(),
-          input.exchange.getPositions(),
+          managedBatch === undefined
+            ? input.exchange.getOpenOrders()
+            : Promise.resolve([]),
+          managedBatch === undefined
+            ? input.exchange.getPositions()
+            : Promise.resolve([]),
           input.exchange.getActivities({
             marketSlug: validated.order.marketSlug,
             createdAfter: new Date(
@@ -744,15 +816,40 @@ export async function executeValidatedOrders(
           }),
           targetAccount,
         ]);
+      let openOrders = readOpenOrders;
+      let positions = readPositions;
+      let freshAccount = readAccount;
       input.signal?.throwIfAborted();
-      if (openOrders.length > 0) {
+      if (managedBatch !== undefined) {
+        const check = await managedBatch.reconcile(
+          input.exchange,
+          input.signal,
+        );
+        managedOrderChecks.push(check);
+        // This rebasing is permitted only after exact-order reconciliation
+        // explains all position/cash changes since the first working BUY.
+        currentSnapshot = check.account;
+        freshAccount = check.account;
+        positions = check.account.positions;
+        openOrders = check.account.openOrders;
+        for (const [index, attempt] of attempts.entries()) {
+          const order = check.orders.find(
+            (item) => item.id === attempt.result?.orderId,
+          );
+          if (order !== undefined)
+            attempts[index] = { ...attempt, result: managedBuyResult(order) };
+        }
+      }
+      if (managedBatch === undefined && openOrders.length > 0) {
         attempts.push({
           ...identity,
           validated,
           skippedReason:
             "Fresh open orders appeared after cycle reconstruction; remaining execution stopped",
         });
-        return { attempts, stoppedForAmbiguity: false };
+        return finish(
+          "Unexpected open orders appeared after cycle reconstruction",
+        );
       }
       const staleTargetReason = stalePortfolioTargetReason(
         validated,
@@ -826,7 +923,8 @@ export async function executeValidatedOrders(
       const previewSpend = assertPreviewSafe(
         preview,
         validated,
-        currentSnapshot.buyingPower,
+        managedBatch?.availableBuyingPower(currentSnapshot) ??
+          currentSnapshot.buyingPower,
         Decimal.max(0, maximumCycleSpend.minus(committedCycleSpend)),
       );
 
@@ -1039,6 +1137,27 @@ export async function executeValidatedOrders(
           }
         }
       }
+      if (
+        result.status !== "AMBIGUOUS" &&
+        (result.status === "WORKING" || managedBatch !== undefined)
+      ) {
+        try {
+          managedBatch ??= new ManagedBuyBatch(currentSnapshot);
+          managedBatch.register(
+            validated.order,
+            result.orderId,
+            previewSpend,
+            validated.market.priceTick,
+            result.filledQuantity,
+          );
+        } catch (error) {
+          result = {
+            ...result,
+            status: "AMBIGUOUS",
+            ambiguousReason: safeErrorMessage(error),
+          };
+        }
+      }
       const reconciliationObservedAt = safeJournalTimestamp(
         now,
         submissionObservedAt,
@@ -1145,12 +1264,13 @@ export async function executeValidatedOrders(
         );
       }
       if (result.status === "AMBIGUOUS") {
-        return { attempts, stoppedForAmbiguity: true };
+        return finish(
+          result.ambiguousReason ?? "Order outcome is ambiguous",
+          true,
+        );
       }
-      if (result.status === "WORKING") {
-        // Do not submit another order while this cycle has live resting exposure.
-        return { attempts, stoppedForAmbiguity: false };
-      }
+      // A verified working BUY retains its full reservation. Subsequent
+      // independent BUYs may proceed after the managed batch is reconciled.
     } catch (error) {
       if (error instanceof ExecutionJournalError) throw error;
       if (input.signal?.aborted === true) input.signal.throwIfAborted();
@@ -1182,8 +1302,10 @@ export async function executeValidatedOrders(
           ? undefined
           : () => executionHealth.recordFailure(failure),
       );
+      if (error instanceof ManagedBuyStateError)
+        return finish(safeErrorMessage(error), true);
     }
   }
 
-  return { attempts, stoppedForAmbiguity: false };
+  return finish();
 }

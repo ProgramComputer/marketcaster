@@ -50,6 +50,7 @@ jobs:
           npm run check:policy
           npm run check:state-lifecycle
           npm run check:execution-health
+          npm run check:managed-buy-continuation
           npm run check:source-and-reconciliation
           npm run check:observe
           npm run check:memory-feedback

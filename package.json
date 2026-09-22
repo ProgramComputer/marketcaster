@@ -23,6 +23,7 @@
     "check:policy": "node scripts/check-strategy-policy.mjs && node scripts/check-selection-policy.mjs && node scripts/check-forecast-policy.mjs",
     "check:state-lifecycle": "node --import tsx scripts/check-state-lifecycle.mjs",
     "check:execution-health": "node --import tsx scripts/check-execution-health.mjs",
+    "check:managed-buy-continuation": "node --import tsx scripts/check-managed-buy-continuation.mjs",
     "check:observe": "node scripts/check-observe-policy.mjs",
     "check:source-and-reconciliation": "node --import tsx scripts/check-source-and-reconciliation.mjs",
     "check:memory-feedback": "node --import tsx scripts/check-memory-feedback.mjs",
