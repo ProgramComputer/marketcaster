@@ -50,11 +50,11 @@ async function audit(point, minimumMaterialEdge = "0") {
 }
 
 for (const [point, edge, status, issueCount] of [
-  ["0.505", "-0.01", "NON_POSITIVE", 0],
-  ["0.515", "0", "NON_POSITIVE", 0],
-  ["0.52", "0.005", "POSITIVE_NOT_MATERIAL", 0],
-  ["0.525", "0.01", "POSITIVE_NOT_MATERIAL", 0],
-  ["0.535", "0.02", "MATERIAL_POSITIVE", 1],
+  ["0.507375", "-0.01", "NON_POSITIVE", 0],
+  ["0.517375", "0", "NON_POSITIVE", 0],
+  ["0.522375", "0.005", "POSITIVE_NOT_MATERIAL", 0],
+  ["0.527375", "0.01", "POSITIVE_NOT_MATERIAL", 0],
+  ["0.537375", "0.02", "MATERIAL_POSITIVE", 1],
 ]) {
   const report = await audit(point);
   const check = report.checks.find((row) => row.evaluatedSide === "YES");

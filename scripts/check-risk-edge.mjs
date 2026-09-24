@@ -5,36 +5,39 @@ import { calculateKellyBudget } from "../dist/src/risk/kelly.js";
 import { executeValidatedOrders } from "../dist/src/execution/executor.js";
 import {
   calculateNetEdge,
-  estimateExchangeTakerFee,
-  estimateTakerFeeUpperBound,
+  estimatePolymarketUsTakerFeeUpperBound,
+  estimateExchangeTakerFeePerContract,
   feeForEdgeEvaluation,
 } from "../dist/src/risk/edge.js";
 
 const quantity = new Decimal(1);
 const price = new Decimal("0.98");
 const probability = new Decimal("0.995");
-const priceSpecificFee = estimateExchangeTakerFee(
+const priceSpecificFee = estimateExchangeTakerFeePerContract(
   "polymarket-us",
-  quantity,
   price,
 );
-const cashReserve = estimateTakerFeeUpperBound(quantity, price, "BUY");
+const cashReserve = estimatePolymarketUsTakerFeeUpperBound(
+  quantity,
+  price,
+  "BUY",
+);
 
-assert.equal(priceSpecificFee.toFixed(6), "0.001176");
-assert.equal(cashReserve.toFixed(3), "0.015");
+assert.equal(priceSpecificFee.toFixed(6), "0.001362");
+assert.equal(cashReserve.toFixed(3), "0.020");
 assert.equal(
   feeForEdgeEvaluation("polymarket-us", priceSpecificFee, cashReserve).toFixed(
     6,
   ),
-  "0.001176",
+  "0.001362",
 );
 assert.equal(
   calculateNetEdge(probability, price, priceSpecificFee).toFixed(6),
-  "0.013824",
+  "0.013638",
 );
 assert.equal(
   feeForEdgeEvaluation("kalshi", priceSpecificFee, cashReserve).toFixed(3),
-  "0.015",
+  "0.020",
 );
 
 // Synthetic exchange only. No credentials, network, or real orders are used.
@@ -99,7 +102,11 @@ const exchange = {
   getBbo: async () => bbo,
   getOrderBook: async () => book,
   createImmediateOrderFeeReserveEstimator: async (order) => (quantity) =>
-    estimateTakerFeeUpperBound(quantity, order.canonicalLimitPrice, "BUY"),
+    estimatePolymarketUsTakerFeeUpperBound(
+      quantity,
+      order.canonicalLimitPrice,
+      "BUY",
+    ),
 };
 const input = {
   exchange,
@@ -121,10 +128,10 @@ for (const resting of [false, true]) {
   assert.equal(result.accepted.length, 1);
   const accepted = result.accepted[0];
   assert.equal(accepted.order.quantity.toString(), "10");
-  assert.equal(accepted.estimatedFees.toString(), "0.01176");
-  assert.equal(accepted.conservativeFeeReserve.toString(), "0.15");
-  assert.equal(accepted.maximumExecutionSpend.toString(), "9.95");
-  assert.equal(accepted.netEdge.toString(), "0.013824");
+  assert.equal(accepted.estimatedFees.toString(), "0.01");
+  assert.equal(accepted.conservativeFeeReserve.toString(), "0.17");
+  assert.equal(accepted.maximumExecutionSpend.toString(), "9.97");
+  assert.equal(accepted.netEdge.toString(), "0.014");
   assert.ok(accepted.maximumExecutionSpend.lte(accepted.riskBudget));
   assert.ok(
     accepted.maximumExecutionSpend.lte(
