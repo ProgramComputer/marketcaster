@@ -22,6 +22,11 @@ export interface Page<T> {
   readonly items: readonly T[];
   readonly nextCursor?: string;
   readonly eof: boolean;
+  /**
+   * Why an adapter reported the end: an explicit response marker, or a page
+   * shorter than requested. Omitted when unknown or when not at the end.
+   */
+  readonly eofSource?: "RESPONSE" | "SHORT_PAGE";
 }
 
 export const DecimalInputSchema = z

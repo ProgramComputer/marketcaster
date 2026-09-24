@@ -434,6 +434,9 @@ export class PolymarketUsExchange implements PredictionExchange {
       return {
         items,
         eof,
+        ...(eof
+          ? { eofSource: responseEof === undefined ? "SHORT_PAGE" : "RESPONSE" }
+          : {}),
         ...(nextCursor === undefined ? {} : { nextCursor }),
       };
     } catch (error) {

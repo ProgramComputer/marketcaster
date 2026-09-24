@@ -1126,6 +1126,12 @@ export async function runCycle(
     );
     warnings.push(...discovery.catalog.warnings);
     const opportunityBoard = discovery.opportunityBoard;
+    if (discovery.catalog.acquisition !== undefined) {
+      await journal?.recordArtifact(
+        "market-catalog-acquisition",
+        discovery.catalog.acquisition,
+      );
+    }
     await journal?.recordArtifact(
       "market-selection-snapshot",
       discovery.marketSelectionSnapshot,
@@ -1154,15 +1160,28 @@ export async function runCycle(
         researchFamilyAliases.set(market.slug, familyKey);
       }
     }
-    discoveryLogger.info(
-      {
-        catalogued: discovery.catalog.markets.length,
-        categories: Object.keys(discovery.catalog.categoryCounts).length,
-        preloadedHeld: discovery.preloadedHeld.length,
-        preloadedOpportunities: opportunityBoard.length,
-      },
-      "Full market catalog loaded",
-    );
+    const catalogCoverage =
+      discovery.catalog.acquisition?.coverage ?? "UNKNOWN";
+    const catalogLog = {
+      catalogued: discovery.catalog.markets.length,
+      categories: Object.keys(discovery.catalog.categoryCounts).length,
+      preloadedHeld: discovery.preloadedHeld.length,
+      preloadedOpportunities: opportunityBoard.length,
+      catalogCoverage,
+      catalogListRequests: discovery.catalog.acquisition?.pages.length,
+      catalogStopReason: discovery.catalog.acquisition?.stopReason,
+      catalogDiagnostics: discovery.catalog.acquisition?.diagnostics.map(
+        (diagnostic) => diagnostic.code,
+      ),
+    };
+    if (catalogCoverage === "DEGRADED") {
+      discoveryLogger.warn(
+        catalogLog,
+        "Market catalog loaded with degraded coverage",
+      );
+    } else {
+      discoveryLogger.info(catalogLog, "Full market catalog loaded");
+    }
 
     const initialValuationContext = valuationContext(
       initialSnapshot,
@@ -1285,6 +1304,11 @@ export async function runCycle(
       marketCatalog: {
         count: discovery.catalog.markets.length,
         categoryCounts: discovery.catalog.categoryCounts,
+        coverage: discovery.catalog.acquisition?.coverage ?? "UNKNOWN",
+        coverageDiagnostics:
+          discovery.catalog.acquisition?.diagnostics.map(
+            (diagnostic) => diagnostic.message,
+          ) ?? [],
       },
       opportunityBoard,
       // The terminal plan must explicitly address the complete held portfolio.
