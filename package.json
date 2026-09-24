@@ -34,6 +34,7 @@
     "check:evidence-reading": "node scripts/check-evidence-reading.mjs",
     "check:source-provenance": "node scripts/check-source-provenance.mjs",
     "check:input-provenance": "node --import tsx scripts/check-input-provenance.mjs",
+    "check:anthropic-opus55": "node scripts/check-anthropic-opus55.mjs",
     "check:schema-correction": "node scripts/check-schema-correction.mjs",
     "check:resolution-review": "node scripts/check-resolution-review.mjs"
   },
