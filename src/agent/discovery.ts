@@ -8,7 +8,7 @@ import type {
   MarketMetricWindow,
   OrderBook,
 } from "../domain/market.js";
-import { serializeDecimal } from "../domain/primitives.js";
+import { serializeDecimal, type Page } from "../domain/primitives.js";
 import {
   ExchangeError,
   type PredictionExchange,
@@ -197,6 +197,44 @@ export class MarketDiscoveryNarrowingRequiredError extends Error {
   }
 }
 
+export type CatalogCoverageDiagnosticCode =
+  | "EMPTY_TERMINAL_PAGE_AT_PAGE_BOUNDARY"
+  | "END_OF_CATALOG_BEFORE_NONEMPTY_PAGE"
+  | "DUPLICATE_ROWS_ACROSS_PAGES";
+
+export interface CatalogCoverageDiagnostic {
+  readonly code: CatalogCoverageDiagnosticCode;
+  readonly message: string;
+}
+
+/** One catalog list request exactly as the exchange answered it. */
+export interface CatalogPageObservation {
+  readonly pageNumber: number;
+  readonly offset?: number;
+  readonly cursor?: string;
+  readonly requestedLimit: number;
+  readonly returnedCount: number;
+  readonly newMarketCount: number;
+  readonly duplicateCount: number;
+  readonly eof: boolean;
+  readonly eofSource?: "RESPONSE" | "SHORT_PAGE";
+  readonly nextCursor?: string;
+  /** A repeated request for an ambiguous end of the list. */
+  readonly verification: boolean;
+}
+
+export interface CatalogAcquisition {
+  readonly pageSize: number;
+  readonly maximumConcurrentPages: number;
+  readonly pages: readonly CatalogPageObservation[];
+  readonly rawRowCount: number;
+  readonly uniqueMarketCount: number;
+  readonly duplicateRowCount: number;
+  readonly stopReason: "EXCHANGE_EOF" | "SHORT_PAGE" | "EMPTY_PAGE";
+  readonly coverage: "COMPLETE" | "DEGRADED";
+  readonly diagnostics: readonly CatalogCoverageDiagnostic[];
+}
+
 export interface MarketCatalog {
   readonly markets: readonly Market[];
   readonly bySlug: ReadonlyMap<string, Market>;
@@ -205,6 +243,8 @@ export interface MarketCatalog {
   readonly categoryCounts: Readonly<Record<string, number>>;
   readonly exchangeRankingBasis: "VOLUME_DESC" | "EXCHANGE_DEFAULT";
   readonly warnings: readonly string[];
+  /** Page-level evidence for how the listed universe was acquired. */
+  readonly acquisition?: CatalogAcquisition;
 }
 
 export interface MarketCatalogOptions {
@@ -373,6 +413,13 @@ export function searchMarketFacets(
   };
 }
 
+function catalogStopReason(
+  page: Page<Market>,
+): CatalogAcquisition["stopReason"] {
+  if (page.eofSource === "RESPONSE") return "EXCHANGE_EOF";
+  return page.items.length === 0 ? "EMPTY_PAGE" : "SHORT_PAGE";
+}
+
 async function listEntireUniverse(
   exchange: PredictionExchange,
   pageSize: number,
@@ -380,11 +427,24 @@ async function listEntireUniverse(
   minimumVolumeUsd?: Decimal,
   signal?: AbortSignal,
   maximumConcurrentPages = 1,
-): Promise<readonly Market[]> {
+): Promise<{
+  readonly markets: readonly Market[];
+  readonly acquisition: CatalogAcquisition;
+}> {
   const markets: Market[] = [];
   const identities = new Map<string, string>();
-  const append = (items: readonly Market[]): void => {
-    for (const market of items) {
+  const pages: CatalogPageObservation[] = [];
+  const diagnostics: CatalogCoverageDiagnostic[] = [];
+  let rawRowCount = 0;
+  let duplicateRowCount = 0;
+  const append = (
+    page: Page<Market>,
+    pageNumber: number,
+    position: { readonly offset?: number; readonly cursor?: string },
+    verification: boolean,
+  ): void => {
+    let newMarketCount = 0;
+    for (const market of page.items) {
       const knownId = identities.get(market.slug);
       if (knownId !== undefined && knownId !== market.id.value) {
         throw new Error(`Conflicting identifiers for market ${market.slug}`);
@@ -392,8 +452,64 @@ async function listEntireUniverse(
       if (knownId === undefined) {
         identities.set(market.slug, market.id.value);
         markets.push(market);
+        newMarketCount += 1;
       }
     }
+    rawRowCount += page.items.length;
+    duplicateRowCount += page.items.length - newMarketCount;
+    pages.push({
+      pageNumber,
+      ...position,
+      requestedLimit: pageSize,
+      returnedCount: page.items.length,
+      newMarketCount,
+      duplicateCount: page.items.length - newMarketCount,
+      eof: page.eof,
+      ...(page.eofSource === undefined ? {} : { eofSource: page.eofSource }),
+      ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
+      verification,
+    });
+  };
+  // An empty page whose end is inferred only from its length, directly after a
+  // full page, cannot be told apart from a truncated response. Ask once more.
+  const ambiguousEnd = (
+    page: Page<Market>,
+    previousReturned: number | undefined,
+  ): boolean =>
+    page.eof &&
+    page.eofSource === "SHORT_PAGE" &&
+    page.items.length === 0 &&
+    previousReturned === pageSize;
+  const confirmedEmptyEnd = (position: string): void => {
+    diagnostics.push({
+      code: "EMPTY_TERMINAL_PAGE_AT_PAGE_BOUNDARY",
+      message: `${position} returned no rows directly after a full page, without an explicit end marker, and a repeat request also returned none; the list may have ended early`,
+    });
+  };
+  const finish = (terminal: Page<Market>) => {
+    if (duplicateRowCount > 0) {
+      diagnostics.push({
+        code: "DUPLICATE_ROWS_ACROSS_PAGES",
+        message: `${duplicateRowCount} repeated rows were returned across pages; the list order changed during pagination, so other rows may have been skipped`,
+      });
+    }
+    return {
+      markets,
+      acquisition: {
+        pageSize,
+        maximumConcurrentPages,
+        pages: Object.freeze(pages),
+        rawRowCount,
+        uniqueMarketCount: markets.length,
+        duplicateRowCount,
+        stopReason: catalogStopReason(terminal),
+        coverage:
+          diagnostics.length === 0
+            ? ("COMPLETE" as const)
+            : ("DEGRADED" as const),
+        diagnostics: Object.freeze([...diagnostics]),
+      },
+    };
   };
 
   if (maximumConcurrentPages > 1) {
@@ -402,50 +518,104 @@ async function listEntireUniverse(
         "Concurrent catalog pagination requires a numeric-offset exchange",
       );
     }
-    for (
-      let batchStart = 0;
-      batchStart < maximumPages;
-      batchStart += maximumConcurrentPages
-    ) {
+    const request = (pageNumber: number) =>
+      exchange.listMarkets({
+        active: true,
+        closed: false,
+        archived: false,
+        limit: pageSize,
+        offset: pageNumber * pageSize,
+        orderBy: ["volume"],
+        orderDirection: "desc",
+        ...(minimumVolumeUsd === undefined ? {} : { minimumVolumeUsd }),
+      });
+    let nextPage = 0;
+    let previousReturned: number | undefined;
+    while (nextPage < maximumPages) {
       signal?.throwIfAborted();
       const pageNumbers = Array.from(
-        {
-          length: Math.min(maximumConcurrentPages, maximumPages - batchStart),
-        },
-        (_, index) => batchStart + index,
+        { length: Math.min(maximumConcurrentPages, maximumPages - nextPage) },
+        (_, index) => nextPage + index,
       );
-      const pages = await Promise.all(
-        pageNumbers.map((pageNumber) =>
-          exchange.listMarkets({
-            active: true,
-            closed: false,
-            archived: false,
-            limit: pageSize,
-            offset: pageNumber * pageSize,
-            orderBy: ["volume"],
-            orderDirection: "desc",
-            ...(minimumVolumeUsd === undefined ? {} : { minimumVolumeUsd }),
-          }),
-        ),
-      );
+      const batch = await Promise.all(pageNumbers.map(request));
       signal?.throwIfAborted();
-      for (const page of pages) {
-        append(page.items);
-        if (page.eof) return markets;
-        if (page.items.length === 0) {
-          throw new Error("Market offset pagination made no progress");
+      let terminal:
+        | {
+            readonly index: number;
+            readonly previousReturned: number | undefined;
+          }
+        | undefined;
+      // Keep every fetched row; an early end marker must not discard later pages.
+      for (const [index, page] of batch.entries()) {
+        const pageNumber = nextPage + index;
+        append(page, pageNumber, { offset: pageNumber * pageSize }, false);
+        if (terminal === undefined) {
+          if (page.eof) {
+            terminal = { index, previousReturned };
+          } else if (page.items.length === 0) {
+            throw new Error("Market offset pagination made no progress");
+          }
         }
+        previousReturned = page.items.length;
       }
+      if (terminal === undefined) {
+        nextPage += batch.length;
+        continue;
+      }
+      const terminalPageNumber = nextPage + terminal.index;
+      if (
+        batch.slice(terminal.index + 1).some((page) => page.items.length > 0)
+      ) {
+        // Recover rows that an inconsistent end marker would otherwise hide.
+        signal?.throwIfAborted();
+        const recheck = await request(terminalPageNumber);
+        signal?.throwIfAborted();
+        append(
+          recheck,
+          terminalPageNumber,
+          { offset: terminalPageNumber * pageSize },
+          true,
+        );
+        diagnostics.push({
+          code: "END_OF_CATALOG_BEFORE_NONEMPTY_PAGE",
+          message: `Offset ${terminalPageNumber * pageSize} reported the end of the list, but a later page in the same batch returned rows; it was requested again (${recheck.items.length} rows) and scanning continued`,
+        });
+        nextPage += batch.length;
+        continue;
+      }
+      const terminalPage = batch[terminal.index];
+      if (terminalPage === undefined) {
+        throw new Error("Catalog batch omitted its terminal page");
+      }
+      if (!ambiguousEnd(terminalPage, terminal.previousReturned)) {
+        return finish(terminalPage);
+      }
+      signal?.throwIfAborted();
+      const recheck = await request(terminalPageNumber);
+      signal?.throwIfAborted();
+      append(
+        recheck,
+        terminalPageNumber,
+        { offset: terminalPageNumber * pageSize },
+        true,
+      );
+      if (recheck.items.length === 0) {
+        confirmedEmptyEnd(`Offset ${terminalPageNumber * pageSize}`);
+        return finish(recheck);
+      }
+      if (recheck.eof) return finish(recheck);
+      // Rows reappeared: resume after the recovered page.
+      previousReturned = recheck.items.length;
+      nextPage = terminalPageNumber + 1;
     }
     throw new Error(`Market discovery exceeded the ${maximumPages}-page guard`);
   }
 
   const cursors = new Set<string>();
   let cursor: string | undefined;
-
-  for (let pageNumber = 0; pageNumber < maximumPages; pageNumber += 1) {
-    signal?.throwIfAborted();
-    const page = await exchange.listMarkets({
+  let previousReturned: number | undefined;
+  const request = (requestCursor: string | undefined) =>
+    exchange.listMarkets({
       active: true,
       closed: false,
       archived: false,
@@ -454,10 +624,26 @@ async function listEntireUniverse(
         ? { orderBy: ["volume"], orderDirection: "desc" as const }
         : {}),
       ...(minimumVolumeUsd === undefined ? {} : { minimumVolumeUsd }),
-      ...(cursor === undefined ? {} : { cursor }),
+      ...(requestCursor === undefined ? {} : { cursor: requestCursor }),
     });
-    append(page.items);
-    if (page.eof) return markets;
+
+  for (let pageNumber = 0; pageNumber < maximumPages; pageNumber += 1) {
+    signal?.throwIfAborted();
+    const position = cursor === undefined ? {} : { cursor };
+    let page = await request(cursor);
+    append(page, pageNumber, position, false);
+    if (ambiguousEnd(page, previousReturned)) {
+      signal?.throwIfAborted();
+      page = await request(cursor);
+      append(page, pageNumber, position, true);
+      if (page.items.length === 0) {
+        confirmedEmptyEnd(
+          cursor === undefined ? "The first page" : `Cursor ${cursor}`,
+        );
+        return finish(page);
+      }
+    }
+    if (page.eof) return finish(page);
     if (page.nextCursor === undefined || cursors.has(page.nextCursor)) {
       throw new Error(
         "Market pagination was incomplete or entered a cursor loop",
@@ -465,6 +651,7 @@ async function listEntireUniverse(
     }
     cursors.add(page.nextCursor);
     cursor = page.nextCursor;
+    previousReturned = page.items.length;
   }
   throw new Error(`Market discovery exceeded the ${maximumPages}-page guard`);
 }
@@ -483,16 +670,15 @@ export async function discoverMarketCatalog(
   ) {
     throw new RangeError("maximumConcurrentPages must be a positive integer");
   }
-  const markets = [
-    ...(await listEntireUniverse(
-      exchange,
-      pageSize,
-      maximumPages,
-      undefined,
-      options.signal,
-      maximumConcurrentPages,
-    )),
-  ];
+  const listed = await listEntireUniverse(
+    exchange,
+    pageSize,
+    maximumPages,
+    undefined,
+    options.signal,
+    maximumConcurrentPages,
+  );
+  const markets = [...listed.markets];
   const bySlug = new Map(markets.map((market) => [market.slug, market]));
   const exchangeRanks = new Map(
     markets.map((market, index) => [market.slug, index + 1]),
@@ -501,6 +687,15 @@ export async function discoverMarketCatalog(
     snapshot.positions.map((position) => position.marketSlug),
   );
   const warnings: string[] = [];
+  if (listed.acquisition.coverage === "DEGRADED") {
+    warnings.push(
+      `CATALOG_COVERAGE_DEGRADED: ${listed.acquisition.diagnostics
+        .map((diagnostic) => diagnostic.code)
+        .join(
+          ", ",
+        )}; ${listed.acquisition.uniqueMarketCount} markets from ${listed.acquisition.pages.length} list requests. A market absent from this catalog is unverified, not unavailable.`,
+    );
+  }
 
   for (const slug of heldSlugs) {
     if (bySlug.has(slug)) continue;
@@ -532,6 +727,7 @@ export async function discoverMarketCatalog(
     exchangeRankingBasis:
       exchange.id === "polymarket-us" ? "VOLUME_DESC" : "EXCHANGE_DEFAULT",
     warnings: Object.freeze(warnings),
+    acquisition: listed.acquisition,
   };
 }
 
@@ -1483,13 +1679,14 @@ export class MarketDiscoveryResolver {
 
     const pending = (async (): Promise<VolumeCatalogResolution> => {
       signal?.throwIfAborted();
-      const exchangeMarkets = await listEntireUniverse(
-        this.exchange,
-        this.pageSize,
-        this.maximumPages,
-        minimum,
-        signal,
-      );
+      const { markets: exchangeMarkets, acquisition } =
+        await listEntireUniverse(
+          this.exchange,
+          this.pageSize,
+          this.maximumPages,
+          minimum,
+          signal,
+        );
       const exchangeBySlug = new Map(
         exchangeMarkets.map((market) => [market.slug, market]),
       );
@@ -1511,7 +1708,15 @@ export class MarketDiscoveryResolver {
         heldSlugs: this.catalog.heldSlugs,
         categoryCounts: categoryCounts(qualified),
         exchangeRankingBasis: this.catalog.exchangeRankingBasis,
-        warnings: this.catalog.warnings,
+        warnings:
+          acquisition.coverage === "DEGRADED"
+            ? [
+                ...this.catalog.warnings,
+                `CATALOG_COVERAGE_DEGRADED: volume-threshold listing ${acquisition.diagnostics
+                  .map((diagnostic) => diagnostic.code)
+                  .join(", ")}`,
+              ]
+            : this.catalog.warnings,
       };
       return {
         catalog: filteredCatalog,

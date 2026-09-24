@@ -77,6 +77,8 @@ export interface BuildAgentContextInput {
   readonly marketCatalog: {
     readonly count: number;
     readonly categoryCounts: Readonly<Record<string, number>>;
+    readonly coverage?: "COMPLETE" | "DEGRADED" | "UNKNOWN";
+    readonly coverageDiagnostics?: readonly string[];
   };
   readonly opportunityBoard?: readonly OpportunityBoardItem[];
   readonly preloadedMarkets: readonly PreloadedMarketInput[];
@@ -247,7 +249,10 @@ export interface AgentContext {
   readonly markets: {
     readonly catalogCount: number;
     readonly categoryCounts: Readonly<Record<string, number>>;
-    readonly fullUniverseSearchable: true;
+    /** False when list acquisition is known to be incomplete. */
+    readonly fullUniverseSearchable: boolean;
+    readonly catalogCoverage: "COMPLETE" | "DEGRADED" | "UNKNOWN";
+    readonly catalogCoverageDiagnostics: readonly string[];
     readonly discoveryModes: readonly [
       "ALL",
       "KEYWORD",
@@ -785,7 +790,10 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
     markets: {
       catalogCount: input.marketCatalog.count,
       categoryCounts: input.marketCatalog.categoryCounts,
-      fullUniverseSearchable: true,
+      fullUniverseSearchable:
+        (input.marketCatalog.coverage ?? "UNKNOWN") !== "DEGRADED",
+      catalogCoverage: input.marketCatalog.coverage ?? "UNKNOWN",
+      catalogCoverageDiagnostics: input.marketCatalog.coverageDiagnostics ?? [],
       discoveryModes: [
         "ALL",
         "KEYWORD",
