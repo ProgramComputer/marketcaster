@@ -200,7 +200,9 @@ export class MarketDiscoveryNarrowingRequiredError extends Error {
 export type CatalogCoverageDiagnosticCode =
   | "EMPTY_TERMINAL_PAGE_AT_PAGE_BOUNDARY"
   | "END_OF_CATALOG_BEFORE_NONEMPTY_PAGE"
-  | "DUPLICATE_ROWS_ACROSS_PAGES";
+  | "DUPLICATE_ROWS_ACROSS_PAGES"
+  | "LIST_ORDER_NOT_MONOTONIC"
+  | "CATALOG_SUPPLEMENT_INCOMPLETE";
 
 export interface CatalogCoverageDiagnostic {
   readonly code: CatalogCoverageDiagnosticCode;
@@ -230,9 +232,44 @@ export interface CatalogAcquisition {
   readonly rawRowCount: number;
   readonly uniqueMarketCount: number;
   readonly duplicateRowCount: number;
-  readonly stopReason: "EXCHANGE_EOF" | "SHORT_PAGE" | "EMPTY_PAGE";
+  readonly stopReason: "EXCHANGE_EOF" | "SHORT_PAGE" | "EMPTY_PAGE" | "HORIZON";
   readonly coverage: "COMPLETE" | "DEGRADED";
   readonly diagnostics: readonly CatalogCoverageDiagnostic[];
+  /** Ranking and supplementary listings acquired after the membership list. */
+  readonly segments?: readonly CatalogSegmentAcquisition[];
+}
+
+/** A caller-selected exchange list order. */
+export interface CatalogListOrder {
+  readonly orderBy: readonly string[];
+  readonly orderDirection: "asc" | "desc";
+}
+
+/** One listing requested in addition to the membership list. */
+export interface CatalogSegmentAcquisition {
+  readonly kind: "RANKING" | "CATEGORY" | "CLOSING_SOON";
+  readonly key?: string;
+  readonly listRequests: number;
+  readonly uniqueMarketCount: number;
+  /** Markets merged into the catalog that the membership list lacked. */
+  readonly addedMarketCount: number;
+  readonly coverage: "COMPLETE" | "DEGRADED" | "UNSUPPORTED" | "FAILED";
+  readonly stopReason?: CatalogAcquisition["stopReason"];
+  readonly diagnostics: readonly CatalogCoverageDiagnostic[];
+  /** A ranking only orders members; it cannot remove or add coverage. */
+  readonly affectsCoverage: boolean;
+}
+
+export interface CatalogSupplementOptions {
+  /** Categories whose complete listings must be present in the catalog. */
+  readonly categories?: readonly string[];
+  /** Every open market closing before `now + hours` must be present. */
+  readonly closingWithin?: {
+    readonly hours: number;
+    readonly now: Date;
+    /** Ascending close-time order; omitted when the exchange cannot sort so. */
+    readonly order?: CatalogListOrder;
+  };
 }
 
 export interface MarketCatalog {
@@ -253,6 +290,16 @@ export interface MarketCatalogOptions {
   /** Offset-page concurrency. Only safe for exchanges with numeric offsets. */
   readonly maximumConcurrentPages?: number;
   readonly signal?: AbortSignal;
+  /**
+   * A stable order that lists every open market exactly once. When set, it
+   * defines catalog membership and `rankingOrder` only ranks the members, so an
+   * order that shifts between page requests cannot drop markets.
+   */
+  readonly membershipOrder?: CatalogListOrder;
+  readonly rankingOrder?: CatalogListOrder;
+  readonly supplements?: CatalogSupplementOptions;
+  /** Waits before each repeat of an ambiguous empty end page. */
+  readonly verificationDelaysMilliseconds?: readonly number[];
 }
 
 export interface ResolvedMarketDetails {
@@ -420,23 +467,106 @@ function catalogStopReason(
   return page.items.length === 0 ? "EMPTY_PAGE" : "SHORT_PAGE";
 }
 
+const DEFAULT_VERIFICATION_DELAYS_MILLISECONDS = Object.freeze([
+  0, 1_000, 3_000,
+]);
+const MEMBERSHIP_CHURN_MINIMUM_ROWS = 50;
+const MEMBERSHIP_CHURN_FRACTION = 0.002;
+
+async function pause(
+  milliseconds: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  if (milliseconds <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      const reason: unknown = signal?.reason;
+      reject(
+        reason instanceof Error
+          ? reason
+          : new DOMException("Catalog verification aborted", "AbortError"),
+      );
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+interface ListUniverseOptions {
+  readonly pageSize: number;
+  readonly maximumPages: number;
+  readonly maximumConcurrentPages?: number;
+  readonly minimumVolumeUsd?: Decimal;
+  readonly signal?: AbortSignal;
+  /** Omitted: the exchange's historical discovery order. */
+  readonly order?: CatalogListOrder;
+  readonly categories?: readonly string[];
+  /**
+   * For a listing in ascending close order: stop after a page whose rows all
+   * close at or after this time. Out-of-order rows are reported.
+   */
+  readonly closesBefore?: Date;
+  readonly verificationDelaysMilliseconds?: readonly number[];
+}
+
 async function listEntireUniverse(
   exchange: PredictionExchange,
-  pageSize: number,
-  maximumPages: number,
-  minimumVolumeUsd?: Decimal,
-  signal?: AbortSignal,
-  maximumConcurrentPages = 1,
+  options: ListUniverseOptions,
 ): Promise<{
   readonly markets: readonly Market[];
   readonly acquisition: CatalogAcquisition;
 }> {
+  const { pageSize, maximumPages, signal } = options;
+  const maximumConcurrentPages = options.maximumConcurrentPages ?? 1;
+  const verificationDelays =
+    options.verificationDelaysMilliseconds ??
+    DEFAULT_VERIFICATION_DELAYS_MILLISECONDS;
+  if (
+    verificationDelays.length === 0 ||
+    verificationDelays.some(
+      (delay) => !Number.isSafeInteger(delay) || delay < 0,
+    )
+  ) {
+    throw new RangeError(
+      "verificationDelaysMilliseconds must list at least one non-negative integer",
+    );
+  }
+  const order =
+    options.order ??
+    (exchange.id === "polymarket-us"
+      ? ({ orderBy: ["volume", "id"], orderDirection: "desc" } as const)
+      : undefined);
+  const baseQuery = {
+    active: true,
+    closed: false,
+    archived: false,
+    limit: pageSize,
+    ...(order === undefined
+      ? {}
+      : { orderBy: order.orderBy, orderDirection: order.orderDirection }),
+    ...(options.categories === undefined
+      ? {}
+      : { categories: options.categories }),
+    ...(options.minimumVolumeUsd === undefined
+      ? {}
+      : { minimumVolumeUsd: options.minimumVolumeUsd }),
+  };
+  const horizon = options.closesBefore?.getTime();
   const markets: Market[] = [];
   const identities = new Map<string, string>();
   const pages: CatalogPageObservation[] = [];
   const diagnostics: CatalogCoverageDiagnostic[] = [];
   let rawRowCount = 0;
   let duplicateRowCount = 0;
+  let latestClose = Number.NEGATIVE_INFINITY;
+  let orderViolation = false;
+  const closeTime = (market: Market): number =>
+    market.closesAt?.getTime() ?? Number.POSITIVE_INFINITY;
   const append = (
     page: Page<Market>,
     pageNumber: number,
@@ -454,6 +584,11 @@ async function listEntireUniverse(
         markets.push(market);
         newMarketCount += 1;
       }
+      if (horizon !== undefined && !verification) {
+        const closes = closeTime(market);
+        if (closes < latestClose) orderViolation = true;
+        latestClose = Math.max(latestClose, closes);
+      }
     }
     rawRowCount += page.items.length;
     duplicateRowCount += page.items.length - newMarketCount;
@@ -470,8 +605,14 @@ async function listEntireUniverse(
       verification,
     });
   };
+  // Rows at or beyond the horizon end an ascending close-time listing.
+  const reachedHorizon = (page: Page<Market>): boolean =>
+    horizon !== undefined &&
+    page.items.length > 0 &&
+    page.items.every((market) => closeTime(market) >= horizon);
   // An empty page whose end is inferred only from its length, directly after a
-  // full page, cannot be told apart from a truncated response. Ask once more.
+  // full page, cannot be told apart from a truncated response. Ask again, with
+  // increasing waits, before accepting it as the end of the list.
   const ambiguousEnd = (
     page: Page<Market>,
     previousReturned: number | undefined,
@@ -480,17 +621,44 @@ async function listEntireUniverse(
     page.eofSource === "SHORT_PAGE" &&
     page.items.length === 0 &&
     previousReturned === pageSize;
+  const verifyEnd = async (
+    fetch: () => Promise<Page<Market>>,
+    record: (page: Page<Market>) => void,
+  ): Promise<Page<Market>> => {
+    let latest: Page<Market> | undefined;
+    for (const delay of verificationDelays) {
+      await pause(delay, signal);
+      latest = await fetch();
+      signal?.throwIfAborted();
+      record(latest);
+      if (latest.items.length > 0) return latest;
+    }
+    if (latest === undefined) {
+      throw new Error("Catalog end verification made no request");
+    }
+    return latest;
+  };
   const confirmedEmptyEnd = (position: string): void => {
     diagnostics.push({
       code: "EMPTY_TERMINAL_PAGE_AT_PAGE_BOUNDARY",
-      message: `${position} returned no rows directly after a full page, without an explicit end marker, and a repeat request also returned none; the list may have ended early`,
+      message: `${position} returned no rows directly after a full page, without an explicit end marker, and ${verificationDelays.length} repeated requests also returned none; the list may have ended early`,
     });
   };
-  const finish = (terminal: Page<Market>) => {
+  const finish = (
+    terminal: Page<Market>,
+    stopReason: CatalogAcquisition["stopReason"] = catalogStopReason(terminal),
+  ) => {
     if (duplicateRowCount > 0) {
       diagnostics.push({
         code: "DUPLICATE_ROWS_ACROSS_PAGES",
         message: `${duplicateRowCount} repeated rows were returned across pages; the list order changed during pagination, so other rows may have been skipped`,
+      });
+    }
+    if (orderViolation) {
+      diagnostics.push({
+        code: "LIST_ORDER_NOT_MONOTONIC",
+        message:
+          "Rows did not arrive in ascending close order, so stopping at the close-time horizon may have skipped markets",
       });
     }
     return {
@@ -502,7 +670,7 @@ async function listEntireUniverse(
         rawRowCount,
         uniqueMarketCount: markets.length,
         duplicateRowCount,
-        stopReason: catalogStopReason(terminal),
+        stopReason,
         coverage:
           diagnostics.length === 0
             ? ("COMPLETE" as const)
@@ -519,16 +687,7 @@ async function listEntireUniverse(
       );
     }
     const request = (pageNumber: number) =>
-      exchange.listMarkets({
-        active: true,
-        closed: false,
-        archived: false,
-        limit: pageSize,
-        offset: pageNumber * pageSize,
-        orderBy: ["volume"],
-        orderDirection: "desc",
-        ...(minimumVolumeUsd === undefined ? {} : { minimumVolumeUsd }),
-      });
+      exchange.listMarkets({ ...baseQuery, offset: pageNumber * pageSize });
     let nextPage = 0;
     let previousReturned: number | undefined;
     while (nextPage < maximumPages) {
@@ -545,12 +704,15 @@ async function listEntireUniverse(
             readonly previousReturned: number | undefined;
           }
         | undefined;
+      let horizonPage: Page<Market> | undefined;
       // Keep every fetched row; an early end marker must not discard later pages.
       for (const [index, page] of batch.entries()) {
         const pageNumber = nextPage + index;
         append(page, pageNumber, { offset: pageNumber * pageSize }, false);
-        if (terminal === undefined) {
-          if (page.eof) {
+        if (terminal === undefined && horizonPage === undefined) {
+          if (reachedHorizon(page)) {
+            horizonPage = page;
+          } else if (page.eof) {
             terminal = { index, previousReturned };
           } else if (page.items.length === 0) {
             throw new Error("Market offset pagination made no progress");
@@ -558,6 +720,7 @@ async function listEntireUniverse(
         }
         previousReturned = page.items.length;
       }
+      if (horizonPage !== undefined) return finish(horizonPage, "HORIZON");
       if (terminal === undefined) {
         nextPage += batch.length;
         continue;
@@ -567,19 +730,22 @@ async function listEntireUniverse(
         batch.slice(terminal.index + 1).some((page) => page.items.length > 0)
       ) {
         // Recover rows that an inconsistent end marker would otherwise hide.
-        signal?.throwIfAborted();
-        const recheck = await request(terminalPageNumber);
-        signal?.throwIfAborted();
-        append(
-          recheck,
-          terminalPageNumber,
-          { offset: terminalPageNumber * pageSize },
-          true,
+        const recheck = await verifyEnd(
+          () => request(terminalPageNumber),
+          (page) =>
+            append(
+              page,
+              terminalPageNumber,
+              { offset: terminalPageNumber * pageSize },
+              true,
+            ),
         );
-        diagnostics.push({
-          code: "END_OF_CATALOG_BEFORE_NONEMPTY_PAGE",
-          message: `Offset ${terminalPageNumber * pageSize} reported the end of the list, but a later page in the same batch returned rows; it was requested again (${recheck.items.length} rows) and scanning continued`,
-        });
+        if (recheck.items.length === 0) {
+          diagnostics.push({
+            code: "END_OF_CATALOG_BEFORE_NONEMPTY_PAGE",
+            message: `Offset ${terminalPageNumber * pageSize} reported the end of the list, but a later page in the same batch returned rows; ${verificationDelays.length} repeated requests returned none, so its rows are missing`,
+          });
+        }
         nextPage += batch.length;
         continue;
       }
@@ -590,19 +756,21 @@ async function listEntireUniverse(
       if (!ambiguousEnd(terminalPage, terminal.previousReturned)) {
         return finish(terminalPage);
       }
-      signal?.throwIfAborted();
-      const recheck = await request(terminalPageNumber);
-      signal?.throwIfAborted();
-      append(
-        recheck,
-        terminalPageNumber,
-        { offset: terminalPageNumber * pageSize },
-        true,
+      const recheck = await verifyEnd(
+        () => request(terminalPageNumber),
+        (page) =>
+          append(
+            page,
+            terminalPageNumber,
+            { offset: terminalPageNumber * pageSize },
+            true,
+          ),
       );
       if (recheck.items.length === 0) {
         confirmedEmptyEnd(`Offset ${terminalPageNumber * pageSize}`);
         return finish(recheck);
       }
+      if (reachedHorizon(recheck)) return finish(recheck, "HORIZON");
       if (recheck.eof) return finish(recheck);
       // Rows reappeared: resume after the recovered page.
       previousReturned = recheck.items.length;
@@ -616,14 +784,7 @@ async function listEntireUniverse(
   let previousReturned: number | undefined;
   const request = (requestCursor: string | undefined) =>
     exchange.listMarkets({
-      active: true,
-      closed: false,
-      archived: false,
-      limit: pageSize,
-      ...(exchange.id === "polymarket-us"
-        ? { orderBy: ["volume"], orderDirection: "desc" as const }
-        : {}),
-      ...(minimumVolumeUsd === undefined ? {} : { minimumVolumeUsd }),
+      ...baseQuery,
       ...(requestCursor === undefined ? {} : { cursor: requestCursor }),
     });
 
@@ -633,9 +794,10 @@ async function listEntireUniverse(
     let page = await request(cursor);
     append(page, pageNumber, position, false);
     if (ambiguousEnd(page, previousReturned)) {
-      signal?.throwIfAborted();
-      page = await request(cursor);
-      append(page, pageNumber, position, true);
+      page = await verifyEnd(
+        () => request(cursor),
+        (verified) => append(verified, pageNumber, position, true),
+      );
       if (page.items.length === 0) {
         confirmedEmptyEnd(
           cursor === undefined ? "The first page" : `Cursor ${cursor}`,
@@ -643,6 +805,7 @@ async function listEntireUniverse(
         return finish(page);
       }
     }
+    if (reachedHorizon(page)) return finish(page, "HORIZON");
     if (page.eof) return finish(page);
     if (page.nextCursor === undefined || cursors.has(page.nextCursor)) {
       throw new Error(
@@ -654,6 +817,52 @@ async function listEntireUniverse(
     previousReturned = page.items.length;
   }
   throw new Error(`Market discovery exceeded the ${maximumPages}-page guard`);
+}
+
+function segmentFromListing(
+  kind: CatalogSegmentAcquisition["kind"],
+  key: string | undefined,
+  acquisition: CatalogAcquisition,
+  addedMarketCount: number,
+  affectsCoverage: boolean,
+): CatalogSegmentAcquisition {
+  return {
+    kind,
+    ...(key === undefined ? {} : { key }),
+    listRequests: acquisition.pages.length,
+    uniqueMarketCount: acquisition.uniqueMarketCount,
+    addedMarketCount,
+    coverage: acquisition.coverage,
+    stopReason: acquisition.stopReason,
+    diagnostics: acquisition.diagnostics,
+    affectsCoverage,
+  };
+}
+
+function segmentFromFailure(
+  kind: CatalogSegmentAcquisition["kind"],
+  key: string | undefined,
+  error: unknown,
+  affectsCoverage: boolean,
+): CatalogSegmentAcquisition {
+  const unsupported =
+    error instanceof ExchangeError && error.code === "UNSUPPORTED";
+  const detail = error instanceof Error ? error.message : String(error);
+  return {
+    kind,
+    ...(key === undefined ? {} : { key }),
+    listRequests: 0,
+    uniqueMarketCount: 0,
+    addedMarketCount: 0,
+    coverage: unsupported ? "UNSUPPORTED" : "FAILED",
+    diagnostics: Object.freeze([
+      {
+        code: "CATALOG_SUPPLEMENT_INCOMPLETE" as const,
+        message: `${kind}${key === undefined ? "" : ` ${key}`} listing ${unsupported ? "is unsupported by this exchange" : "failed"}: ${detail}`,
+      },
+    ]),
+    affectsCoverage,
+  };
 }
 
 export async function discoverMarketCatalog(
@@ -670,30 +879,205 @@ export async function discoverMarketCatalog(
   ) {
     throw new RangeError("maximumConcurrentPages must be a positive integer");
   }
-  const listed = await listEntireUniverse(
-    exchange,
+  if (
+    options.rankingOrder !== undefined &&
+    options.membershipOrder === undefined
+  ) {
+    throw new RangeError("rankingOrder requires a stable membershipOrder");
+  }
+  const closingWithin = options.supplements?.closingWithin;
+  if (
+    closingWithin !== undefined &&
+    (!Number.isFinite(closingWithin.hours) ||
+      closingWithin.hours <= 0 ||
+      Number.isNaN(closingWithin.now.getTime()))
+  ) {
+    throw new RangeError(
+      "closingWithin requires positive hours and a valid time",
+    );
+  }
+  const listing = {
     pageSize,
     maximumPages,
-    undefined,
-    options.signal,
     maximumConcurrentPages,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.verificationDelaysMilliseconds === undefined
+      ? {}
+      : {
+          verificationDelaysMilliseconds:
+            options.verificationDelaysMilliseconds,
+        }),
+  };
+  const segments: CatalogSegmentAcquisition[] = [];
+  const optionalListing = async (
+    kind: CatalogSegmentAcquisition["kind"],
+    key: string | undefined,
+    affectsCoverage: boolean,
+    run: () => ReturnType<typeof listEntireUniverse>,
+  ): Promise<readonly Market[]> => {
+    try {
+      const listed = await run();
+      segments.push(
+        segmentFromListing(kind, key, listed.acquisition, 0, affectsCoverage),
+      );
+      return listed.markets;
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      segments.push(segmentFromFailure(kind, key, error, affectsCoverage));
+      return [];
+    }
+  };
+
+  // Rank before listing members: a market created between the two scans is
+  // then an unranked member instead of a ranked market missing from members.
+  const rankingOrder = options.rankingOrder;
+  const ranked =
+    rankingOrder === undefined
+      ? undefined
+      : await optionalListing("RANKING", undefined, false, () =>
+          listEntireUniverse(exchange, { ...listing, order: rankingOrder }),
+        );
+  const listed = await listEntireUniverse(exchange, {
+    ...listing,
+    ...(options.membershipOrder === undefined
+      ? {}
+      : { order: options.membershipOrder }),
+  });
+  const members = new Map(
+    listed.markets.map((market) => [market.slug, market]),
   );
-  const markets = [...listed.markets];
-  const bySlug = new Map(markets.map((market) => [market.slug, market]));
+  const markets: Market[] = [];
+  const bySlug = new Map<string, Market>();
+  const include = (market: Market): boolean => {
+    if (bySlug.has(market.slug)) return false;
+    bySlug.set(market.slug, market);
+    markets.push(market);
+    return true;
+  };
+  // A market missing from the membership list but seen by the ranking list is
+  // kept: an offset scan can skip rows when markets open or close mid-scan.
+  let rankingAdded = 0;
+  for (const market of ranked ?? []) {
+    const member = members.get(market.slug);
+    if (include(member ?? market) && member === undefined) rankingAdded += 1;
+  }
+  for (const market of listed.markets) include(market);
+  const rankingIndex = segments.findIndex(
+    (segment) => segment.kind === "RANKING",
+  );
+  const rankingSegment = segments[rankingIndex];
+  if (rankingSegment !== undefined) {
+    segments[rankingIndex] = {
+      ...rankingSegment,
+      addedMarketCount: rankingAdded,
+    };
+  }
+  // With a stable membership order, a few repeated rows only mean that markets
+  // opened or closed while the list was paged; many mean the order is unstable.
+  const churnTolerance = Math.max(
+    MEMBERSHIP_CHURN_MINIMUM_ROWS,
+    Math.ceil(listed.acquisition.uniqueMarketCount * MEMBERSHIP_CHURN_FRACTION),
+  );
+  const membershipChurn =
+    options.membershipOrder !== undefined &&
+    listed.acquisition.duplicateRowCount > 0 &&
+    listed.acquisition.duplicateRowCount <= churnTolerance;
+
+  const merge = (
+    index: number,
+    supplement: readonly Market[],
+  ): CatalogSegmentAcquisition | undefined => {
+    const segment = segments[index];
+    if (segment === undefined) return undefined;
+    const addedMarketCount = supplement.filter(include).length;
+    segments[index] = { ...segment, addedMarketCount };
+    return segments[index];
+  };
+  for (const category of options.supplements?.categories ?? []) {
+    const supplement = await optionalListing("CATEGORY", category, true, () =>
+      listEntireUniverse(exchange, {
+        ...listing,
+        ...(options.membershipOrder === undefined
+          ? {}
+          : { order: options.membershipOrder }),
+        categories: [category],
+      }),
+    );
+    merge(segments.length - 1, supplement);
+  }
+  if (closingWithin !== undefined) {
+    const order = closingWithin.order;
+    const key = `${closingWithin.hours}h`;
+    if (order === undefined) {
+      segments.push(
+        segmentFromFailure(
+          "CLOSING_SOON",
+          key,
+          new ExchangeError(
+            "No ascending close-time list order is available",
+            "UNSUPPORTED",
+          ),
+          true,
+        ),
+      );
+    } else {
+      const supplement = await optionalListing("CLOSING_SOON", key, true, () =>
+        listEntireUniverse(exchange, {
+          ...listing,
+          order,
+          closesBefore: new Date(
+            closingWithin.now.getTime() + closingWithin.hours * 3_600_000,
+          ),
+        }),
+      );
+      merge(segments.length - 1, supplement);
+    }
+  }
+
   const exchangeRanks = new Map(
     markets.map((market, index) => [market.slug, index + 1]),
   );
   const heldSlugs = new Set(
     snapshot.positions.map((position) => position.marketSlug),
   );
+  const incompleteSegments = segments.filter(
+    (segment) => segment.affectsCoverage && segment.coverage !== "COMPLETE",
+  );
+  const diagnostics = [
+    ...listed.acquisition.diagnostics.filter(
+      (diagnostic) =>
+        !membershipChurn || diagnostic.code !== "DUPLICATE_ROWS_ACROSS_PAGES",
+    ),
+    ...incompleteSegments.map((segment) => ({
+      code: "CATALOG_SUPPLEMENT_INCOMPLETE" as const,
+      message: `${segment.kind}${segment.key === undefined ? "" : ` ${segment.key}`} listing coverage was ${segment.coverage}: ${segment.diagnostics.map((diagnostic) => diagnostic.code).join(", ")}`,
+    })),
+  ];
+  const acquisition: CatalogAcquisition = {
+    ...listed.acquisition,
+    coverage: diagnostics.length === 0 ? "COMPLETE" : "DEGRADED",
+    diagnostics: Object.freeze(diagnostics),
+    ...(segments.length === 0 ? {} : { segments: Object.freeze(segments) }),
+  };
   const warnings: string[] = [];
-  if (listed.acquisition.coverage === "DEGRADED") {
+  if (acquisition.coverage === "DEGRADED") {
     warnings.push(
-      `CATALOG_COVERAGE_DEGRADED: ${listed.acquisition.diagnostics
+      `CATALOG_COVERAGE_DEGRADED: ${acquisition.diagnostics
         .map((diagnostic) => diagnostic.code)
         .join(
           ", ",
-        )}; ${listed.acquisition.uniqueMarketCount} markets from ${listed.acquisition.pages.length} list requests. A market absent from this catalog is unverified, not unavailable.`,
+        )}; ${markets.length} markets from ${acquisition.pages.length} membership list requests. A market absent from this catalog is unverified, not unavailable.`,
+    );
+  }
+  if (membershipChurn) {
+    warnings.push(
+      `CATALOG_LISTING_CHANGED_DURING_SCAN: ${listed.acquisition.duplicateRowCount} membership rows repeated (tolerance ${churnTolerance}) while markets opened or closed; ${rankingAdded} markets missing from the membership list were kept from the ranking list`,
+    );
+  }
+  const ranking = segments.find((segment) => segment.kind === "RANKING");
+  if (ranking !== undefined && ranking.coverage !== "COMPLETE") {
+    warnings.push(
+      `CATALOG_RANKING_PARTIAL: the ranking listing was ${ranking.coverage}; markets it did not return keep membership order after ranked markets`,
     );
   }
 
@@ -725,9 +1109,14 @@ export async function discoverMarketCatalog(
     heldSlugs,
     categoryCounts: categoryCounts(markets),
     exchangeRankingBasis:
-      exchange.id === "polymarket-us" ? "VOLUME_DESC" : "EXCHANGE_DEFAULT",
+      exchange.id === "polymarket-us" &&
+      (options.membershipOrder === undefined ||
+        (rankingOrder?.orderBy[0] === "volume" &&
+          rankingOrder.orderDirection === "desc"))
+        ? "VOLUME_DESC"
+        : "EXCHANGE_DEFAULT",
     warnings: Object.freeze(warnings),
-    acquisition: listed.acquisition,
+    acquisition,
   };
 }
 
@@ -1680,13 +2069,12 @@ export class MarketDiscoveryResolver {
     const pending = (async (): Promise<VolumeCatalogResolution> => {
       signal?.throwIfAborted();
       const { markets: exchangeMarkets, acquisition } =
-        await listEntireUniverse(
-          this.exchange,
-          this.pageSize,
-          this.maximumPages,
-          minimum,
-          signal,
-        );
+        await listEntireUniverse(this.exchange, {
+          pageSize: this.pageSize,
+          maximumPages: this.maximumPages,
+          minimumVolumeUsd: minimum,
+          ...(signal === undefined ? {} : { signal }),
+        });
       const exchangeBySlug = new Map(
         exchangeMarkets.map((market) => [market.slug, market]),
       );

@@ -50,6 +50,7 @@ const load = (exchange, options = {}) =>
   discoverMarketCatalog(exchange, snapshot, {
     pageSize: 5,
     maximumConcurrentPages: 4,
+    verificationDelaysMilliseconds: [0, 0, 0],
     ...options,
   });
 
@@ -104,8 +105,8 @@ test("an upstream stop at a batch boundary is verified and reported, not silent"
     ["EMPTY_TERMINAL_PAGE_AT_PAGE_BOUNDARY"],
   );
   assert.equal(catalog.acquisition.stopReason, "EMPTY_PAGE");
-  assert.equal(requests.filter((r) => r.offset === 20).length, 2);
-  assert.equal(requests.length, 9);
+  assert.equal(requests.filter((r) => r.offset === 20).length, 4);
+  assert.equal(requests.length, 11);
   const verification = catalog.acquisition.pages.at(-1);
   assert.equal(verification.verification, true);
   assert.equal(verification.offset, 20);
@@ -123,11 +124,23 @@ test("a transient empty boundary page is recovered on verification", async () =>
   assert.equal(catalog.acquisition.stopReason, "SHORT_PAGE");
 });
 
-test("an early end before later rows keeps every row and is reported", async () => {
+test("an early end before later rows is re-read and recovered", async () => {
   const { exchange } = scripted(catalogue(38, { transient: new Set([20]) }));
   const catalog = await load(exchange);
   assert.equal(catalog.markets.length, 38);
   assert.deepEqual([...new Set(catalog.markets.map((m) => m.slug))].length, 38);
+  assert.equal(catalog.acquisition.coverage, "COMPLETE");
+  assert(
+    catalog.acquisition.pages.some((p) => p.offset === 20 && p.verification),
+  );
+});
+
+test("an early end before later rows that stays empty is reported", async () => {
+  const { exchange } = scripted(({ offset, limit }) =>
+    offset === 20 ? [] : rows(offset, Math.min(38, offset + limit)),
+  );
+  const catalog = await load(exchange);
+  assert.equal(catalog.markets.length, 33);
   assert.equal(catalog.acquisition.coverage, "DEGRADED");
   assert.deepEqual(
     catalog.acquisition.diagnostics.map((d) => d.code),
@@ -149,13 +162,23 @@ test("rows repeated across pages are reported as a coverage risk", async () => {
   );
 });
 
-test("a list ending exactly on a page boundary is re-read once and stays flagged", async () => {
+test("a list ending exactly on a page boundary is re-read three times and stays flagged", async () => {
   // Indistinguishable from truncation without an explicit end marker.
   const { exchange, requests } = scripted(catalogue(20));
   const catalog = await load(exchange);
   assert.equal(catalog.markets.length, 20);
   assert.equal(catalog.acquisition.coverage, "DEGRADED");
-  assert.equal(requests.filter((r) => r.offset === 20).length, 2);
+  assert.equal(requests.filter((r) => r.offset === 20).length, 4);
+});
+
+test("an empty boundary page that persists for two re-reads is still recovered", async () => {
+  // Offset 20 opens the second batch; the whole batch is empty at first.
+  const { exchange } = scripted(({ offset, limit }, call) =>
+    offset >= 20 && call < 3 ? [] : rows(offset, Math.min(22, offset + limit)),
+  );
+  const catalog = await load(exchange);
+  assert.equal(catalog.markets.length, 22);
+  assert.equal(catalog.acquisition.coverage, "COMPLETE");
 });
 
 test("an explicit end marker after full pages is trusted without a repeat", async () => {
@@ -183,7 +206,7 @@ test("sequential pagination applies the same verification", async () => {
   const catalog = await load(exchange, { maximumConcurrentPages: 1 });
   assert.equal(catalog.markets.length, 20);
   assert.equal(catalog.acquisition.coverage, "DEGRADED");
-  assert.equal(requests.length, 6);
+  assert.equal(requests.length, 8);
   assert.deepEqual(
     catalog.acquisition.pages.map((p) => [p.cursor, p.verification]),
     [
@@ -192,6 +215,8 @@ test("sequential pagination applies the same verification", async () => {
       ["10", false],
       ["15", false],
       ["20", false],
+      ["20", true],
+      ["20", true],
       ["20", true],
     ],
   );

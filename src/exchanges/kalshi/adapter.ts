@@ -849,6 +849,12 @@ export class KalshiExchange implements PredictionExchange {
           "UNSUPPORTED",
         );
       }
+      if (query.categories !== undefined) {
+        throw new ExchangeError(
+          "Kalshi market discovery does not support category-filtered listing",
+          "UNSUPPORTED",
+        );
+      }
       if (query.closed === true && query.archived === undefined) {
         throw new ExchangeError(
           "Kalshi closed-market queries must specify the archived predicate",

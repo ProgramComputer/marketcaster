@@ -12,6 +12,7 @@ export function positionReductionDisabled(
 
 export type RiskRejectionCode =
   | "POSITION_REDUCTION_DISABLED"
+  | "NEW_ENTRIES_BLOCKED"
   | "MARKET_NOT_RESEARCHED"
   | "MARKET_NOT_FOUND"
   | "MARKET_INACTIVE"
