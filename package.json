@@ -29,6 +29,7 @@
     "check:observe": "node scripts/check-observe-policy.mjs",
     "check:source-and-reconciliation": "node --import tsx scripts/check-source-and-reconciliation.mjs",
     "check:memory-feedback": "node --import tsx scripts/check-memory-feedback.mjs",
+    "check:polymarket-fees": "node scripts/check-polymarket-fees.mjs",
     "check:risk-edge": "node scripts/check-risk-edge.mjs && node scripts/check-pass-edge-audit.mjs",
     "check:evidence-reading": "node scripts/check-evidence-reading.mjs",
     "check:source-provenance": "node scripts/check-source-provenance.mjs",

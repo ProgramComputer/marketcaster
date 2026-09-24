@@ -1,6 +1,8 @@
 import { Decimal } from "decimal.js";
 
-export const DEFAULT_TAKER_FEE_THETA = new Decimal("0.06");
+// https://docs.polymarket.us/fees — effective September 17, 2026.
+export const DEFAULT_TAKER_FEE_THETA = new Decimal("0.0695");
+export const POLYMARKET_US_MAKER_FEE_THETA = new Decimal("-0.0125");
 export const KALSHI_TAKER_FEE_THETA = new Decimal("0.07");
 const KALSHI_ROUNDING_RESERVE = new Decimal("0.01");
 const KALSHI_FEE_ROUNDING_INCREMENT = new Decimal("0.0001");
@@ -55,10 +57,44 @@ export function estimateExchangeTakerFee(
   quantity: Decimal,
   price: Decimal,
 ): Decimal {
+  if (exchangeId === "polymarket-us")
+    return estimatePolymarketUsFillFee(quantity, price, "TAKER");
   if (exchangeId !== "kalshi") return estimateTakerFee(quantity, price);
   return estimateTakerFee(quantity, price, KALSHI_TAKER_FEE_THETA)
     .toDecimalPlaces(4, Decimal.ROUND_CEIL)
     .plus(KALSHI_ROUNDING_RESERVE);
+}
+
+/** Signed single-fill fee: a maker rebate is negative, never a cash reserve. */
+export function estimatePolymarketUsFillFee(
+  quantity: Decimal,
+  price: Decimal,
+  liquidity: "TAKER" | "MAKER",
+): Decimal {
+  return estimateTakerFee(
+    quantity,
+    price,
+    liquidity === "MAKER"
+      ? POLYMARKET_US_MAKER_FEE_THETA
+      : DEFAULT_TAKER_FEE_THETA,
+  ).toDecimalPlaces(2, Decimal.ROUND_HALF_EVEN);
+}
+
+/**
+ * The exchange caps cumulative taker charges at the rounded cumulative exact
+ * fee. The maximum curve value over every executable price therefore bounds
+ * even fragmented fills. Do not credit possible maker or volume rebates here.
+ */
+export function estimatePolymarketUsTakerFeeUpperBound(
+  quantity: Decimal,
+  canonicalLimitPrice: Decimal,
+  action: "BUY" | "SELL",
+): Decimal {
+  return estimateTakerFeeUpperBound(
+    quantity,
+    canonicalLimitPrice,
+    action,
+  ).toDecimalPlaces(2, Decimal.ROUND_HALF_EVEN);
 }
 
 export function estimateKalshiTakerFeeUpperBound(
@@ -100,6 +136,9 @@ export function estimateExchangeTakerFeePerContract(
   exchangeId: string,
   price: Decimal,
 ): Decimal {
+  // A unit rate for price guards is not a one-contract fill; round only once
+  // the actual candidate quantity is known.
+  if (exchangeId === "polymarket-us") return estimateTakerFeePerContract(price);
   return estimateExchangeTakerFee(exchangeId, new Decimal(1), price);
 }
 
