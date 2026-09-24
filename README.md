@@ -83,6 +83,22 @@ The public reference board uses exchange order. Optional grouping and bounded
 enrichment mechanisms accept optional callbacks. Reference configuration
 values are illustrative safety and resource limits.
 
+On Polymarket US the catalog is listed twice. Markets in ascending ID order
+define membership, because volume order shifts between page requests and can
+repeat or skip rows. A volume listing with an ID tie-breaker ranks the members,
+and a market it returns that the membership list skipped is kept. An empty page
+directly after a full page is re-requested with increasing waits before it is
+accepted as the end of the list. Each cycle records page-level acquisition and
+reports `COMPLETE` or `DEGRADED` coverage; a few repeated membership rows from
+markets opening or closing mid-scan are reported without degrading coverage.
+
+`marketSelection.catalogSupplements` can list exchange categories, or a
+close-time horizon in hours, whose complete listings are merged into the
+catalog. A supplement that fails or is unsupported by the exchange degrades
+coverage. `marketSelection.degradedCatalogPolicy` is `WARN` by default;
+`BLOCK_NEW_ENTRIES` refuses BUY actions in markets without a current position
+while coverage is degraded, and tells the model so before research.
+
 Discovery output is untrusted catalog evidence. It never establishes settlement
 identity, source validity, correlation, executable liquidity, or permission to
 trade. Those facts are checked later against exact market details and refreshed

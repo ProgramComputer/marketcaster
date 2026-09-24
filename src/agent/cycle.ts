@@ -976,6 +976,8 @@ export async function runCycle(
       dependencies.logger,
       "market-discovery",
     );
+    const catalogSupplements =
+      dependencies.config.marketSelection.catalogSupplements;
     const discovery = await withStageTimeout(
       "market-discovery",
       dependencies.config.cycle.stageBudgetsSeconds.marketDiscovery === null
@@ -989,10 +991,50 @@ export async function runCycle(
             signal,
             // Polymarket US returns up to 500 rows and paginates correctly at
             // that boundary. Its numeric offsets also let four independent
-            // pages share the configured request gate without skipping rows.
+            // pages share the configured request gate. Volume order shifts
+            // between page requests (equal volumes reorder), repeating some
+            // rows and skipping others, so ascending IDs define membership and
+            // volume only ranks the members.
             ...(dependencies.exchange.id === "polymarket-us"
-              ? { pageSize: 500, maximumConcurrentPages: 4 }
+              ? {
+                  pageSize: 500,
+                  maximumConcurrentPages: 4,
+                  membershipOrder: {
+                    orderBy: ["id"],
+                    orderDirection: "asc" as const,
+                  },
+                  // The ID tie-breaker keeps equal volumes in one order.
+                  rankingOrder: {
+                    orderBy: ["volume", "id"],
+                    orderDirection: "desc" as const,
+                  },
+                }
               : {}),
+            ...(catalogSupplements === undefined
+              ? {}
+              : {
+                  supplements: {
+                    ...(catalogSupplements.categories === undefined
+                      ? {}
+                      : { categories: catalogSupplements.categories }),
+                    ...(catalogSupplements.closingWithinHours === undefined
+                      ? {}
+                      : {
+                          closingWithin: {
+                            hours: catalogSupplements.closingWithinHours,
+                            now: now(),
+                            ...(dependencies.exchange.id === "polymarket-us"
+                              ? {
+                                  order: {
+                                    orderBy: ["end_date", "id"],
+                                    orderDirection: "asc" as const,
+                                  },
+                                }
+                              : {}),
+                          },
+                        }),
+                  },
+                }),
           },
         );
         const marketDiscoveryResolver = new MarketDiscoveryResolver(
@@ -1162,6 +1204,15 @@ export async function runCycle(
     }
     const catalogCoverage =
       discovery.catalog.acquisition?.coverage ?? "UNKNOWN";
+    const newEntriesBlocked =
+      catalogCoverage === "DEGRADED" &&
+      dependencies.config.marketSelection.degradedCatalogPolicy ===
+        "BLOCK_NEW_ENTRIES"
+        ? {
+            reason:
+              "marketSelection.degradedCatalogPolicy=BLOCK_NEW_ENTRIES: the market catalog is incomplete this cycle, so BUY actions in markets without a current position are refused",
+          }
+        : undefined;
     const catalogLog = {
       catalogued: discovery.catalog.markets.length,
       categories: Object.keys(discovery.catalog.categoryCounts).length,
@@ -1173,6 +1224,15 @@ export async function runCycle(
       catalogDiagnostics: discovery.catalog.acquisition?.diagnostics.map(
         (diagnostic) => diagnostic.code,
       ),
+      catalogSegments: discovery.catalog.acquisition?.segments?.map(
+        (segment) => ({
+          kind: segment.kind,
+          key: segment.key,
+          coverage: segment.coverage,
+          added: segment.addedMarketCount,
+        }),
+      ),
+      newEntriesBlocked: newEntriesBlocked !== undefined,
     };
     if (catalogCoverage === "DEGRADED") {
       discoveryLogger.warn(
@@ -1309,6 +1369,7 @@ export async function runCycle(
           discovery.catalog.acquisition?.diagnostics.map(
             (diagnostic) => diagnostic.message,
           ) ?? [],
+        newEntriesBlocked: newEntriesBlocked !== undefined,
       },
       opportunityBoard,
       // The terminal plan must explicitly address the complete held portfolio.
@@ -1550,6 +1611,7 @@ export async function runCycle(
           ...discovery.catalog.heldSlugs,
           ...researchTools.inspectedMarketSlugs,
         ]),
+        ...(newEntriesBlocked === undefined ? {} : { newEntriesBlocked }),
         freshProbabilityByMarketSlug:
           freshLive.selectedSideProbabilityByMarketSlug,
         requireFreshProbabilityMarketSlugs: freshLive.requiredMarketSlugs,

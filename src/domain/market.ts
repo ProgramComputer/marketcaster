@@ -126,6 +126,8 @@ export interface MarketQuery {
   readonly orderBy?: readonly string[];
   readonly orderDirection?: "asc" | "desc";
   readonly minimumVolumeUsd?: Decimal;
+  /** Exchange category keys; adapters without category filters reject it. */
+  readonly categories?: readonly string[];
 }
 
 export type MarketGroupKind = "TAG" | "EVENT" | "SERIES";

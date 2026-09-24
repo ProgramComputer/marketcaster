@@ -402,6 +402,9 @@ export class PolymarketUsExchange implements PredictionExchange {
         ...(query.orderDirection === undefined
           ? {}
           : { orderDirection: query.orderDirection }),
+        ...(query.categories === undefined
+          ? {}
+          : { categories: [...query.categories] }),
         ...(query.minimumVolumeUsd === undefined
           ? {}
           : {

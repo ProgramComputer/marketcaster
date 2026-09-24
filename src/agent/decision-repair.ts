@@ -9,7 +9,11 @@ import type { RiskRejectionCode } from "../risk/policy.js";
 export function isRepairableRiskRejection(code: RiskRejectionCode): boolean {
   // Infrastructure failures and an operator-disabled capability cannot be
   // repaired by changing the model's intended portfolio.
-  return code !== "EXCHANGE_ERROR" && code !== "POSITION_REDUCTION_DISABLED";
+  return (
+    code !== "EXCHANGE_ERROR" &&
+    code !== "POSITION_REDUCTION_DISABLED" &&
+    code !== "NEW_ENTRIES_BLOCKED"
+  );
 }
 
 /** Keep policy-blocked intent visible while independent targets are repaired. */
@@ -113,6 +117,13 @@ export function buildTerminalDecisionRepairFeedback(
       )
         ? [
             "POSITION_REDUCTION_DISABLED is a fixed runtime policy, not a repair opportunity. Its original requested reduction and rejection will be retained. Repair only independent issues; do not replace the blocked reduction with a hold or try to override the policy.",
+          ]
+        : []),
+      ...(validation.rejected.some(
+        (rejection) => rejection.code === "NEW_ENTRIES_BLOCKED",
+      )
+        ? [
+            "NEW_ENTRIES_BLOCKED is fixed for this cycle: BUY targets in markets without a current position cannot execute. Drop them or record them as passes; do not research replacements.",
           ]
         : []),
       "Use fresh evidence or research to correct a target, replace it, or omit it. Do not invent evidence or change a probability merely to force validation to pass.",

@@ -136,6 +136,24 @@ export const RepositoryConfigSchema = z
         familyScouts: FamilyScoutConfigSchema.extend({
           scoringWeights: FamilyScoutScoringWeightsSchema,
         }).optional(),
+        /** Listings that must be complete in every cycle's catalog. */
+        catalogSupplements: z
+          .object({
+            categories: z
+              .array(z.string().min(1))
+              .min(1)
+              .max(20)
+              .refine(
+                (values) => new Set(values).size === values.length,
+                "Catalog supplement categories must be unique",
+              )
+              .optional(),
+            closingWithinHours: z.number().positive().max(168).optional(),
+          })
+          .strict()
+          .optional(),
+        /** WARN (default) or refuse new-market entries when coverage is degraded. */
+        degradedCatalogPolicy: z.enum(["WARN", "BLOCK_NEW_ENTRIES"]).optional(),
       })
       .strict()
       .superRefine((value, context) => {

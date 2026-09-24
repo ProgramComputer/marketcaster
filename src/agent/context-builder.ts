@@ -79,6 +79,8 @@ export interface BuildAgentContextInput {
     readonly categoryCounts: Readonly<Record<string, number>>;
     readonly coverage?: "COMPLETE" | "DEGRADED" | "UNKNOWN";
     readonly coverageDiagnostics?: readonly string[];
+    /** New-market BUYs are refused this cycle because coverage is degraded. */
+    readonly newEntriesBlocked?: boolean;
   };
   readonly opportunityBoard?: readonly OpportunityBoardItem[];
   readonly preloadedMarkets: readonly PreloadedMarketInput[];
@@ -253,6 +255,8 @@ export interface AgentContext {
     readonly fullUniverseSearchable: boolean;
     readonly catalogCoverage: "COMPLETE" | "DEGRADED" | "UNKNOWN";
     readonly catalogCoverageDiagnostics: readonly string[];
+    readonly newEntriesBlocked: boolean;
+    readonly newEntriesBlockedReason?: string;
     readonly discoveryModes: readonly [
       "ALL",
       "KEYWORD",
@@ -794,6 +798,13 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
         (input.marketCatalog.coverage ?? "UNKNOWN") !== "DEGRADED",
       catalogCoverage: input.marketCatalog.coverage ?? "UNKNOWN",
       catalogCoverageDiagnostics: input.marketCatalog.coverageDiagnostics ?? [],
+      newEntriesBlocked: input.marketCatalog.newEntriesBlocked === true,
+      ...(input.marketCatalog.newEntriesBlocked === true
+        ? {
+            newEntriesBlockedReason:
+              "The market catalog behind this cycle is incomplete, so BUY targets in markets without a current position are refused with NEW_ENTRIES_BLOCKED. Review holdings and record passes; do not spend research on new entries.",
+          }
+        : {}),
       discoveryModes: [
         "ALL",
         "KEYWORD",

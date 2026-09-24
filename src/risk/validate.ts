@@ -137,6 +137,11 @@ export interface ValidateProposalsInput {
   readonly knownMarkets?: ReadonlyMap<string, Market>;
   readonly permittedMarketSlugs?: ReadonlySet<string>;
   /**
+   * Refuses BUY actions in markets without a current position, for example
+   * when the market catalog behind this cycle's search was incomplete.
+   */
+  readonly newEntriesBlocked?: { readonly reason: string };
+  /**
    * Fresh deterministic selected-side probabilities for markets whose event
    * state can change during a model turn. When a slug is required but absent,
    * validation fails closed instead of treating a favorable price move as new
@@ -1247,6 +1252,25 @@ export async function validateProposals(
           code: "POSITION_REDUCTION_DISABLED",
           reason:
             "Canonical SELL actions are disabled by risk.allowPositionReductions",
+        },
+      });
+      continue;
+    }
+    if (
+      input.newEntriesBlocked !== undefined &&
+      submittedProposal.action === "BUY" &&
+      !input.snapshot.positions.some(
+        (position) =>
+          position.marketSlug === submittedProposal.marketSlug &&
+          position.quantity.gt(0),
+      )
+    ) {
+      indexedRejections.push({
+        proposalIndex,
+        rejection: {
+          proposal: submittedProposal,
+          code: "NEW_ENTRIES_BLOCKED",
+          reason: input.newEntriesBlocked.reason,
         },
       });
       continue;

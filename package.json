@@ -12,7 +12,7 @@
     "build": "tsc -p tsconfig.build.json",
     "check:position-reductions": "node scripts/check-position-reductions.mjs && node scripts/check-position-reduction-context.mjs && node scripts/check-position-reduction-cycle.mjs",
     "check:overrides": "node scripts/check-runtime-overrides.mjs",
-    "check:discovery-compatibility": "node scripts/check-null-quotes.mjs && node scripts/check-discovery-timeout.mjs && node scripts/check-catalog-acquisition.mjs",
+    "check:discovery-compatibility": "node scripts/check-null-quotes.mjs && node scripts/check-discovery-timeout.mjs && node scripts/check-catalog-acquisition.mjs && node scripts/check-catalog-coverage-policy.mjs",
     "cycle": "node dist/src/index.js",
     "dev": "tsx src/index.ts",
     "experiment:market-selection": "node dist/src/experiments/market-selection.js",
