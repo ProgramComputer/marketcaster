@@ -33,7 +33,7 @@ import type {
 } from "../../domain/order.js";
 import type { Position } from "../../domain/position.js";
 import type { MarketId, Page } from "../../domain/primitives.js";
-import { estimateTakerFeeUpperBound } from "../../risk/edge.js";
+import { estimatePolymarketUsTakerFeeUpperBound } from "../../risk/edge.js";
 import { ExchangeError, type PredictionExchange } from "../exchange.js";
 import {
   assertSafeMemoryScope,
@@ -1084,7 +1084,7 @@ export class PolymarketUsExchange implements PredictionExchange {
     order: ImmediateOrder,
   ): Promise<(quantity: Decimal) => Decimal> {
     return Promise.resolve((quantity: Decimal) =>
-      estimateTakerFeeUpperBound(
+      estimatePolymarketUsTakerFeeUpperBound(
         quantity,
         order.canonicalLimitPrice,
         order.action,
