@@ -34,7 +34,6 @@ const ANTHROPIC_MESSAGES_ENDPOINT = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_API_VERSION = "2023-06-01";
 const ANTHROPIC_CACHE_DIAGNOSTICS_BETA = "cache-diagnosis-2026-04-07";
 const ANTHROPIC_CONTEXT_PRESSURE_INPUT_TOKENS = 175_000;
-const ANTHROPIC_CONTEXT_PRESSURE_OUTPUT_TOKENS = 4096;
 // Claude versions from these onward reject forced tool_choice and bind thinking
 // blocks to an append-only conversation. Later versions inherit the behavior.
 const ANTHROPIC_APPEND_ONLY_MINIMUM_VERSIONS: ReadonlyMap<
@@ -641,12 +640,7 @@ export class AnthropicDecisionProvider implements DecisionProvider {
           const comparedMessageId = diagnosticsPreviousMessageId;
           const requestBody = {
             model: requestModelId,
-            max_tokens: contextPressure
-              ? Math.min(
-                  limits.maximumOutputTokens,
-                  ANTHROPIC_CONTEXT_PRESSURE_OUTPUT_TOKENS,
-                )
-              : limits.maximumOutputTokens,
+            max_tokens: limits.maximumOutputTokens,
             system: [
               {
                 type: "text",
