@@ -356,40 +356,43 @@ try {
     false,
   );
 
-  for (const pressureCase of [
-    {
-      name: "below",
-      usage: {
-        input_tokens: 99_999,
-        cache_creation_input_tokens: 40_000,
-        cache_read_input_tokens: 35_000,
-        output_tokens: 10,
-      },
-      expectedMaxTokens: 6_000,
-      terminal: false,
-    },
-    {
-      name: "at-threshold",
-      usage: {
-        input_tokens: 100_000,
-        cache_creation_input_tokens: 40_000,
-        cache_read_input_tokens: 35_000,
-        output_tokens: 10,
-      },
-      expectedMaxTokens: 4_096,
-      terminal: true,
-    },
-    {
-      name: "configured-below-cap",
-      usage: { input_tokens: 175_000, output_tokens: 10 },
-      configuredMaxTokens: 2_048,
-      expectedMaxTokens: 2_048,
-      terminal: true,
-    },
-  ]) {
+  for (const [pressureModelId, pressureCase] of [OPUS_55, LEGACY].flatMap(
+    (modelId) =>
+      [
+        {
+          name: "below",
+          usage: {
+            input_tokens: 99_999,
+            cache_creation_input_tokens: 40_000,
+            cache_read_input_tokens: 35_000,
+            output_tokens: 10,
+          },
+          expectedMaxTokens: 6_000,
+          terminal: false,
+        },
+        {
+          name: "at-threshold",
+          usage: {
+            input_tokens: 100_000,
+            cache_creation_input_tokens: 40_000,
+            cache_read_input_tokens: 35_000,
+            output_tokens: 10,
+          },
+          expectedMaxTokens: 6_000,
+          terminal: true,
+        },
+        {
+          name: "configured-limit",
+          usage: { input_tokens: 175_000, output_tokens: 10 },
+          configuredMaxTokens: 2_048,
+          expectedMaxTokens: 2_048,
+          terminal: true,
+        },
+      ].map((pressureCase) => [modelId, pressureCase]),
+  )) {
     let pressureNoteCalls = 0;
     const contextPressure = harness({
-      modelId: OPUS_55,
+      modelId: pressureModelId,
       maximumRounds: 3,
       maximumOutputTokens: pressureCase.configuredMaxTokens ?? 6_000,
       toolOptions: {
@@ -438,12 +441,19 @@ try {
       contextPressure.requests[1].max_tokens,
       pressureCase.expectedMaxTokens,
     );
-    assert.equal(
-      /terminal submission/u.test(
-        contextPressure.requests[1].messages.at(-1).content,
-      ),
-      pressureCase.terminal,
-    );
+    if (pressureModelId === OPUS_55) {
+      assert.equal(
+        /terminal submission/u.test(
+          contextPressure.requests[1].messages.at(-1).content,
+        ),
+        pressureCase.terminal,
+      );
+    } else {
+      assert.equal(
+        contextPressure.requests[1].tool_choice.type,
+        pressureCase.terminal ? "tool" : "any",
+      );
+    }
     assertAllPreservedPrefixes(contextPressure);
     assert.equal(pressureNoteCalls, pressureCase.terminal ? 1 : 2);
   }
