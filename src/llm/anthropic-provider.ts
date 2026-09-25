@@ -534,20 +534,19 @@ export class AnthropicDecisionProvider implements DecisionProvider {
               ),
             ]);
           }
+          // Schema correction keeps the full tool list, including server web
+          // search, and forces submit_trade_plan through tool_choice as the
+          // final round does, so the cached tools -> system -> messages prefix
+          // stays identical to the preceding request.
           const definitions = preserveConversation
             ? (preservedDefinitions ?? roundDefinitions)
             : useCatalogModel
               ? definitionsForCatalogModel(roundDefinitions)
-              : schemaCorrectionRound
-                ? roundDefinitions.filter(
-                    (definition) => definition.name === "submit_trade_plan",
-                  )
-                : roundDefinitions;
+              : roundDefinitions;
           const remainingServerWebSearches =
             limits.maximumWebSearches - serverWebSearchCount;
           const useServerWebSearch =
-            (preserveConversation ||
-              (!schemaCorrectionRound && !useCatalogModel)) &&
+            (preserveConversation || !useCatalogModel) &&
             !input.researchTools.hasClientWebSearchHandler &&
             limits.maximumWebSearches > 0;
           const providerTools: Record<string, unknown>[] = [
