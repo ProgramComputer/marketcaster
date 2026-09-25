@@ -388,12 +388,26 @@ try {
           expectedMaxTokens: 2_048,
           terminal: true,
         },
+        {
+          // Server-search usage is summed across the search loop, so it is
+          // not a single prompt size and cannot force the final round.
+          name: "summed-server-search",
+          usage: {
+            input_tokens: 175_000,
+            output_tokens: 10,
+            server_tool_use: { web_search_requests: 1 },
+          },
+          maximumWebSearches: 1,
+          expectedMaxTokens: 6_000,
+          terminal: false,
+        },
       ].map((pressureCase) => [modelId, pressureCase]),
   )) {
     let pressureNoteCalls = 0;
     const contextPressure = harness({
       modelId: pressureModelId,
       maximumRounds: 3,
+      maximumWebSearches: pressureCase.maximumWebSearches ?? 0,
       maximumOutputTokens: pressureCase.configuredMaxTokens ?? 6_000,
       toolOptions: {
         agentNotesHandler: async () => {
