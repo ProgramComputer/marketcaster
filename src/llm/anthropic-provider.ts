@@ -35,7 +35,20 @@ const ANTHROPIC_API_VERSION = "2023-06-01";
 const ANTHROPIC_CACHE_DIAGNOSTICS_BETA = "cache-diagnosis-2026-04-07";
 const ANTHROPIC_CONTEXT_PRESSURE_INPUT_TOKENS = 175_000;
 const ANTHROPIC_CONTEXT_PRESSURE_OUTPUT_TOKENS = 4096;
-const ANTHROPIC_OPUS_55_MODEL_ID = "claude-opus-5-5";
+// Claude versions from these onward reject forced tool_choice and bind thinking
+// blocks to an append-only conversation. Later versions inherit the behavior.
+const ANTHROPIC_APPEND_ONLY_MINIMUM_VERSIONS: ReadonlyMap<
+  string,
+  readonly [number, number]
+> = new Map([
+  ["opus", [5, 5]],
+  ["sonnet", [5, 5]],
+  ["haiku", [5, 5]],
+  ["fable", [5, 1]],
+  ["mythos", [5, 1]],
+]);
+const ANTHROPIC_MODEL_VERSION_PATTERN =
+  /(?:^|[^a-z0-9])claude-(opus|sonnet|haiku|fable|mythos)-(\d{1,2})(?:-(\d{1,2}))?(?![0-9])/u;
 const ANTHROPIC_STABLE_CACHE_CONTROL = {
   type: "ephemeral",
   ttl: "1h",
@@ -309,7 +322,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function requiresAppendOnlyAnthropicConversation(modelId: string): boolean {
-  return modelId === ANTHROPIC_OPUS_55_MODEL_ID;
+  const match = ANTHROPIC_MODEL_VERSION_PATTERN.exec(
+    modelId.toLocaleLowerCase("en-US"),
+  );
+  const minimum =
+    match?.[1] === undefined
+      ? undefined
+      : ANTHROPIC_APPEND_ONLY_MINIMUM_VERSIONS.get(match[1]);
+  if (match === null || minimum === undefined) return false;
+  const major = Number(match[2]);
+  const minor = Number(match[3] ?? 0);
+  return major > minimum[0] || (major === minimum[0] && minor >= minimum[1]);
 }
 
 type AnthropicDecisionPhase =
