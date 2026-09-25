@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { aggregateCacheDiagnostics } from "../dist/src/agent/cycle.js";
 import { loadPromptBundle } from "../dist/src/config/prompts.js";
 import { DecisionResearchTools } from "../dist/src/llm/research-tools.js";
 import { AnthropicDecisionProvider } from "../dist/src/llm/anthropic-provider.js";
@@ -100,3 +101,59 @@ assert.equal(researchCorrection.length, 2);
 assertStablePrefix(researchCorrection);
 assert.deepEqual(researchCorrection[0].tool_choice, { type: "any" });
 assert.deepEqual(researchCorrection[1].tool_choice, forcedSubmission);
+
+// A correction round that changes the prefix is one miss. The next round is
+// still diagnosed against the correction request, but reads an older cache
+// entry covering its whole prompt, so it adds no missed input tokens.
+const diagnosticRound = (round, usage, cacheDiagnostic) => ({
+  round,
+  response: {},
+  toolCalls: [],
+  toolResults: [],
+  providerWebSearchCount: 0,
+  diagnosticsPreviousMessageId: round === 1 ? null : `synthetic-${round - 1}`,
+  tokenUsage: { outputTokens: 10, ...usage },
+  cacheDiagnostic,
+});
+const unchanged = { state: "DIAGNOSTICS_NULL" };
+const toolsChanged = {
+  state: "CACHE_MISS",
+  reasonType: "tools_changed",
+  missedInputTokens: 30_000,
+};
+const diagnostics = aggregateCacheDiagnostics([
+  diagnosticRound(
+    1,
+    { inputTokens: 20, cachedInputTokens: 0, cacheCreationInputTokens: 30_000 },
+    unchanged,
+  ),
+  diagnosticRound(
+    2,
+    {
+      inputTokens: 20,
+      cachedInputTokens: 29_980,
+      cacheCreationInputTokens: 5_000,
+    },
+    unchanged,
+  ),
+  diagnosticRound(
+    3,
+    { inputTokens: 20, cachedInputTokens: 0, cacheCreationInputTokens: 33_000 },
+    toolsChanged,
+  ),
+  diagnosticRound(
+    4,
+    {
+      inputTokens: 20,
+      cachedInputTokens: 35_000,
+      cacheCreationInputTokens: 4_000,
+    },
+    toolsChanged,
+  ),
+]);
+assert.deepEqual(diagnostics.missReasonCounts, { tools_changed: 2 });
+assert.equal(
+  diagnostics.missedInputTokens,
+  30_000,
+  "A recovered prefix is not counted as a second miss",
+);
