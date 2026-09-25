@@ -34,11 +34,23 @@ const ANTHROPIC_MESSAGES_ENDPOINT = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_API_VERSION = "2023-06-01";
 const ANTHROPIC_CACHE_DIAGNOSTICS_BETA = "cache-diagnosis-2026-04-07";
 const ANTHROPIC_CONTEXT_PRESSURE_INPUT_TOKENS = 175_000;
-const ANTHROPIC_CONTEXT_PRESSURE_OUTPUT_TOKENS = 4096;
-const ANTHROPIC_STABLE_CACHE_CONTROL = {
-  type: "ephemeral",
-  ttl: "1h",
-} as const;
+// Claude versions from these onward reject forced tool_choice and bind thinking
+// blocks to an append-only conversation. Later versions inherit the behavior.
+const ANTHROPIC_APPEND_ONLY_MINIMUM_VERSIONS: ReadonlyMap<
+  string,
+  readonly [number, number]
+> = new Map([
+  ["opus", [5, 5]],
+  ["sonnet", [5, 5]],
+  ["haiku", [5, 5]],
+  ["fable", [5, 1]],
+  ["mythos", [5, 1]],
+]);
+const ANTHROPIC_MODEL_VERSION_PATTERN =
+  /(?:^|[^a-z0-9])claude-(opus|sonnet|haiku|fable|mythos)-(\d{1,2})(?:-(\d{1,2}))?(?![0-9])/u;
+// Decision rounds start seconds apart, so the default five-minute TTL stays
+// warm without the doubled one-hour write price.
+const ANTHROPIC_STABLE_CACHE_CONTROL = { type: "ephemeral" } as const;
 const TokenCountSchema = z.number().int().nonnegative();
 
 const AnthropicCacheMissReasonSchema = z
@@ -110,6 +122,15 @@ const AnthropicServerWebSearchResultSchema = z
   })
   .loose();
 
+const AnthropicServerToolUseSchema = z
+  .object({
+    type: z.literal("server_tool_use"),
+    id: z.string().min(1),
+    name: z.string().min(1),
+    input: z.unknown(),
+  })
+  .loose();
+
 function serverWebSearchResultSucceeded(
   result: z.infer<typeof AnthropicServerWebSearchResultSchema>,
 ): boolean {
@@ -127,6 +148,32 @@ function serverWebSearchResultSucceeded(
       type.toLocaleLowerCase("en-US").includes("error")
     );
   });
+}
+
+function validPreservedServerWebSearchResult(
+  result: z.infer<typeof AnthropicServerWebSearchResultSchema>,
+): boolean {
+  if (!Object.hasOwn(result, "content")) return false;
+  const content = result.content;
+  if (Array.isArray(content)) {
+    return content.every(
+      (item) =>
+        isRecord(item) &&
+        item.type === "web_search_result" &&
+        typeof item.url === "string" &&
+        typeof item.title === "string" &&
+        typeof item.encrypted_content === "string" &&
+        (item.page_age === undefined ||
+          item.page_age === null ||
+          typeof item.page_age === "string"),
+    );
+  }
+  return (
+    isRecord(content) &&
+    content.type === "web_search_tool_result_error" &&
+    typeof content.error_code === "string" &&
+    content.error_code.length > 0
+  );
 }
 
 export interface AnthropicDecisionProviderOptions {
@@ -272,6 +319,64 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function requiresAppendOnlyAnthropicConversation(modelId: string): boolean {
+  const match = ANTHROPIC_MODEL_VERSION_PATTERN.exec(
+    modelId.toLocaleLowerCase("en-US"),
+  );
+  const minimum =
+    match?.[1] === undefined
+      ? undefined
+      : ANTHROPIC_APPEND_ONLY_MINIMUM_VERSIONS.get(match[1]);
+  if (match === null || minimum === undefined) return false;
+  const major = Number(match[2]);
+  const minor = Number(match[3] ?? 0);
+  return major > minimum[0] || (major === minimum[0] && minor >= minimum[1]);
+}
+
+type AnthropicDecisionPhase =
+  | "catalog"
+  | "research"
+  | "final"
+  | "schema-correction"
+  | "repair-research"
+  | "repair-final";
+
+function anthropicPhaseInstruction(phase: AnthropicDecisionPhase): string {
+  switch (phase) {
+    case "catalog":
+      return "Current phase: catalog narrowing. Use only catalog tools. When narrowing is complete, call continue_with_primary_model by itself. Do not call research, persistence, preview, server-search, or submission tools.";
+    case "research":
+      return "Current phase: primary research. Use only the authorized research tools, or call submit_trade_plan by itself when the plan is ready. Do not call continue_with_primary_model.";
+    case "final":
+      return "Current phase: terminal submission. Call submit_trade_plan exactly once and do not call any other client or server tool. Prose is not a submitted plan.";
+    case "schema-correction":
+      return "Current phase: schema correction. Correct the rejected plan and call submit_trade_plan exactly once. Do not call research, catalog, persistence, preview, handoff, or server tools.";
+    case "repair-research":
+      return "Current phase: substantive decision repair. Research is reopened within the remaining limits. Use only authorized primary-model research tools, or call submit_trade_plan by itself when the replacement plan is ready.";
+    case "repair-final":
+      return "Current phase: final substantive-repair submission. Call submit_trade_plan exactly once and do not call any other client or server tool. Prose is not a replacement plan.";
+  }
+}
+
+function appendAnthropicPhaseInstruction(
+  messages: unknown[],
+  instruction: string,
+  requestAlreadySent: boolean,
+): void {
+  if (!requestAlreadySent) {
+    const initialMessage = messages[0];
+    if (
+      isRecord(initialMessage) &&
+      initialMessage.role === "user" &&
+      typeof initialMessage.content === "string"
+    ) {
+      initialMessage.content = `${initialMessage.content}\n\n${instruction}`;
+      return;
+    }
+  }
+  messages.push({ role: "user", content: instruction });
+}
+
 function transferableAnthropicMessages(
   messages: readonly unknown[],
 ): unknown[] {
@@ -372,6 +477,22 @@ export class AnthropicDecisionProvider implements DecisionProvider {
         let diagnosticsPreviousMessageId = this.#previousMessageId;
         let catalogPhaseActive = this.catalogModelId !== undefined;
         let previousRequestModelId: string | undefined;
+        let previousPhase: AnthropicDecisionPhase | undefined;
+        const pendingServerToolUseIds = new Set<string>();
+        const seenToolCallIds = new Set<string>();
+        const seenServerToolResultIds = new Set<string>();
+        let preservedDefinitions:
+          | readonly {
+              readonly name: string;
+              readonly description: string;
+              readonly inputSchema: Readonly<Record<string, unknown>>;
+            }[]
+          | undefined;
+        const preserveConversation = [this.modelId, this.catalogModelId].some(
+          (modelId) =>
+            modelId !== undefined &&
+            requiresAppendOnlyAnthropicConversation(modelId),
+        );
         while (
           schemaCorrectionPending ||
           (repairActive
@@ -399,6 +520,7 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             ? (this.catalogModelId ?? this.modelId)
             : this.modelId;
           if (
+            !preserveConversation &&
             previousRequestModelId !== undefined &&
             previousRequestModelId !== requestModelId
           ) {
@@ -418,18 +540,34 @@ export class AnthropicDecisionProvider implements DecisionProvider {
           const roundDefinitions = input.researchTools.definitionsForRound(
             finalRound || schemaCorrectionRound,
           );
-          const definitions = useCatalogModel
-            ? definitionsForCatalogModel(roundDefinitions)
-            : schemaCorrectionRound
-              ? roundDefinitions.filter(
-                  (definition) => definition.name === "submit_trade_plan",
-                )
+          if (preserveConversation && preservedDefinitions === undefined) {
+            const routedDefinitions =
+              this.catalogModelId === undefined
+                ? []
+                : definitionsForCatalogModel(roundDefinitions);
+            preservedDefinitions = Object.freeze([
+              ...roundDefinitions,
+              ...routedDefinitions.filter(
+                (definition) =>
+                  !roundDefinitions.some(
+                    (candidate) => candidate.name === definition.name,
+                  ),
+              ),
+            ]);
+          }
+          // Schema correction keeps the full tool list, including server web
+          // search, and forces submit_trade_plan through tool_choice as the
+          // final round does, so the cached tools -> system -> messages prefix
+          // stays identical to the preceding request.
+          const definitions = preserveConversation
+            ? (preservedDefinitions ?? roundDefinitions)
+            : useCatalogModel
+              ? definitionsForCatalogModel(roundDefinitions)
               : roundDefinitions;
           const remainingServerWebSearches =
             limits.maximumWebSearches - serverWebSearchCount;
           const useServerWebSearch =
-            !schemaCorrectionRound &&
-            !useCatalogModel &&
+            (preserveConversation || !useCatalogModel) &&
             !input.researchTools.hasClientWebSearchHandler &&
             limits.maximumWebSearches > 0;
           const providerTools: Record<string, unknown>[] = [
@@ -461,19 +599,47 @@ export class AnthropicDecisionProvider implements DecisionProvider {
           if (finalProviderTool !== undefined) {
             finalProviderTool.cache_control = ANTHROPIC_STABLE_CACHE_CONTROL;
           }
-          const toolChoice =
-            finalRound || schemaCorrectionRound
+          const phase: AnthropicDecisionPhase = useCatalogModel
+            ? "catalog"
+            : schemaCorrectionRound
+              ? "schema-correction"
+              : repairActive
+                ? finalRound
+                  ? "repair-final"
+                  : "repair-research"
+                : finalRound
+                  ? "final"
+                  : "research";
+          if (
+            preserveConversation &&
+            pendingServerToolUseIds.size > 0 &&
+            phase !== "research" &&
+            phase !== "repair-research"
+          ) {
+            throw new DecisionProviderError(
+              "Anthropic left a server tool unresolved before a restricted decision phase",
+              "INVALID_RESPONSE",
+            );
+          }
+          if (preserveConversation && phase !== previousPhase) {
+            appendAnthropicPhaseInstruction(
+              messages,
+              anthropicPhaseInstruction(phase),
+              transcriptRound > 1,
+            );
+            previousPhase = phase;
+          }
+          const toolChoice = requiresAppendOnlyAnthropicConversation(
+            requestModelId,
+          )
+            ? { type: "auto" }
+            : finalRound || schemaCorrectionRound
               ? { type: "tool", name: "submit_trade_plan" }
               : { type: "any" };
           const comparedMessageId = diagnosticsPreviousMessageId;
           const requestBody = {
             model: requestModelId,
-            max_tokens: contextPressure
-              ? Math.min(
-                  limits.maximumOutputTokens,
-                  ANTHROPIC_CONTEXT_PRESSURE_OUTPUT_TOKENS,
-                )
-              : limits.maximumOutputTokens,
+            max_tokens: limits.maximumOutputTokens,
             system: [
               {
                 type: "text",
@@ -549,6 +715,12 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             const parsed = AnthropicToolUseSchema.safeParse(item);
             return parsed.success ? [parsed.data] : [];
           });
+          const serverToolCalls = parsedResponse.data.content.flatMap(
+            (item) => {
+              const parsed = AnthropicServerToolUseSchema.safeParse(item);
+              return parsed.success ? [parsed.data] : [];
+            },
+          );
           const transcriptToolCalls: DecisionToolCallTranscript[] = calls.map(
             (call) => ({
               callId: call.id,
@@ -570,18 +742,217 @@ export class AnthropicDecisionProvider implements DecisionProvider {
           const successfulServerWebSearchCount = serverWebSearchResults.filter(
             serverWebSearchResultSucceeded,
           ).length;
-          const observedServerWebSearches =
-            parsedResponse.data.usage?.server_tool_use?.web_search_requests ??
-            completedServerWebSearchIds.size;
+          const reportedServerWebSearches =
+            parsedResponse.data.usage?.server_tool_use?.web_search_requests;
+          let observedServerWebSearches =
+            reportedServerWebSearches ?? completedServerWebSearchIds.size;
+          let providerWebSearchAttemptsToRecord = observedServerWebSearches;
+          let providerWebSearchSuccessesToRecord = Math.min(
+            observedServerWebSearches,
+            successfulServerWebSearchCount,
+          );
           const observedTokenUsage =
             parsedResponse.data.usage === undefined
               ? undefined
               : tokenUsage(parsedResponse.data.usage);
-          if (parsedResponse.data.usage !== undefined) {
+          // A response that ran a server search reports input summed across the
+          // search loop's sampling steps, so keep the last single-pass size.
+          if (
+            parsedResponse.data.usage !== undefined &&
+            (parsedResponse.data.usage.server_tool_use?.web_search_requests ??
+              0) === 0
+          ) {
             previousInputTokens = inputTokenCount(parsedResponse.data.usage);
           }
           const toolResults: unknown[] = [];
           try {
+            if (preserveConversation) {
+              const malformedToolBlock = parsedResponse.data.content.some(
+                (item) =>
+                  isRecord(item) &&
+                  ((item.type === "tool_use" &&
+                    !AnthropicToolUseSchema.safeParse(item).success) ||
+                    (item.type === "server_tool_use" &&
+                      !AnthropicServerToolUseSchema.safeParse(item).success) ||
+                    (item.type === "web_search_tool_result" &&
+                      !AnthropicServerWebSearchResultSchema.safeParse(item)
+                        .success)),
+              );
+              if (malformedToolBlock) {
+                throw new DecisionProviderError(
+                  "Anthropic returned a malformed tool-call block",
+                  "INVALID_RESPONSE",
+                );
+              }
+              const callIds = [
+                ...calls.map((call) => call.id),
+                ...serverToolCalls.map((call) => call.id),
+              ];
+              if (
+                new Set(callIds).size !== callIds.length ||
+                callIds.some((callId) => seenToolCallIds.has(callId))
+              ) {
+                throw new DecisionProviderError(
+                  "Anthropic returned duplicate or reused tool-call IDs",
+                  "INVALID_RESPONSE",
+                );
+              }
+              if (
+                calls.length > 0 &&
+                parsedResponse.data.stop_reason !== "tool_use"
+              ) {
+                throw new DecisionProviderError(
+                  `Anthropic stopped with ${parsedResponse.data.stop_reason ?? "no reason"} while returning client tool calls`,
+                  "INVALID_RESPONSE",
+                );
+              }
+              const catalogDefinitions =
+                definitionsForCatalogModel(roundDefinitions);
+              const declaredClientNames = new Set(
+                definitions
+                  .filter(
+                    (definition) =>
+                      definition.name !== "web_search" ||
+                      input.researchTools.hasClientWebSearchHandler,
+                  )
+                  .map((definition) => definition.name),
+              );
+              const authorizedNames = new Set(
+                (useCatalogModel
+                  ? catalogDefinitions.map((definition) => definition.name)
+                  : finalRound || schemaCorrectionRound
+                    ? ["submit_trade_plan"]
+                    : roundDefinitions.map((definition) => definition.name)
+                ).filter((name) => declaredClientNames.has(name)),
+              );
+              if (calls.some((call) => !authorizedNames.has(call.name))) {
+                throw new DecisionProviderError(
+                  "Anthropic called a tool outside the current decision phase",
+                  "INVALID_RESPONSE",
+                );
+              }
+              if (serverToolCalls.some((call) => call.name !== "web_search")) {
+                throw new DecisionProviderError(
+                  "Anthropic called an unsupported server tool",
+                  "INVALID_RESPONSE",
+                );
+              }
+              const currentServerToolUseIds = new Set(
+                serverToolCalls.map((call) => call.id),
+              );
+              const responseServerToolResultIds = serverWebSearchResults.map(
+                (result) => result.tool_use_id,
+              );
+              if (
+                new Set(responseServerToolResultIds).size !==
+                  responseServerToolResultIds.length ||
+                responseServerToolResultIds.some((resultId) =>
+                  seenServerToolResultIds.has(resultId),
+                ) ||
+                serverWebSearchResults.some(
+                  (result) => !validPreservedServerWebSearchResult(result),
+                )
+              ) {
+                throw new DecisionProviderError(
+                  "Anthropic returned a malformed, duplicate, or reused server-tool result",
+                  "INVALID_RESPONSE",
+                );
+              }
+              if (
+                serverWebSearchResults.some(
+                  (result) =>
+                    !currentServerToolUseIds.has(result.tool_use_id) &&
+                    !pendingServerToolUseIds.has(result.tool_use_id),
+                )
+              ) {
+                throw new DecisionProviderError(
+                  "Anthropic returned a server-tool result without a matching call",
+                  "INVALID_RESPONSE",
+                );
+              }
+              const pendingBeforeResponse = new Set(pendingServerToolUseIds);
+              const completedPendingServerToolUseIds = new Set(
+                serverWebSearchResults
+                  .filter((result) =>
+                    pendingBeforeResponse.has(result.tool_use_id),
+                  )
+                  .map((result) => result.tool_use_id),
+              );
+              for (const result of serverWebSearchResults) {
+                pendingServerToolUseIds.delete(result.tool_use_id);
+                seenServerToolResultIds.add(result.tool_use_id);
+              }
+              for (const call of serverToolCalls) {
+                if (!completedServerWebSearchIds.has(call.id)) {
+                  pendingServerToolUseIds.add(call.id);
+                }
+              }
+              for (const callId of callIds) seenToolCallIds.add(callId);
+
+              const identifiedSearchActivity =
+                serverToolCalls.length + completedPendingServerToolUseIds.size;
+              const unrepresentedReportedSearches = Math.max(
+                0,
+                (reportedServerWebSearches ?? 0) - identifiedSearchActivity,
+              );
+              observedServerWebSearches =
+                serverToolCalls.length + unrepresentedReportedSearches;
+              providerWebSearchAttemptsToRecord =
+                serverWebSearchResults.length + unrepresentedReportedSearches;
+              providerWebSearchSuccessesToRecord =
+                successfulServerWebSearchCount;
+
+              const serverActivity =
+                serverToolCalls.length > 0 ||
+                serverWebSearchResults.length > 0 ||
+                (reportedServerWebSearches ?? 0) > 0;
+              const serverSearchAuthorized =
+                !useCatalogModel &&
+                !finalRound &&
+                !schemaCorrectionRound &&
+                useServerWebSearch;
+              if (serverActivity && !serverSearchAuthorized) {
+                throw new DecisionProviderError(
+                  "Anthropic attempted provider web search outside its permitted phase",
+                  "INVALID_RESPONSE",
+                );
+              }
+              if (
+                parsedResponse.data.stop_reason === "pause_turn" &&
+                (!serverSearchAuthorized || !serverActivity)
+              ) {
+                throw new DecisionProviderError(
+                  "Anthropic returned an invalid server-tool pause",
+                  "INVALID_RESPONSE",
+                );
+              }
+              const terminalOrHandoffCalls = calls.filter(
+                (call) =>
+                  call.name === "submit_trade_plan" ||
+                  isPrimaryModelHandoffToolName(call.name),
+              );
+              if (
+                terminalOrHandoffCalls.length > 0 &&
+                (calls.length !== 1 ||
+                  serverToolCalls.length > 0 ||
+                  unrepresentedReportedSearches > 0 ||
+                  pendingServerToolUseIds.size > 0)
+              ) {
+                throw new DecisionProviderError(
+                  "Anthropic combined a terminal or model-handoff call with another client or server tool call",
+                  "INVALID_RESPONSE",
+                );
+              }
+              if (
+                (finalRound || schemaCorrectionRound) &&
+                (calls.length !== 1 || calls[0]?.name !== "submit_trade_plan")
+              ) {
+                throw new DecisionProviderError(
+                  "Anthropic did not make the required solitary terminal submission",
+                  "INVALID_RESPONSE",
+                );
+              }
+            }
             if (observedServerWebSearches > remainingServerWebSearches) {
               throw new DecisionProviderError(
                 "Anthropic exceeded the configured web-search limit",
@@ -596,11 +967,8 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             }
             serverWebSearchCount += observedServerWebSearches;
             input.researchTools.recordProviderWebSearches(
-              observedServerWebSearches,
-              Math.min(
-                observedServerWebSearches,
-                successfulServerWebSearchCount,
-              ),
+              providerWebSearchAttemptsToRecord,
+              providerWebSearchSuccessesToRecord,
             );
             input.researchTools.recordProviderEvidenceSources(
               extractAnthropicEvidenceSources(responseBody),

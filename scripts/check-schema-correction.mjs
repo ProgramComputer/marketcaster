@@ -114,10 +114,18 @@ for (const [Provider, providerKind] of [
     1,
     "Only the corrected schema reaches substantive validation",
   );
-  assert.deepEqual(
-    corrected.requests[1].tools.map((tool) => tool.name),
-    ["submit_trade_plan"],
-  );
+  if (providerKind === "anthropic") {
+    assert.deepEqual(
+      corrected.requests[1].tools,
+      corrected.requests[0].tools,
+      "Anthropic schema correction keeps the cached tool prefix",
+    );
+  } else {
+    assert.deepEqual(
+      corrected.requests[1].tools.map((tool) => tool.name),
+      ["submit_trade_plan"],
+    );
+  }
   assert.equal(corrected.requests[1].tool_choice.name, "submit_trade_plan");
   assert.ok(corrected.transcript[0].toolResults[0].result.isError);
   assert.equal(corrected.transcript[1].toolResults[0].result.kind, "DECISION");
@@ -178,10 +186,14 @@ for (const [Provider, providerKind] of [
     2,
     "Schema correction cannot bypass a substantive terminal guard",
   );
-  assert.deepEqual(
-    guarded.requests[2].tools.map((tool) => tool.name),
-    ["submit_trade_plan"],
-  );
+  if (providerKind === "anthropic") {
+    assert.deepEqual(guarded.requests[2].tools, guarded.requests[0].tools);
+  } else {
+    assert.deepEqual(
+      guarded.requests[2].tools.map((tool) => tool.name),
+      ["submit_trade_plan"],
+    );
+  }
 
   const timeout = harness([invalid, valid], {
     inputOptions: {

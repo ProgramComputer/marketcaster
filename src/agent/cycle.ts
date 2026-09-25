@@ -262,7 +262,7 @@ function aggregateTokenUsage(
   };
 }
 
-function aggregateCacheDiagnostics(
+export function aggregateCacheDiagnostics(
   rounds: readonly DecisionTranscriptRound[],
 ): NonNullable<CycleReport["agent"]["cacheDiagnostics"]> | undefined {
   const diagnosticRounds = rounds.filter(
@@ -270,6 +270,15 @@ function aggregateCacheDiagnostics(
   );
   if (diagnosticRounds.length === 0) return undefined;
 
+  const roundPromptTokens = (round: DecisionTranscriptRound | undefined) => {
+    const usage = round?.tokenUsage;
+    if (usage === undefined) return undefined;
+    return (
+      usage.inputTokens +
+      (usage.cachedInputTokens ?? 0) +
+      (usage.cacheCreationInputTokens ?? 0)
+    );
+  };
   const rawStateCounts: Record<string, number> = {};
   const missReasonCounts: Record<string, number> = {};
   let missedInputTokens = 0;
@@ -282,19 +291,22 @@ function aggregateCacheDiagnostics(
       missReasonCounts[diagnostic.reasonType] =
         (missReasonCounts[diagnostic.reasonType] ?? 0) + 1;
     }
-    missedInputTokens += diagnostic.missedInputTokens ?? 0;
+    // Diagnostics compare against the previous request even when an older
+    // cache entry still serves the prefix, so count only the shortfall between
+    // the previous prompt and what this round actually read from cache.
+    const estimate = diagnostic.missedInputTokens ?? 0;
+    const previousPrompt = roundPromptTokens(rounds[rounds.indexOf(round) - 1]);
+    const cachedInput = round.tokenUsage?.cachedInputTokens;
+    missedInputTokens +=
+      previousPrompt === undefined || cachedInput === undefined
+        ? estimate
+        : Math.min(estimate, Math.max(0, previousPrompt - cachedInput));
   }
 
-  const promptInputTokens = rounds.reduce((total, round) => {
-    const usage = round.tokenUsage;
-    if (usage === undefined) return total;
-    return (
-      total +
-      usage.inputTokens +
-      (usage.cachedInputTokens ?? 0) +
-      (usage.cacheCreationInputTokens ?? 0)
-    );
-  }, 0);
+  const promptInputTokens = rounds.reduce(
+    (total, round) => total + (roundPromptTokens(round) ?? 0),
+    0,
+  );
   const cacheReadTokens = rounds.reduce(
     (total, round) => total + (round.tokenUsage?.cachedInputTokens ?? 0),
     0,
