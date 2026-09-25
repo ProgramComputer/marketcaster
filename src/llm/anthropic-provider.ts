@@ -756,7 +756,13 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             parsedResponse.data.usage === undefined
               ? undefined
               : tokenUsage(parsedResponse.data.usage);
-          if (parsedResponse.data.usage !== undefined) {
+          // A response that ran a server search reports input summed across the
+          // search loop's sampling steps, so keep the last single-pass size.
+          if (
+            parsedResponse.data.usage !== undefined &&
+            (parsedResponse.data.usage.server_tool_use?.web_search_requests ??
+              0) === 0
+          ) {
             previousInputTokens = inputTokenCount(parsedResponse.data.usage);
           }
           const toolResults: unknown[] = [];
