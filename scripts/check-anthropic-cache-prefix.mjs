@@ -66,6 +66,8 @@ function assertStablePrefix(requests) {
     ),
     "Synthetic fixture exercises provider web search",
   );
+  assert.deepEqual(first.system[0].cache_control, { type: "ephemeral" });
+  assert.deepEqual(first.tools.at(-1).cache_control, { type: "ephemeral" });
   for (const request of rest) {
     assert.deepEqual(request.tools, first.tools);
     assert.deepEqual(request.system, first.system);

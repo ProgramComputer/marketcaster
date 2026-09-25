@@ -48,10 +48,9 @@ const ANTHROPIC_APPEND_ONLY_MINIMUM_VERSIONS: ReadonlyMap<
 ]);
 const ANTHROPIC_MODEL_VERSION_PATTERN =
   /(?:^|[^a-z0-9])claude-(opus|sonnet|haiku|fable|mythos)-(\d{1,2})(?:-(\d{1,2}))?(?![0-9])/u;
-const ANTHROPIC_STABLE_CACHE_CONTROL = {
-  type: "ephemeral",
-  ttl: "1h",
-} as const;
+// Decision rounds start seconds apart, so the default five-minute TTL stays
+// warm without the doubled one-hour write price.
+const ANTHROPIC_STABLE_CACHE_CONTROL = { type: "ephemeral" } as const;
 const TokenCountSchema = z.number().int().nonnegative();
 
 const AnthropicCacheMissReasonSchema = z
