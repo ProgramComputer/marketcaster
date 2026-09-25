@@ -197,19 +197,41 @@ try {
     name: "submit_trade_plan",
   });
 
-  const unknownFutureModel = harness({
-    modelId: "claude-opus-5-6",
-    responses: [
-      response("unknown-future", [
-        toolUse("unknown-future-submit", "submit_trade_plan", validPlan),
-      ]),
-    ],
-  });
-  await unknownFutureModel.decide();
-  assert.deepEqual(unknownFutureModel.requests[0].tool_choice, {
-    type: "tool",
-    name: "submit_trade_plan",
-  });
+  for (const [modelId, expectedChoice] of [
+    ["claude-opus-5-6", "auto"],
+    ["claude-opus-6", "auto"],
+    ["claude-sonnet-5-5", "auto"],
+    ["claude-fable-5-1", "auto"],
+    ["claude-mythos-5-1", "auto"],
+    ["anthropic.claude-opus-5-5", "auto"],
+    ["claude-opus-5-5@20261001", "auto"],
+    ["claude-opus-5", "tool"],
+    ["claude-opus-5-20260401", "tool"],
+    ["claude-opus-4-5-20251101", "tool"],
+    ["claude-sonnet-5", "tool"],
+    ["claude-fable-5", "tool"],
+    ["claude-3-5-sonnet-20241022", "tool"],
+    ["synthetic-model", "tool"],
+  ]) {
+    const versioned = harness({
+      modelId,
+      responses: [
+        response(`versioned-${modelId}`, [
+          toolUse(
+            `versioned-${modelId}-submit`,
+            "submit_trade_plan",
+            validPlan,
+          ),
+        ]),
+      ],
+    });
+    await versioned.decide();
+    assert.equal(
+      versioned.requests[0].tool_choice.type,
+      expectedChoice,
+      `${modelId} selects the ${expectedChoice} submission contract`,
+    );
+  }
 
   const opusFinal = harness({
     modelId: OPUS_55,
