@@ -701,7 +701,8 @@ export type PassResearchGateStatus =
   | "NO_CANDIDATES"
   | "NO_QUALIFIED_CANDIDATES"
   | "WAIVED_FINAL_ROUND"
-  | "WAIVED_PROVIDER_BYPASS";
+  | "WAIVED_PROVIDER_BYPASS"
+  | "INCOMPLETE_NO_ORDERS";
 
 export interface PassResearchReadiness {
   readonly allowed: boolean;
@@ -1420,6 +1421,30 @@ function decisionInputValidationIssues(
   }));
 }
 
+const LEAKED_TOOL_MARKUP_PATTERN = /<\/?parameter\b/u;
+
+// Persistence inputs are long free text, so name the invalid fields and any
+// tool-call markup that leaked into a string value instead of a bare error.
+function invalidPersistenceInput(
+  message: string,
+  input: unknown,
+  error: z.ZodError,
+): ToolExecutionResult {
+  const leakedMarkup = LEAKED_TOOL_MARKUP_PATTERN.test(
+    JSON.stringify(input ?? null),
+  );
+  return safeToolError("INVALID_TOOL_INPUT", message, {
+    issues: decisionInputValidationIssues(error),
+    issueCount: error.issues.length,
+    issuesTruncated: error.issues.length > MAXIMUM_DECISION_INPUT_ISSUES,
+    ...(leakedMarkup
+      ? {
+          hint: "A string value contains tool-call markup such as <parameter name=...>. Put every field in its own JSON property and call the tool again.",
+        }
+      : {}),
+  });
+}
+
 const PROTECTED_CURSOR_PATTERN = /^v1\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]{43})$/u;
 const MAXIMUM_RAW_CURSOR_LENGTH = 1_000;
 
@@ -2090,7 +2115,7 @@ export class DecisionResearchTools {
   private totalStateOperationCount = 0;
   private activeMaximumMarketDiscoveryRequests: number | undefined;
   private activeMaximumWebSearchRequests: number | undefined;
-  private activeMaximumTradePreviewRequests: number | undefined;
+  private activeMaximumTradePreviewRequests: number | null | undefined;
   private activeSession: DecisionResearchSession | undefined;
   private providerDecisionReturned = false;
   private readonly surfacedSlugs = new Set<string>();
@@ -3862,7 +3887,10 @@ export class DecisionResearchSession {
         this.messages.invalidTradePreviewInput,
       );
     }
-    if (this.tradePreviewCount >= this.limits.maximumTradePreviewRequests) {
+    if (
+      this.limits.maximumTradePreviewRequests !== null &&
+      this.tradePreviewCount >= this.limits.maximumTradePreviewRequests
+    ) {
       return safeToolError(
         "TOOL_LIMIT_REACHED",
         "Maximum trade-preview request count reached. Do not call preview_trade again this cycle; use the completed previews and submit the complete trade plan.",
@@ -3915,9 +3943,10 @@ export class DecisionResearchSession {
   ): Promise<ToolExecutionResult> {
     const parsed = AgentNoteInputSchema.safeParse(input);
     if (!parsed.success) {
-      return safeToolError(
-        "INVALID_TOOL_INPUT",
+      return invalidPersistenceInput(
         this.messages.invalidAgentNoteInput,
+        input,
+        parsed.error,
       );
     }
     const persistentKnowledgeOperations =
@@ -3999,9 +4028,10 @@ export class DecisionResearchSession {
   ): Promise<ToolExecutionResult> {
     const parsed = AgentStateInputSchema.safeParse(input);
     if (!parsed.success) {
-      return safeToolError(
-        "INVALID_TOOL_INPUT",
+      return invalidPersistenceInput(
         this.messages.invalidAgentStateInput,
+        input,
+        parsed.error,
       );
     }
     const persistentKnowledgeOperations =

@@ -1071,6 +1071,45 @@ await (async () => {
     fallback.settlementRulesProvenance,
     "Rule origin survives the adapter, context builder and strict tool-result schema",
   );
+  const previewCounts = async (maximumTradePreviewRequests, calls) => {
+    const previewTools = new DecisionResearchTools({
+      prompts: prompts.research,
+      marketDetailsHandler: async () => detail,
+      tradePreviewHandler: async (request) => ({ synthetic: request }),
+    });
+    const previewSession = previewTools.createSession({
+      ...DEFAULT_DECISION_LIMITS,
+      maximumTradePreviewRequests,
+    });
+    const signal = new globalThis.AbortController().signal;
+    await previewSession.execute(
+      "get_market_details",
+      { marketSlug: fallback.slug },
+      signal,
+    );
+    const codes = [];
+    for (let call = 0; call < calls; call += 1) {
+      const result = await previewSession.execute(
+        "preview_trade",
+        {
+          marketSlug: fallback.slug,
+          side: "YES",
+          action: "BUY",
+          quantity: "1",
+          limitPrice: "0.5",
+        },
+        signal,
+      );
+      codes.push(result.isError ? JSON.parse(result.content).code : "OK");
+    }
+    return codes;
+  };
+  assert.deepEqual(await previewCounts(1, 2), ["OK", "TOOL_LIMIT_REACHED"]);
+  assert.deepEqual(
+    await previewCounts(null, 14),
+    Array(14).fill("OK"),
+    "A null preview limit leaves the count to the model",
+  );
   const kalshi = mapKalshiMarket(
     KalshiMarketSchema.parse({
       ticker: "SYNTHETIC-A",
@@ -1576,4 +1615,52 @@ await (async () => {
     assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
     await rm(directory, { recursive: true, force: true });
   }
+})();
+
+// check-evidence-class.mjs
+await (async () => {
+  const { default: assert } = await import("node:assert/strict");
+  const { default: process } = await import("node:process");
+  const { DecisionEvidenceSchema } =
+    await import("../dist/src/agent/decision-evidence.js");
+  const base = {
+    title: "Synthetic forecast page",
+    url: "https://forecast.example.test/point",
+    claimExcerpt: "High near 70",
+    claimEventYear: 2026,
+    relevance: "Synthetic current forecast",
+  };
+  const observedReport = DecisionEvidenceSchema.parse({
+    ...base,
+    evidenceClass: "CURRENT_REPORT",
+    asOf: "2026-01-01T12:00:00Z",
+  });
+  assert.equal(observedReport.evidenceClass, "LIVE_DATA");
+  assert.equal(observedReport.asOf, "2026-01-01T12:00:00Z");
+  assert.equal(observedReport.publishedAt, undefined);
+  const publishedReport = DecisionEvidenceSchema.parse({
+    ...base,
+    evidenceClass: "CURRENT_REPORT",
+    publishedAt: "2026-01-01T12:00:00Z",
+  });
+  assert.equal(publishedReport.evidenceClass, "CURRENT_REPORT");
+  assert.deepEqual(
+    DecisionEvidenceSchema.safeParse({
+      ...base,
+      evidenceClass: "CURRENT_REPORT",
+      publishedAt: "2026-01-01T12:00:00Z",
+      asOf: "2026-01-01T12:00:00Z",
+    }).error?.issues.map((issue) => issue.message),
+    ["CURRENT_REPORT evidence cannot set asOf"],
+  );
+  assert.deepEqual(
+    DecisionEvidenceSchema.safeParse({
+      ...base,
+      evidenceClass: "CURRENT_REPORT",
+    }).error?.issues.map((issue) => issue.message),
+    ["CURRENT_REPORT evidence requires publishedAt"],
+  );
+  process.stdout.write(
+    "Evidence class checks passed (observed reports classified as live data)\n",
+  );
 })();

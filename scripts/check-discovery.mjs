@@ -180,6 +180,51 @@ await (async () => {
     }
   });
 
+  test("agent previews can be uncapped and provider settings are optional", async () => {
+    const { decisionLimitsFromConfig, DEFAULT_DECISION_LIMITS } =
+      await import("../dist/src/llm/decision-provider.js");
+    const defaultLimits = decisionLimitsFromConfig(
+      RepositoryConfigSchema.parse(defaults).agent,
+    );
+    assert.equal(
+      defaultLimits.maximumOutputTokens,
+      DEFAULT_DECISION_LIMITS.maximumOutputTokens,
+    );
+    assert.equal(
+      defaultLimits.contextPressureInputTokens,
+      DEFAULT_DECISION_LIMITS.contextPressureInputTokens,
+    );
+
+    const input = globalThis.structuredClone(defaults);
+    input.agent.maximumTradePreviewRequests = null;
+    input.agent.maximumOutputTokens = 32_768;
+    input.agent.contextPressureInputTokens = 400_000;
+    input.agent.reasoningEffort = "high";
+    const parsed = RepositoryConfigSchema.parse(input);
+    assert.equal(parsed.agent.maximumTradePreviewRequests, null);
+    assert.equal(parsed.agent.reasoningEffort, "high");
+    const limits = decisionLimitsFromConfig(parsed.agent);
+    assert.equal(limits.maximumTradePreviewRequests, null);
+    assert.equal(limits.maximumOutputTokens, 32_768);
+    assert.equal(limits.contextPressureInputTokens, 400_000);
+
+    for (const [field, invalid] of [
+      ["maximumTradePreviewRequests", 13],
+      ["maximumTradePreviewRequests", undefined],
+      ["maximumOutputTokens", 32_769],
+      ["contextPressureInputTokens", 0],
+      ["reasoningEffort", "extreme"],
+    ]) {
+      const candidate = globalThis.structuredClone(input);
+      candidate.agent[field] = invalid;
+      assert.equal(
+        RepositoryConfigSchema.safeParse(candidate).success,
+        false,
+        `${field}=${String(invalid)} must be rejected`,
+      );
+    }
+  });
+
   test("uncapped discovery can complete beyond the former deadline", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const result = withStageTimeout(

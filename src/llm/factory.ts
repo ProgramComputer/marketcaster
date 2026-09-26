@@ -3,7 +3,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
 import type { RuntimeEnvironment } from "../config/env.js";
 import { AnthropicDecisionProvider } from "./anthropic-provider.js";
-import type { DecisionProvider } from "./decision-provider.js";
+import type { DecisionProvider, ReasoningEffort } from "./decision-provider.js";
 import { OpenAIDecisionProvider } from "./openai-provider.js";
 
 const CurrentRunPointerSchema = z
@@ -39,6 +39,7 @@ const AnthropicTranscriptSchema = z
 export interface DecisionProviderFactoryOptions {
   readonly reportingDirectory: string;
   readonly accountScope: string;
+  readonly reasoningEffort?: ReasoningEffort;
 }
 
 async function previousAnthropicMessageId(
@@ -94,6 +95,16 @@ export async function createDecisionProvider(
     throw new Error("LLM_API_KEY is required for the decision provider");
   }
   if (environment.LLM_PROVIDER === "openai") {
+    if (environment.LLM_FALLBACK_MODEL !== undefined) {
+      throw new Error(
+        "LLM_FALLBACK_MODEL is supported only by the Anthropic provider",
+      );
+    }
+    if (options.reasoningEffort !== undefined) {
+      throw new Error(
+        "agent.reasoningEffort is supported only by the Anthropic provider",
+      );
+    }
     return new OpenAIDecisionProvider({
       apiKey: environment.LLM_API_KEY,
       modelId: environment.LLM_MODEL,
@@ -115,6 +126,12 @@ export async function createDecisionProvider(
     ...(environment.LLM_CATALOG_MODEL === undefined
       ? {}
       : { catalogModelId: environment.LLM_CATALOG_MODEL }),
+    ...(environment.LLM_FALLBACK_MODEL === undefined
+      ? {}
+      : { fallbackModelId: environment.LLM_FALLBACK_MODEL }),
+    ...(options.reasoningEffort === undefined
+      ? {}
+      : { reasoningEffort: options.reasoningEffort }),
     ...(previousMessageId === undefined ? {} : { previousMessageId }),
   });
 }

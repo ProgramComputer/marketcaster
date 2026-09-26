@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Decimal } from "decimal.js";
 import pino from "pino";
-import { runCycle } from "../dist/src/agent/cycle.js";
+import {
+  resolveFinalPassResearchGate,
+  runCycle,
+} from "../dist/src/agent/cycle.js";
 import { loadRuntimeConfiguration } from "../dist/src/config/runtime-overrides.js";
 import {
   captureDecisionSubmission,
@@ -154,6 +157,29 @@ export default api => ({
   assert.equal(report.agent.decisionAudit.submissions.attempts.length, 1);
   assert.equal(report.agent.decisionAudit.submissions.omittedTargets.length, 0);
   for (const count of Object.values(calls)) assert(count > 0);
+
+  // A final no-order plan with incomplete pass research completes as a flagged
+  // pass; a plan with orders or satisfied research is unchanged.
+  const unmetReadiness = {
+    allowed: false,
+    status: "REQUIRED",
+    unmet: ["1 qualified-candidate market analysis request(s)"],
+  };
+  const flagged = resolveFinalPassResearchGate(0, unmetReadiness);
+  assert.equal(flagged.readiness.status, "INCOMPLETE_NO_ORDERS");
+  assert.equal(flagged.readiness.allowed, false);
+  assert.match(
+    flagged.warning,
+    /incomplete research qualification: 1 qualified/u,
+  );
+  assert.equal(
+    resolveFinalPassResearchGate(1, unmetReadiness).warning,
+    undefined,
+  );
+  const satisfied = { allowed: true, status: "SATISFIED", unmet: [] };
+  assert.deepEqual(resolveFinalPassResearchGate(0, satisfied), {
+    readiness: satisfied,
+  });
 
   // A final empty plan must not erase an earlier factual rejection or turn it
   // into a source-fetch error. An unrelated retained target stays independent.

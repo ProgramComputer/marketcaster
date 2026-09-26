@@ -124,6 +124,22 @@ Built-in providers support OpenAI's Responses API and Anthropic. An optional
 primary `LLM_MODEL` takes ownership of web research, evidence reads, analysis,
 previews, state changes, final decisions, and repair rounds.
 
+Claude versions that reject forced tool choice (Opus 5.5, Fable 5.1, Mythos 5.1
+and later) run with automatic tool choice and a stated decision phase. A turn
+that omits its tool call or breaks the phase is answered with a correction that
+repeats the phase without using a decision round, at most three times per
+decision. These models return a summarized reasoning trace in the transcript.
+After an Anthropic safety refusal, the decision continues once on the optional
+`LLM_FALLBACK_MODEL`; otherwise the cycle stops with a `REFUSAL` error and places
+no order.
+
+Optional `agent` settings tune the provider request: `reasoningEffort`
+(Anthropic `low`, `medium`, `high`, `xhigh` or `max`), `maximumOutputTokens`
+(up to 32,768; thinking counts toward it) and `contextPressureInputTokens`, the
+input size at which the terminal submission is requested (175,000 by default).
+`maximumTradePreviewRequests: null` leaves the number of trade previews to the
+model within the round and time limits.
+
 The provider does not place orders. It returns desired total exposures and
 supporting audit fields. The same deterministic validator reviews terminal
 plans for both providers and may return structured read-only repair feedback.
@@ -260,6 +276,7 @@ environment variables:
 | `LLM_BASE_URL`                      | Optional trusted OpenAI-compatible API root.                    |
 | `LLM_MODEL`                         | Primary decision and repair model.                              |
 | `LLM_CATALOG_MODEL`                 | Optional same-provider catalog model.                           |
+| `LLM_FALLBACK_MODEL`                | Optional Anthropic model used after a safety refusal.           |
 | `LLM_API_KEY`                       | Selected provider API key.                                      |
 | `POLYMARKET_KEY_ID`                 | Polymarket US key identifier.                                   |
 | `POLYMARKET_SECRET_KEY`             | Polymarket US signing secret.                                   |

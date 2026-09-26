@@ -17,10 +17,13 @@ export interface DecisionLimits {
   readonly maximumEvidenceSourceReadRequests: number;
   readonly maximumMarketDetailRequests: number;
   readonly maximumMarketAnalysisRequests: number;
-  readonly maximumTradePreviewRequests: number;
+  /** `null` leaves trade previews to the model's judgement within the rounds. */
+  readonly maximumTradePreviewRequests: number | null;
   readonly maximumNoteOperations: number;
   readonly timeoutMilliseconds: number;
   readonly maximumOutputTokens: number;
+  /** Input size at which the provider asks for the terminal submission. */
+  readonly contextPressureInputTokens: number;
 }
 
 export const HARD_MAXIMUM_DECISION_LIMITS: DecisionLimits = Object.freeze({
@@ -35,6 +38,7 @@ export const HARD_MAXIMUM_DECISION_LIMITS: DecisionLimits = Object.freeze({
   maximumNoteOperations: 20,
   timeoutMilliseconds: 1_500_000,
   maximumOutputTokens: 32_768,
+  contextPressureInputTokens: 1_000_000,
 });
 
 export const DEFAULT_DECISION_LIMITS: DecisionLimits = Object.freeze({
@@ -49,6 +53,7 @@ export const DEFAULT_DECISION_LIMITS: DecisionLimits = Object.freeze({
   maximumNoteOperations: 10,
   timeoutMilliseconds: 1_500_000,
   maximumOutputTokens: 8192,
+  contextPressureInputTokens: 175_000,
 });
 
 const PartialDecisionLimitsSchema = z
@@ -68,10 +73,16 @@ const PartialDecisionLimitsSchema = z
       .optional(),
     maximumMarketDetailRequests: z.number().int().nonnegative().optional(),
     maximumMarketAnalysisRequests: z.number().int().nonnegative().optional(),
-    maximumTradePreviewRequests: z.number().int().nonnegative().optional(),
+    maximumTradePreviewRequests: z
+      .number()
+      .int()
+      .nonnegative()
+      .nullable()
+      .optional(),
     maximumNoteOperations: z.number().int().nonnegative().optional(),
     timeoutMilliseconds: z.number().int().positive().optional(),
     maximumOutputTokens: z.number().int().positive().optional(),
+    contextPressureInputTokens: z.number().int().positive().optional(),
   })
   .strict();
 
@@ -205,7 +216,11 @@ export type DecisionProviderErrorCode =
   | "INVALID_RESPONSE"
   | "INVALID_DECISION"
   | "TOOL_LIMIT"
-  | "ROUND_LIMIT";
+  | "ROUND_LIMIT"
+  | "REFUSAL";
+
+/** Provider reasoning depth, sent where the provider supports it. */
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 export class DecisionProviderError extends Error {
   public constructor(
@@ -443,8 +458,9 @@ export function resolveDecisionLimits(
       parsed.maximumMarketAnalysisRequests ??
       DEFAULT_DECISION_LIMITS.maximumMarketAnalysisRequests,
     maximumTradePreviewRequests:
-      parsed.maximumTradePreviewRequests ??
-      DEFAULT_DECISION_LIMITS.maximumTradePreviewRequests,
+      parsed.maximumTradePreviewRequests === undefined
+        ? DEFAULT_DECISION_LIMITS.maximumTradePreviewRequests
+        : parsed.maximumTradePreviewRequests,
     maximumNoteOperations:
       parsed.maximumNoteOperations ??
       DEFAULT_DECISION_LIMITS.maximumNoteOperations,
@@ -452,11 +468,16 @@ export function resolveDecisionLimits(
       parsed.timeoutMilliseconds ?? DEFAULT_DECISION_LIMITS.timeoutMilliseconds,
     maximumOutputTokens:
       parsed.maximumOutputTokens ?? DEFAULT_DECISION_LIMITS.maximumOutputTokens,
+    contextPressureInputTokens:
+      parsed.contextPressureInputTokens ??
+      DEFAULT_DECISION_LIMITS.contextPressureInputTokens,
   };
   for (const key of Object.keys(
     HARD_MAXIMUM_DECISION_LIMITS,
   ) as (keyof DecisionLimits)[]) {
-    if (resolved[key] > HARD_MAXIMUM_DECISION_LIMITS[key]) {
+    const value = resolved[key];
+    const maximum = HARD_MAXIMUM_DECISION_LIMITS[key];
+    if (value !== null && maximum !== null && value > maximum) {
       throw new RangeError(
         `${key} exceeds the hard maximum of ${HARD_MAXIMUM_DECISION_LIMITS[key]}`,
       );
@@ -480,6 +501,12 @@ export function decisionLimitsFromConfig(
     maximumTradePreviewRequests: config.maximumTradePreviewRequests,
     maximumNoteOperations: config.maximumNoteOperations,
     timeoutMilliseconds: config.timeoutSeconds * 1000,
+    ...(config.maximumOutputTokens === undefined
+      ? {}
+      : { maximumOutputTokens: config.maximumOutputTokens }),
+    ...(config.contextPressureInputTokens === undefined
+      ? {}
+      : { contextPressureInputTokens: config.contextPressureInputTokens }),
   });
 }
 

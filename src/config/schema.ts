@@ -181,8 +181,19 @@ export const RepositoryConfigSchema = z
         maximumMarketDiscoveryRequests: z.number().int().nonnegative().max(20),
         maximumMarketDetailRequests: z.number().int().nonnegative().max(25),
         maximumMarketAnalysisRequests: z.number().int().nonnegative().max(20),
-        maximumTradePreviewRequests: z.number().int().nonnegative().max(12),
+        maximumTradePreviewRequests: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(12)
+          .nullable(),
         maximumNoteOperations: z.number().int().nonnegative().max(20),
+        maximumOutputTokens: PositiveIntegerSchema.max(32_768).optional(),
+        contextPressureInputTokens:
+          PositiveIntegerSchema.max(1_000_000).optional(),
+        reasoningEffort: z
+          .enum(["low", "medium", "high", "xhigh", "max"])
+          .optional(),
         passResearch: PassResearchConfigSchema,
         memory: AgentMemoryConfigSchema,
         state: AgentStateConfigSchema,
@@ -290,7 +301,7 @@ export const RepositoryConfigSchema = z
       ],
     ] as const;
     for (const [field, minimum, maximum] of passResearchBounds) {
-      if (minimum > maximum) {
+      if (maximum !== null && minimum > maximum) {
         context.addIssue({
           code: "custom",
           path: ["agent", "passResearch", field],

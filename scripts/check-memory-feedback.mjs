@@ -107,6 +107,20 @@ try {
     null,
     "Successful staging is not commitment",
   );
+  const leaked = await execute("manage_state", {
+    action: "SET_CYCLE_PLAN",
+    content:
+      'Review synthetic contract",\n<parameter name="marketSlugs">["fixture-market"]',
+    basisMarketSlugs: ["fixture-market"],
+  });
+  assert.equal(leaked.ok, false);
+  assert.equal(leaked.code, "INVALID_TOOL_INPUT");
+  assert.ok(leaked.issues.some((issue) => issue.path === "action"));
+  assert.match(leaked.hint, /tool-call markup/u);
+  const plainInvalid = await execute("manage_notes", { action: "ERASE" });
+  assert.equal(plainInvalid.code, "INVALID_TOOL_INPUT");
+  assert.ok(plainInvalid.issues.length > 0);
+  assert.equal(plainInvalid.hint, undefined);
   const added = await state.manage(
     {
       action: "ADD_BELIEF",

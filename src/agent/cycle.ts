@@ -34,6 +34,7 @@ import {
   DecisionResearchTools,
   type MarketFamilyDetailsResult,
   type MarketFamilyDetailsToolInput,
+  type PassResearchReadiness,
 } from "../llm/research-tools.js";
 import { reconstructAccount } from "../portfolio/reconstruct.js";
 import {
@@ -679,6 +680,22 @@ function mergeTerminalDecisionRepairFeedback(
     instructions: [
       ...new Set(present.flatMap((feedback) => feedback.instructions)),
     ],
+  };
+}
+
+/**
+ * A final plan that places no order completes even when pass research is
+ * incomplete: it trades nothing either way, so the gap is reported as a flagged
+ * pass instead of failing the cycle and discarding its report.
+ */
+export function resolveFinalPassResearchGate(
+  proposalCount: number,
+  readiness: PassResearchReadiness,
+): Readonly<{ readiness: PassResearchReadiness; warning?: string }> {
+  if (proposalCount > 0 || readiness.allowed) return { readiness };
+  return {
+    readiness: { ...readiness, status: "INCOMPLETE_NO_ORDERS" },
+    warning: `No-order decision completed with incomplete research qualification: ${readiness.unmet.join("; ")}`,
   };
 }
 
@@ -2180,11 +2197,13 @@ export async function runCycle(
       );
     }
     researchTools.recordProviderDecisionReturned();
-    const finalPassReadiness = researchTools.strictPassResearchReadiness;
-    if (decision.proposals.length === 0 && !finalPassReadiness.allowed) {
-      throw new SafetyGuardError(
-        `No-order decision did not satisfy the research gate: ${finalPassReadiness.unmet.join("; ")}`,
-      );
+    const finalPassResearch = resolveFinalPassResearchGate(
+      decision.proposals.length,
+      researchTools.strictPassResearchReadiness,
+    );
+    const finalPassReadiness = finalPassResearch.readiness;
+    if (finalPassResearch.warning !== undefined) {
+      warnings.push(finalPassResearch.warning);
     }
     await transcriptJournalQueue;
     stageLogger(dependencies.logger, "agent-research").info(
@@ -2239,7 +2258,7 @@ export async function runCycle(
     const observedPassResearchGate = researchTools.strictPassResearchReadiness;
     const passResearchGate =
       decision.proposals.length === 0
-        ? observedPassResearchGate
+        ? resolveFinalPassResearchGate(0, observedPassResearchGate).readiness
         : {
             ...observedPassResearchGate,
             allowed: true,

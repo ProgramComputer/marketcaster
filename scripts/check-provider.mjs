@@ -408,3 +408,219 @@ await (async () => {
     "A recovered prefix is not counted as a second miss",
   );
 })();
+
+// check-anthropic-turn-corrections.mjs
+await (async () => {
+  const { default: assert } = await import("node:assert/strict");
+  const { default: process } = await import("node:process");
+  const { loadPromptBundle } = await import("../dist/src/config/prompts.js");
+  const { DecisionResearchTools } =
+    await import("../dist/src/llm/research-tools.js");
+  const { AnthropicDecisionProvider } =
+    await import("../dist/src/llm/anthropic-provider.js");
+  // All provider requests are intercepted below; no keys, models, or network are used.
+  const prompts = await loadPromptBundle();
+  const validPlan = {
+    cycleSummary: "Synthetic terminal plan",
+    evidenceBundles: [],
+    portfolioTargets: [],
+    candidateDispositions: [],
+  };
+  const submit = { tool: "submit_trade_plan", input: validPlan };
+  const research = {
+    tool: "read_evidence_source",
+    input: { url: "https://example.com/synthetic-unobserved-source" },
+  };
+  const prose = { text: "Synthetic analysis without a tool call." };
+  const refusal = { refusal: "synthetic-category" };
+
+  function run(
+    sequence,
+    {
+      modelId = "claude-opus-5-5",
+      fallbackModelId,
+      reasoningEffort,
+      limits = {},
+      usage,
+    } = {},
+  ) {
+    const requests = [];
+    const transcript = [];
+    const provider = new AnthropicDecisionProvider({
+      apiKey: "synthetic-fixture-key",
+      modelId,
+      ...(fallbackModelId === undefined ? {} : { fallbackModelId }),
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+      fetchImplementation: async (_url, init) => {
+        requests.push(JSON.parse(init.body));
+        const step = sequence[requests.length - 1];
+        assert.ok(step, "unexpected extra provider request");
+        const id = `synthetic-call-${requests.length}`;
+        const body =
+          step.refusal !== undefined
+            ? {
+                stop_reason: "refusal",
+                stop_details: { type: "refusal", category: step.refusal },
+                content: [],
+              }
+            : step.text !== undefined
+              ? {
+                  stop_reason: "end_turn",
+                  content: [{ type: "text", text: step.text }],
+                }
+              : {
+                  stop_reason: "tool_use",
+                  content: [
+                    {
+                      type: "tool_use",
+                      id,
+                      name: step.tool,
+                      input: step.input,
+                    },
+                  ],
+                };
+        return new globalThis.Response(
+          JSON.stringify({
+            id,
+            type: "message",
+            role: "assistant",
+            ...(usage === undefined ? {} : { usage }),
+            ...body,
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+    const decide = provider.decide({
+      prompt: { system: "Synthetic system prompt", user: "Synthetic request" },
+      researchTools: new DecisionResearchTools({ prompts: prompts.research }),
+      limits: {
+        maximumRounds: 3,
+        maximumWebSearches: 0,
+        timeoutMilliseconds: 5000,
+        ...limits,
+      },
+      reviewTerminalDecision: async () => ({ repair: false }),
+      recordTranscriptRound: (round) => transcript.push(round),
+    });
+    return { decide, requests, transcript };
+  }
+
+  function assertAppendOnly(requests) {
+    for (let index = 1; index < requests.length; index += 1) {
+      assert.deepEqual(
+        requests[index].messages.slice(0, requests[index - 1].messages.length),
+        requests[index - 1].messages,
+        "Each request appends to the previous message history",
+      );
+    }
+  }
+
+  // A prose-only turn is answered with a nudge and repeats the phase without
+  // consuming a round; the request carries auto tool choice and a summary.
+  const nudged = run([prose, submit], { limits: { maximumRounds: 1 } });
+  assert.equal((await nudged.decide).cycleSummary, validPlan.cycleSummary);
+  assert.equal(nudged.requests.length, 2);
+  assertAppendOnly(nudged.requests);
+  for (const request of nudged.requests) {
+    assert.deepEqual(request.tool_choice, { type: "auto" });
+    assert.deepEqual(request.thinking, {
+      type: "adaptive",
+      display: "summarized",
+    });
+    assert.equal(request.output_config, undefined);
+  }
+  const nudge = nudged.requests[1].messages.at(-1);
+  assert.equal(nudge.role, "user");
+  assert.match(nudge.content.at(-1).text, /did not call a tool/u);
+  assert.match(nudge.content.at(-1).text, /terminal submission/u);
+
+  // A research call in the terminal phase is answered, not executed, and the
+  // model resubmits in the same phase.
+  const corrected = run([research, submit], { limits: { maximumRounds: 1 } });
+  assert.equal((await corrected.decide).cycleSummary, validPlan.cycleSummary);
+  assertAppendOnly(corrected.requests);
+  const notExecuted = corrected.requests[1].messages.at(-1).content[0];
+  assert.equal(notExecuted.type, "tool_result");
+  assert.equal(notExecuted.is_error, true);
+  assert.match(notExecuted.content, /TOOL_CALL_NOT_EXECUTED/u);
+  assert.equal(
+    corrected.transcript[0].toolResults[0].result.kind,
+    "TOOL_RESULT",
+  );
+
+  // Corrections are bounded.
+  const stubborn = run([prose, prose, prose, prose]);
+  await assert.rejects(
+    stubborn.decide,
+    (error) =>
+      error.code === "INVALID_RESPONSE" && /end_turn/u.test(error.message),
+  );
+  assert.equal(stubborn.requests.length, 4);
+
+  // A refusal continues once on the fallback model; without one it is reported.
+  const fallback = run([refusal, submit], {
+    fallbackModelId: "claude-opus-4-6",
+    limits: { maximumRounds: 1 },
+  });
+  assert.equal((await fallback.decide).cycleSummary, validPlan.cycleSummary);
+  assert.equal(fallback.requests[0].model, "claude-opus-5-5");
+  assert.equal(fallback.requests[1].model, "claude-opus-4-6");
+  assert.deepEqual(
+    fallback.requests[1].messages,
+    fallback.requests[0].messages,
+  );
+  assert.equal(fallback.requests[1].thinking, undefined);
+  assert.deepEqual(fallback.requests[1].tool_choice, {
+    type: "tool",
+    name: "submit_trade_plan",
+  });
+  const refused = run([refusal]);
+  await assert.rejects(
+    refused.decide,
+    (error) =>
+      error.code === "REFUSAL" && /synthetic-category/u.test(error.message),
+  );
+  const refusedAgain = run([refusal, refusal], {
+    fallbackModelId: "claude-opus-4-6",
+  });
+  await assert.rejects(
+    refusedAgain.decide,
+    (error) => error.code === "REFUSAL",
+  );
+
+  // Effort and output size come from configuration; forced models keep their
+  // forced tool choice and send no thinking configuration.
+  const configured = run([research, submit], {
+    modelId: "claude-opus-4-6",
+    reasoningEffort: "high",
+    limits: { maximumOutputTokens: 32_768 },
+  });
+  await configured.decide;
+  assert.deepEqual(configured.requests[0].output_config, { effort: "high" });
+  assert.equal(configured.requests[0].max_tokens, 32_768);
+  assert.equal(configured.requests[0].thinking, undefined);
+  assert.deepEqual(configured.requests[0].tool_choice, { type: "any" });
+
+  // The context threshold that asks for the terminal submission is configurable.
+  const pressureUsage = { input_tokens: 200_000, output_tokens: 10 };
+  const pressured = run([research, submit], {
+    modelId: "claude-opus-4-6",
+    usage: pressureUsage,
+  });
+  await pressured.decide;
+  assert.deepEqual(pressured.requests[1].tool_choice, {
+    type: "tool",
+    name: "submit_trade_plan",
+  });
+  const relaxed = run([research, research, submit], {
+    modelId: "claude-opus-4-6",
+    usage: pressureUsage,
+    limits: { contextPressureInputTokens: 400_000 },
+  });
+  await relaxed.decide;
+  assert.deepEqual(relaxed.requests[1].tool_choice, { type: "any" });
+  process.stdout.write(
+    "Anthropic turn corrections, refusal fallback, effort, and configurable limits passed.\n",
+  );
+})();

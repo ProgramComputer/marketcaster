@@ -17,6 +17,7 @@ import {
   MAXIMUM_TRADE_PLAN_SCHEMA_CORRECTION_ATTEMPTS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS,
+  type ReasoningEffort,
   resolveDecisionLimits,
   reviewDecisionSubmission,
   runWithDecisionDeadline,
@@ -33,7 +34,9 @@ import {
 const ANTHROPIC_MESSAGES_ENDPOINT = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_API_VERSION = "2023-06-01";
 const ANTHROPIC_CACHE_DIAGNOSTICS_BETA = "cache-diagnosis-2026-04-07";
-const ANTHROPIC_CONTEXT_PRESSURE_INPUT_TOKENS = 175_000;
+// A response that omits its tool call or breaks the current phase is answered
+// with a correction instead of failing the cycle, up to this many times.
+const MAXIMUM_ANTHROPIC_TURN_CORRECTIONS = 3;
 // Claude versions from these onward reject forced tool_choice and bind thinking
 // blocks to an append-only conversation. Later versions inherit the behavior.
 const ANTHROPIC_APPEND_ONLY_MINIMUM_VERSIONS: ReadonlyMap<
@@ -180,8 +183,26 @@ export interface AnthropicDecisionProviderOptions {
   readonly apiKey: string;
   readonly modelId: string;
   readonly catalogModelId?: string;
+  /** Continues the conversation on this model after a safety refusal. */
+  readonly fallbackModelId?: string;
+  readonly reasoningEffort?: ReasoningEffort;
   readonly fetchImplementation?: FetchImplementation;
   readonly previousMessageId?: string;
+}
+
+interface AnthropicTurnCorrection {
+  readonly schemaCorrectionRound: boolean;
+  readonly finalRound: boolean;
+}
+
+function anthropicRefusalCategory(responseBody: unknown): string | undefined {
+  if (!isRecord(responseBody) || !isRecord(responseBody.stop_details)) {
+    return undefined;
+  }
+  const category = responseBody.stop_details.category;
+  return typeof category === "string" && category.length > 0
+    ? category
+    : undefined;
 }
 
 function requiredValue(value: string, name: string): string {
@@ -428,7 +449,9 @@ export class AnthropicDecisionProvider implements DecisionProvider {
   public readonly providerId = "anthropic";
   public readonly modelId: string;
   public readonly catalogModelId?: string;
+  public readonly fallbackModelId?: string;
   readonly #apiKey: string;
+  readonly #reasoningEffort: ReasoningEffort | undefined;
   readonly #fetch: FetchImplementation;
   #previousMessageId: string | null;
 
@@ -443,6 +466,15 @@ export class AnthropicDecisionProvider implements DecisionProvider {
     ) {
       this.catalogModelId = catalogModelId;
     }
+    const fallbackModelId = options.fallbackModelId?.trim();
+    if (
+      fallbackModelId !== undefined &&
+      fallbackModelId.length > 0 &&
+      fallbackModelId !== this.modelId
+    ) {
+      this.fallbackModelId = fallbackModelId;
+    }
+    this.#reasoningEffort = options.reasoningEffort;
     this.#fetch = options.fetchImplementation ?? fetch;
     this.#previousMessageId =
       options.previousMessageId === undefined
@@ -478,6 +510,9 @@ export class AnthropicDecisionProvider implements DecisionProvider {
         let catalogPhaseActive = this.catalogModelId !== undefined;
         let previousRequestModelId: string | undefined;
         let previousPhase: AnthropicDecisionPhase | undefined;
+        let fallbackActive = false;
+        let pendingCorrection: AnthropicTurnCorrection | undefined;
+        let turnCorrections = 0;
         const pendingServerToolUseIds = new Set<string>();
         const seenToolCallIds = new Set<string>();
         const seenServerToolResultIds = new Set<string>();
@@ -488,37 +523,50 @@ export class AnthropicDecisionProvider implements DecisionProvider {
               readonly inputSchema: Readonly<Record<string, unknown>>;
             }[]
           | undefined;
-        const preserveConversation = [this.modelId, this.catalogModelId].some(
+        const preserveConversation = [
+          this.modelId,
+          this.catalogModelId,
+          this.fallbackModelId,
+        ].some(
           (modelId) =>
             modelId !== undefined &&
             requiresAppendOnlyAnthropicConversation(modelId),
         );
         while (
+          pendingCorrection !== undefined ||
           schemaCorrectionPending ||
           (repairActive
             ? repairRounds < MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS
             : initialRounds < limits.maximumRounds)
         ) {
-          const schemaCorrectionRound = schemaCorrectionPending;
-          schemaCorrectionPending = false;
+          // A correction repeats the phase it corrects without using a round.
+          const correction = pendingCorrection;
+          pendingCorrection = undefined;
+          const schemaCorrectionRound =
+            correction?.schemaCorrectionRound ?? schemaCorrectionPending;
+          if (correction === undefined) schemaCorrectionPending = false;
           const contextPressure =
             previousInputTokens !== undefined &&
-            previousInputTokens >= ANTHROPIC_CONTEXT_PRESSURE_INPUT_TOKENS;
+            previousInputTokens >= limits.contextPressureInputTokens;
           const finalRound: boolean =
-            contextPressure ||
-            (schemaCorrectionRound
-              ? schemaCorrectionFinalRound
-              : repairActive
-                ? repairRounds === MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS - 1
-                : initialRounds === limits.maximumRounds - 1);
+            correction?.finalRound ??
+            (contextPressure ||
+              (schemaCorrectionRound
+                ? schemaCorrectionFinalRound
+                : repairActive
+                  ? repairRounds === MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS - 1
+                  : initialRounds === limits.maximumRounds - 1));
           const useCatalogModel =
             catalogPhaseActive &&
             !repairActive &&
             !schemaCorrectionRound &&
             !finalRound;
-          const requestModelId = useCatalogModel
-            ? (this.catalogModelId ?? this.modelId)
-            : this.modelId;
+          const requestModelId =
+            fallbackActive && this.fallbackModelId !== undefined
+              ? this.fallbackModelId
+              : useCatalogModel
+                ? (this.catalogModelId ?? this.modelId)
+                : this.modelId;
           if (
             !preserveConversation &&
             previousRequestModelId !== undefined &&
@@ -532,7 +580,7 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             previousInputTokens = undefined;
           }
           previousRequestModelId = requestModelId;
-          if (!schemaCorrectionRound) {
+          if (correction === undefined && !schemaCorrectionRound) {
             if (repairActive) repairRounds += 1;
             else initialRounds += 1;
           }
@@ -652,6 +700,14 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             cache_control: { type: "ephemeral" },
             diagnostics: { previous_message_id: comparedMessageId },
             tool_choice: toolChoice,
+            // Models that always think return a readable reasoning summary for
+            // the transcript instead of an empty thinking block.
+            ...(requiresAppendOnlyAnthropicConversation(requestModelId)
+              ? { thinking: { type: "adaptive", display: "summarized" } }
+              : {}),
+            ...(this.#reasoningEffort === undefined
+              ? {}
+              : { output_config: { effort: this.#reasoningEffort } }),
           };
           await input.recordModelRequest?.(
             decisionRequestProvenance({
@@ -765,7 +821,24 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             previousInputTokens = inputTokenCount(parsedResponse.data.usage);
           }
           const toolResults: unknown[] = [];
+          let phaseViolation: string | undefined;
           try {
+            if (parsedResponse.data.stop_reason === "refusal") {
+              const category = anthropicRefusalCategory(responseBody);
+              if (this.fallbackModelId !== undefined && !fallbackActive) {
+                // Resend the same conversation on the fallback model; the
+                // refused turn is not appended.
+                fallbackActive = true;
+                diagnosticsPreviousMessageId = null;
+                previousInputTokens = undefined;
+                pendingCorrection = { schemaCorrectionRound, finalRound };
+                continue;
+              }
+              throw new DecisionProviderError(
+                `Anthropic declined the request${category === undefined ? "" : ` (${category})`}`,
+                "REFUSAL",
+              );
+            }
             if (preserveConversation) {
               const malformedToolBlock = parsedResponse.data.content.some(
                 (item) =>
@@ -802,7 +875,7 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                 parsedResponse.data.stop_reason !== "tool_use"
               ) {
                 throw new DecisionProviderError(
-                  `Anthropic stopped with ${parsedResponse.data.stop_reason ?? "no reason"} while returning client tool calls`,
+                  `Anthropic stopped with ${parsedResponse.data.stop_reason ?? "no reason"} while returning client tool calls${parsedResponse.data.stop_reason === "max_tokens" ? "; raise agent.maximumOutputTokens" : ""}`,
                   "INVALID_RESPONSE",
                 );
               }
@@ -826,10 +899,8 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                 ).filter((name) => declaredClientNames.has(name)),
               );
               if (calls.some((call) => !authorizedNames.has(call.name))) {
-                throw new DecisionProviderError(
-                  "Anthropic called a tool outside the current decision phase",
-                  "INVALID_RESPONSE",
-                );
+                phaseViolation ??=
+                  "Anthropic called a tool outside the current decision phase";
               }
               if (serverToolCalls.some((call) => call.name !== "web_search")) {
                 throw new DecisionProviderError(
@@ -912,10 +983,8 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                 !schemaCorrectionRound &&
                 useServerWebSearch;
               if (serverActivity && !serverSearchAuthorized) {
-                throw new DecisionProviderError(
-                  "Anthropic attempted provider web search outside its permitted phase",
-                  "INVALID_RESPONSE",
-                );
+                phaseViolation ??=
+                  "Anthropic attempted provider web search outside its permitted phase";
               }
               if (
                 parsedResponse.data.stop_reason === "pause_turn" &&
@@ -938,19 +1007,16 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                   unrepresentedReportedSearches > 0 ||
                   pendingServerToolUseIds.size > 0)
               ) {
-                throw new DecisionProviderError(
-                  "Anthropic combined a terminal or model-handoff call with another client or server tool call",
-                  "INVALID_RESPONSE",
-                );
+                phaseViolation ??=
+                  "Anthropic combined a terminal or model-handoff call with another client or server tool call";
               }
               if (
                 (finalRound || schemaCorrectionRound) &&
+                calls.length > 0 &&
                 (calls.length !== 1 || calls[0]?.name !== "submit_trade_plan")
               ) {
-                throw new DecisionProviderError(
-                  "Anthropic did not make the required solitary terminal submission",
-                  "INVALID_RESPONSE",
-                );
+                phaseViolation ??=
+                  "Anthropic did not make the required solitary terminal submission";
               }
             }
             if (observedServerWebSearches > remainingServerWebSearches) {
@@ -973,7 +1039,7 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             input.researchTools.recordProviderEvidenceSources(
               extractAnthropicEvidenceSources(responseBody),
             );
-            if (calls.length === 0) {
+            if (calls.length === 0 && phaseViolation === undefined) {
               if (
                 parsedResponse.data.stop_reason === "pause_turn" &&
                 !finalRound
@@ -984,10 +1050,12 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                 });
                 continue;
               }
-              throw new DecisionProviderError(
-                `Anthropic stopped with ${parsedResponse.data.stop_reason ?? "no reason"} without calling a permitted tool`,
-                "INVALID_RESPONSE",
-              );
+              if (parsedResponse.data.stop_reason !== "end_turn") {
+                throw new DecisionProviderError(
+                  `Anthropic stopped with ${parsedResponse.data.stop_reason ?? "no reason"} without calling a permitted tool${parsedResponse.data.stop_reason === "max_tokens" ? "; raise agent.maximumOutputTokens" : ""}`,
+                  "INVALID_RESPONSE",
+                );
+              }
             }
             if (
               calls.length > 1 &&
@@ -997,10 +1065,8 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                   isPrimaryModelHandoffToolName(call.name),
               )
             ) {
-              throw new DecisionProviderError(
-                "Anthropic combined a terminal or model-handoff call with another tool call",
-                "INVALID_RESPONSE",
-              );
+              phaseViolation ??=
+                "Anthropic combined a terminal or model-handoff call with another tool call";
             }
             if (
               useCatalogModel &&
@@ -1010,10 +1076,56 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                   !isPrimaryModelHandoffToolName(call.name),
               )
             ) {
-              throw new DecisionProviderError(
-                "The catalog model called a tool outside its permitted catalog phase",
-                "INVALID_RESPONSE",
-              );
+              phaseViolation ??=
+                "The catalog model called a tool outside its permitted catalog phase";
+            }
+            if (phaseViolation !== undefined || calls.length === 0) {
+              const reason =
+                phaseViolation ??
+                "Anthropic stopped with end_turn without calling a permitted tool";
+              if (turnCorrections >= MAXIMUM_ANTHROPIC_TURN_CORRECTIONS) {
+                throw new DecisionProviderError(reason, "INVALID_RESPONSE");
+              }
+              turnCorrections += 1;
+              // Answer every client call without running it, restate the
+              // phase, and repeat the phase without using a decision round.
+              const instruction = `${
+                phaseViolation === undefined
+                  ? "Your previous response did not call a tool."
+                  : `Your previous tool calls were not executed: ${phaseViolation.replace(/^Anthropic /u, "you ")}.`
+              } ${anthropicPhaseInstruction(phase)}`;
+              if (parsedResponse.data.content.length > 0) {
+                messages.push({
+                  role: "assistant",
+                  content: parsedResponse.data.content,
+                });
+              }
+              const notExecuted = calls.map((call) => {
+                const result = {
+                  kind: "TOOL_RESULT",
+                  content: JSON.stringify({
+                    ok: false,
+                    code: "TOOL_CALL_NOT_EXECUTED",
+                    message: instruction,
+                  }),
+                  isError: true,
+                } as const;
+                transcriptToolResults.push(
+                  decisionToolResultTranscript(call.id, call.name, result),
+                );
+                return {
+                  type: "tool_result",
+                  tool_use_id: call.id,
+                  content: result.content,
+                  is_error: true,
+                };
+              });
+              messages.push({
+                role: "user",
+                content: [...notExecuted, { type: "text", text: instruction }],
+              });
+              pendingCorrection = { schemaCorrectionRound, finalRound };
+              continue;
             }
 
             messages.push({

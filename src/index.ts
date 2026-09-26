@@ -46,7 +46,9 @@ export function classifyErrorExitCode(error: unknown): number {
   }
   if (
     error instanceof DecisionProviderError &&
-    ["INVALID_RESPONSE", "INVALID_DECISION", "ROUND_LIMIT"].includes(error.code)
+    ["INVALID_RESPONSE", "INVALID_DECISION", "ROUND_LIMIT", "REFUSAL"].includes(
+      error.code,
+    )
   ) {
     return EXIT_CODE.INVALID_AGENT_DECISION;
   }
@@ -94,6 +96,9 @@ export async function main(env = process.env): Promise<number> {
     const decisionProvider = await createDecisionProvider(environment, {
       reportingDirectory: config.reporting.directory,
       accountScope: exchange.memoryScope,
+      ...(config.agent.reasoningEffort === undefined
+        ? {}
+        : { reasoningEffort: config.agent.reasoningEffort }),
     });
     const report = await runCycle({
       config,
