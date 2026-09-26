@@ -135,8 +135,10 @@ no order.
 
 Optional `agent` settings tune the provider request: `reasoningEffort`
 (Anthropic `low`, `medium`, `high`, `xhigh` or `max`), `maximumOutputTokens`
-(up to 32,768; thinking counts toward it) and `contextPressureInputTokens`, the
-input size at which the terminal submission is requested (175,000 by default).
+(up to 32,768; thinking counts toward it), `contextPressureInputTokens`, the
+input size at which the terminal submission is requested (175,000 by default),
+and `extendedThinking`, which turns on adaptive thinking for Claude models where
+it is optional and runs them with automatic tool choice and stated phases.
 `maximumTradePreviewRequests: null` leaves the number of trade previews to the
 model within the round and time limits.
 

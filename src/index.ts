@@ -99,6 +99,9 @@ export async function main(env = process.env): Promise<number> {
       ...(config.agent.reasoningEffort === undefined
         ? {}
         : { reasoningEffort: config.agent.reasoningEffort }),
+      ...(config.agent.extendedThinking === undefined
+        ? {}
+        : { extendedThinking: config.agent.extendedThinking }),
     });
     const report = await runCycle({
       config,

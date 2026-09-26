@@ -194,6 +194,7 @@ export const RepositoryConfigSchema = z
         reasoningEffort: z
           .enum(["low", "medium", "high", "xhigh", "max"])
           .optional(),
+        extendedThinking: z.boolean().optional(),
         passResearch: PassResearchConfigSchema,
         memory: AgentMemoryConfigSchema,
         state: AgentStateConfigSchema,

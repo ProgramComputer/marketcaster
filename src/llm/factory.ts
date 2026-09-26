@@ -40,6 +40,7 @@ export interface DecisionProviderFactoryOptions {
   readonly reportingDirectory: string;
   readonly accountScope: string;
   readonly reasoningEffort?: ReasoningEffort;
+  readonly extendedThinking?: boolean;
 }
 
 async function previousAnthropicMessageId(
@@ -105,6 +106,11 @@ export async function createDecisionProvider(
         "agent.reasoningEffort is supported only by the Anthropic provider",
       );
     }
+    if (options.extendedThinking === true) {
+      throw new Error(
+        "agent.extendedThinking is supported only by the Anthropic provider",
+      );
+    }
     return new OpenAIDecisionProvider({
       apiKey: environment.LLM_API_KEY,
       modelId: environment.LLM_MODEL,
@@ -132,6 +138,9 @@ export async function createDecisionProvider(
     ...(options.reasoningEffort === undefined
       ? {}
       : { reasoningEffort: options.reasoningEffort }),
+    ...(options.extendedThinking === undefined
+      ? {}
+      : { extendedThinking: options.extendedThinking }),
     ...(previousMessageId === undefined ? {} : { previousMessageId }),
   });
 }

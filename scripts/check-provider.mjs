@@ -440,6 +440,7 @@ await (async () => {
       modelId = "claude-opus-5-5",
       fallbackModelId,
       reasoningEffort,
+      extendedThinking,
       limits = {},
       usage,
     } = {},
@@ -451,6 +452,7 @@ await (async () => {
       modelId,
       ...(fallbackModelId === undefined ? {} : { fallbackModelId }),
       ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+      ...(extendedThinking === undefined ? {} : { extendedThinking }),
       fetchImplementation: async (_url, init) => {
         requests.push(JSON.parse(init.body));
         const step = sequence[requests.length - 1];
@@ -601,6 +603,30 @@ await (async () => {
   assert.equal(configured.requests[0].max_tokens, 32_768);
   assert.equal(configured.requests[0].thinking, undefined);
   assert.deepEqual(configured.requests[0].tool_choice, { type: "any" });
+
+  // Thinking on a model where it is optional uses automatic tool choice,
+  // stated phases and an append-only conversation, and still recovers from a
+  // prose-only turn in the terminal phase.
+  const thinking46 = run([research, prose, submit], {
+    modelId: "claude-opus-4-6",
+    extendedThinking: true,
+    limits: { maximumRounds: 2 },
+  });
+  assert.equal((await thinking46.decide).cycleSummary, validPlan.cycleSummary);
+  assert.equal(thinking46.requests.length, 3);
+  assertAppendOnly(thinking46.requests);
+  for (const request of thinking46.requests) {
+    assert.deepEqual(request.thinking, { type: "adaptive" });
+    assert.deepEqual(request.tool_choice, { type: "auto" });
+  }
+  assert.match(thinking46.requests[0].messages[0].content, /primary research/u);
+  assert.ok(
+    thinking46.requests[1].messages.some(
+      (message) =>
+        typeof message.content === "string" &&
+        /terminal submission/u.test(message.content),
+    ),
+  );
 
   // The context threshold that asks for the terminal submission is configurable.
   const pressureUsage = { input_tokens: 200_000, output_tokens: 10 };

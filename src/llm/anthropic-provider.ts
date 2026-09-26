@@ -186,6 +186,8 @@ export interface AnthropicDecisionProviderOptions {
   /** Continues the conversation on this model after a safety refusal. */
   readonly fallbackModelId?: string;
   readonly reasoningEffort?: ReasoningEffort;
+  /** Turns on adaptive thinking for models where it is optional. */
+  readonly extendedThinking?: boolean;
   readonly fetchImplementation?: FetchImplementation;
   readonly previousMessageId?: string;
 }
@@ -452,6 +454,7 @@ export class AnthropicDecisionProvider implements DecisionProvider {
   public readonly fallbackModelId?: string;
   readonly #apiKey: string;
   readonly #reasoningEffort: ReasoningEffort | undefined;
+  readonly #extendedThinking: boolean;
   readonly #fetch: FetchImplementation;
   #previousMessageId: string | null;
 
@@ -475,6 +478,7 @@ export class AnthropicDecisionProvider implements DecisionProvider {
       this.fallbackModelId = fallbackModelId;
     }
     this.#reasoningEffort = options.reasoningEffort;
+    this.#extendedThinking = options.extendedThinking ?? false;
     this.#fetch = options.fetchImplementation ?? fetch;
     this.#previousMessageId =
       options.previousMessageId === undefined
@@ -523,15 +527,16 @@ export class AnthropicDecisionProvider implements DecisionProvider {
               readonly inputSchema: Readonly<Record<string, unknown>>;
             }[]
           | undefined;
+        // Thinking rejects forced tool choice, so every thinking model runs the
+        // append-only conversation with automatic tool choice and stated phases.
+        const thinks = (modelId: string): boolean =>
+          this.#extendedThinking ||
+          requiresAppendOnlyAnthropicConversation(modelId);
         const preserveConversation = [
           this.modelId,
           this.catalogModelId,
           this.fallbackModelId,
-        ].some(
-          (modelId) =>
-            modelId !== undefined &&
-            requiresAppendOnlyAnthropicConversation(modelId),
-        );
+        ].some((modelId) => modelId !== undefined && thinks(modelId));
         while (
           pendingCorrection !== undefined ||
           schemaCorrectionPending ||
@@ -677,9 +682,7 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             );
             previousPhase = phase;
           }
-          const toolChoice = requiresAppendOnlyAnthropicConversation(
-            requestModelId,
-          )
+          const toolChoice = thinks(requestModelId)
             ? { type: "auto" }
             : finalRound || schemaCorrectionRound
               ? { type: "tool", name: "submit_trade_plan" }
@@ -701,10 +704,13 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             diagnostics: { previous_message_id: comparedMessageId },
             tool_choice: toolChoice,
             // Models that always think return a readable reasoning summary for
-            // the transcript instead of an empty thinking block.
+            // the transcript instead of an empty thinking block; models where
+            // thinking is optional summarize by default.
             ...(requiresAppendOnlyAnthropicConversation(requestModelId)
               ? { thinking: { type: "adaptive", display: "summarized" } }
-              : {}),
+              : this.#extendedThinking
+                ? { thinking: { type: "adaptive" } }
+                : {}),
             ...(this.#reasoningEffort === undefined
               ? {}
               : { output_config: { effort: this.#reasoningEffort } }),
