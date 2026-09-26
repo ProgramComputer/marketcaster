@@ -35,6 +35,7 @@ export type RiskRejectionCode =
   | "INSUFFICIENT_BUDGET"
   | "BUYING_POWER"
   | "CYCLE_SPEND"
+  | "POLICY_UNFUNDED"
   | "CONCENTRATION"
   | "INVALID_PROPOSAL"
   | "EXCHANGE_ERROR";

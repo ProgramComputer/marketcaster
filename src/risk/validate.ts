@@ -1364,12 +1364,19 @@ export async function validateProposals(
   for (const unfunded of batch.unfunded) {
     indexedRejections.push({
       proposalIndex: unfunded.candidate.proposalIndex,
-      rejection: {
-        proposal: unfunded.candidate.proposal,
-        code: "CYCLE_SPEND",
-        reason:
-          "Allocation policy did not fund this candidate within the cycle budget",
-      },
+      rejection:
+        unfunded.policyExplanation === undefined
+          ? {
+              proposal: unfunded.candidate.proposal,
+              code: "CYCLE_SPEND",
+              reason:
+                "Allocation policy did not fund this candidate within the cycle budget",
+            }
+          : {
+              proposal: unfunded.candidate.proposal,
+              code: "POLICY_UNFUNDED",
+              reason: `Allocation policy leaves this candidate unfunded at any size this cycle: ${unfunded.policyExplanation}`,
+            },
     });
   }
 

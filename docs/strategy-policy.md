@@ -15,6 +15,10 @@ run as trusted local code, not in a sandbox.
 - Allocation receives scalar copies of already-assessed candidates and returns
   candidate IDs with requested spends. The engine rejects unknown or repeated IDs,
   nonfinite amounts, candidate-bound violations, and aggregate overspending.
+  An optional `omissionReason(candidate)` on the allocation function may explain
+  why a candidate is intentionally left unfunded, in 1 to 240 printable ASCII
+  characters. The model then receives a final `POLICY_UNFUNDED` rejection with
+  that reason instead of a repairable `CYCLE_SPEND` rejection.
 - Optional cooldown durations apply to typed execution failures. State is isolated
   by account, exchange, market, outcome side, and action; it contains no raw errors.
 - An optional version 1 `evidenceContentAdapter` can extract text from a fetched

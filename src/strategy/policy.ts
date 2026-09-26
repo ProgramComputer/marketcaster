@@ -69,6 +69,8 @@ export function assertStrategyPolicy(
     typeof policy !== "object" ||
     policy.apiVersion !== 1 ||
     typeof policy.allocation !== "function" ||
+    (policy.allocation.omissionReason !== undefined &&
+      typeof policy.allocation.omissionReason !== "function") ||
     typeof policy.selection?.buildOpportunityBoard !== "function" ||
     typeof policy.selection.buildEnrichedOpportunityBoard !== "function" ||
     typeof policy.selection.selectRequiredMarketSlugs !== "function" ||
