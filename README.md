@@ -340,13 +340,12 @@ npm run format:check
 npm run lint
 npm run typecheck
 npm run build
-npm run check:overrides
+npm test
 ```
 
-`check:overrides` is a configuration regression check. It verifies default
-loading, explicit config and prompt selection, report-root precedence, fallback
-restoration after removing overrides, malformed configuration failure, and
-explicit missing-file failure.
+`npm test` runs the offline checks in `scripts/`, one file per area: discovery,
+risk, provider, boundaries, policy, position reductions, observe mode,
+evidence, execution and memory. None contacts an exchange or model provider.
 
 For runtime changes, use offline fixtures and mocked exchange/provider responses
 with reference defaults and temporary override files. Do not use a live cycle
