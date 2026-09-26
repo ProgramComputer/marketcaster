@@ -153,6 +153,26 @@ assert.equal(kellyLimited.accepted.length, 1);
 assert.ok(kellyLimited.accepted[0].maximumExecutionSpend.lt(20));
 assert.ok(kellyLimited.accepted[0].maximumExecutionSpend.gt(10));
 
+// An explained policy omission is final; an unexplained one stays a budget miss.
+const omitted = (extra) =>
+  validateProposals({
+    ...input,
+    allocationPolicy: Object.assign(() => [], extra),
+  });
+const explainedOmission = await omitted({
+  omissionReason: () => "synthetic policy exclusion",
+});
+assert.deepEqual(
+  explainedOmission.rejected.map(({ code, reason }) => [code, reason]),
+  [
+    [
+      "POLICY_UNFUNDED",
+      "Allocation policy leaves this candidate unfunded at any size this cycle: synthetic policy exclusion",
+    ],
+  ],
+);
+assert.equal((await omitted({})).rejected[0].code, "CYCLE_SPEND");
+
 // Budgeting still includes the larger reserve, even when economic edge is positive.
 for (const patch of [
   { snapshot: { ...snapshot, buyingPower: d("0.99") } },

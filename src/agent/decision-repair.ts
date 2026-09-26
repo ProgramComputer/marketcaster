@@ -12,7 +12,8 @@ export function isRepairableRiskRejection(code: RiskRejectionCode): boolean {
   return (
     code !== "EXCHANGE_ERROR" &&
     code !== "POSITION_REDUCTION_DISABLED" &&
-    code !== "NEW_ENTRIES_BLOCKED"
+    code !== "NEW_ENTRIES_BLOCKED" &&
+    code !== "POLICY_UNFUNDED"
   );
 }
 
@@ -124,6 +125,13 @@ export function buildTerminalDecisionRepairFeedback(
       )
         ? [
             "NEW_ENTRIES_BLOCKED is fixed for this cycle: BUY targets in markets without a current position cannot execute. Drop them or record them as passes; do not research replacements.",
+          ]
+        : []),
+      ...(validation.rejected.some(
+        (rejection) => rejection.code === "POLICY_UNFUNDED",
+      )
+        ? [
+            "POLICY_UNFUNDED is final for this cycle: the allocation policy will not fund that target at any size, for the stated reason. Drop it or record it as a pass; do not resize or resubmit it.",
           ]
         : []),
       "Use fresh evidence or research to correct a target, replace it, or omit it. Do not invent evidence or change a probability merely to force validation to pass.",

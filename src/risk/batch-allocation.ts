@@ -53,6 +53,8 @@ export interface UnfundedBatchAllocation<
   readonly rank: number;
   readonly reason: UnfundedBatchAllocationReason;
   readonly availableSpendAtDecision: Decimal;
+  /** The policy's explanation when it left this candidate unfunded on purpose. */
+  readonly policyExplanation?: string;
 }
 
 export interface BatchAllocationResult<
@@ -70,10 +72,34 @@ export interface AllocationInstruction {
   readonly id: string;
   readonly spend: Decimal;
 }
-export type BatchAllocationPolicy = (input: {
-  readonly cycleBudget: Decimal;
-  readonly candidates: readonly BatchAllocationCandidate[];
-}) => readonly AllocationInstruction[];
+export interface BatchAllocationPolicy {
+  (input: {
+    readonly cycleBudget: Decimal;
+    readonly candidates: readonly BatchAllocationCandidate[];
+  }): readonly AllocationInstruction[];
+  /**
+   * Optionally explains why a candidate is intentionally left unfunded. An
+   * explained omission is final for the cycle: resizing cannot change it.
+   */
+  readonly omissionReason?: (
+    candidate: BatchAllocationCandidate,
+  ) => string | undefined;
+}
+
+const OMISSION_REASON = /^[\x20-\x7E]{1,240}$/u;
+
+function explainedOmission(
+  policy: BatchAllocationPolicy | undefined,
+  candidate: BatchAllocationCandidate,
+): string | undefined {
+  const reason: unknown = policy?.omissionReason?.(candidate);
+  if (reason === undefined) return undefined;
+  if (typeof reason !== "string" || !OMISSION_REASON.test(reason.trim()))
+    throw new TypeError(
+      "Allocation omission reason must be printable ASCII of 1 to 240 characters",
+    );
+  return reason.trim();
+}
 
 function assertFiniteNonNegative(value: Decimal, name: string): void {
   if (!value.isFinite() || value.lt(0)) {
@@ -146,36 +172,37 @@ export function allocateBatchBudget<Candidate extends BatchAllocationCandidate>(
   if (byId.size !== input.candidates.length)
     throw new RangeError("Candidate IDs must be unique");
   // Copy scalar inputs: policy cannot replace or mutate the assessed candidates.
+  const copies = input.candidates.map((candidate): BatchAllocationCandidate =>
+    Object.freeze({
+      id: candidate.id,
+      conservativeNetEdge: new Decimal(candidate.conservativeNetEdge),
+      minimumSpend: new Decimal(candidate.minimumSpend),
+      maximumSpend: new Decimal(candidate.maximumSpend),
+      ...(candidate.context === undefined
+        ? {}
+        : {
+            context: Object.freeze({
+              marketSlug: candidate.context.marketSlug,
+              side: candidate.context.side,
+              ...(candidate.context.eventId === undefined
+                ? {}
+                : { eventId: candidate.context.eventId }),
+              ...(candidate.context.closesAt === undefined
+                ? {}
+                : { closesAt: candidate.context.closesAt }),
+              quoteObservedAt: candidate.context.quoteObservedAt,
+              authorizationProbability: new Decimal(
+                candidate.context.authorizationProbability,
+              ),
+              limitPrice: new Decimal(candidate.context.limitPrice),
+            }),
+          }),
+    }),
+  );
   const instructions =
     input.allocationPolicy?.({
       cycleBudget: new Decimal(input.cycleBudget),
-      candidates: input.candidates.map((candidate) =>
-        Object.freeze({
-          id: candidate.id,
-          conservativeNetEdge: new Decimal(candidate.conservativeNetEdge),
-          minimumSpend: new Decimal(candidate.minimumSpend),
-          maximumSpend: new Decimal(candidate.maximumSpend),
-          ...(candidate.context === undefined
-            ? {}
-            : {
-                context: Object.freeze({
-                  marketSlug: candidate.context.marketSlug,
-                  side: candidate.context.side,
-                  ...(candidate.context.eventId === undefined
-                    ? {}
-                    : { eventId: candidate.context.eventId }),
-                  ...(candidate.context.closesAt === undefined
-                    ? {}
-                    : { closesAt: candidate.context.closesAt }),
-                  quoteObservedAt: candidate.context.quoteObservedAt,
-                  authorizationProbability: new Decimal(
-                    candidate.context.authorizationProbability,
-                  ),
-                  limitPrice: new Decimal(candidate.context.limitPrice),
-                }),
-              }),
-        }),
-      ),
+      candidates: copies,
     }) ?? [];
   if (!Array.isArray(instructions))
     throw new TypeError("Allocation policy must return an array");
@@ -207,13 +234,27 @@ export function allocateBatchBudget<Candidate extends BatchAllocationCandidate>(
     });
   }
   const unallocatedSpend = input.cycleBudget.minus(committedSpend);
-  const unfunded = input.candidates
-    .filter((candidate) => !seen.has(candidate.id))
-    .map((candidate, index) => ({
-      candidate,
+  const unfunded = input.candidates.flatMap((candidate, inputIndex) => {
+    if (seen.has(candidate.id)) return [];
+    const copy = copies[inputIndex];
+    if (copy === undefined) throw new RangeError("Candidate copy is missing");
+    const policyExplanation = explainedOmission(input.allocationPolicy, copy);
+    return [
+      {
+        candidate,
+        reason: "POLICY_UNFUNDED" as const,
+        availableSpendAtDecision: unallocatedSpend,
+        ...(policyExplanation === undefined ? {} : { policyExplanation }),
+      },
+    ];
+  });
+  return {
+    allocations,
+    unfunded: unfunded.map((item, index) => ({
+      ...item,
       rank: allocations.length + index,
-      reason: "POLICY_UNFUNDED" as const,
-      availableSpendAtDecision: unallocatedSpend,
-    }));
-  return { allocations, unfunded, committedSpend, unallocatedSpend };
+    })),
+    committedSpend,
+    unallocatedSpend,
+  };
 }

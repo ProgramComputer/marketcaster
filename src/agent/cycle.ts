@@ -1592,19 +1592,37 @@ export async function runCycle(
         signal,
       );
       const allocationAssessments: unknown[] = [];
+      const allocationOmissions: { id: string; reason: string }[] = [];
+      const omissionReason = strategy.allocation.omissionReason;
       const result = await validateProposals({
-        allocationPolicy: (input) => {
-          const assessedInput: unknown = JSON.parse(JSON.stringify(input));
-          const instructions = strategy.allocation(input);
-          const returnedInstructions: unknown = JSON.parse(
-            JSON.stringify(instructions),
-          );
-          allocationAssessments.push({
-            input: assessedInput,
-            instructions: returnedInstructions,
-          });
-          return instructions;
-        },
+        allocationPolicy: Object.assign(
+          (input: Parameters<StrategyPolicy["allocation"]>[0]) => {
+            const assessedInput: unknown = JSON.parse(JSON.stringify(input));
+            const instructions = strategy.allocation(input);
+            const returnedInstructions: unknown = JSON.parse(
+              JSON.stringify(instructions),
+            );
+            allocationAssessments.push({
+              input: assessedInput,
+              instructions: returnedInstructions,
+            });
+            return instructions;
+          },
+          omissionReason === undefined
+            ? {}
+            : {
+                omissionReason: (
+                  candidate: Parameters<
+                    NonNullable<StrategyPolicy["allocation"]["omissionReason"]>
+                  >[0],
+                ) => {
+                  const reason = omissionReason(candidate);
+                  if (typeof reason === "string")
+                    allocationOmissions.push({ id: candidate.id, reason });
+                  return reason;
+                },
+              },
+        ),
         minimumNearTouchBuyNotionalUsd:
           dependencies.config.marketSelection.minimumNearTouchBuyNotionalUsd,
         depthPriceBand: strategy.selection.depthPriceBand,
@@ -1635,6 +1653,9 @@ export async function runCycle(
         {
           observedAt: now().toISOString(),
           assessments: allocationAssessments,
+          ...(allocationOmissions.length === 0
+            ? {}
+            : { omissions: allocationOmissions }),
           executionAuthorization: false,
         },
       );

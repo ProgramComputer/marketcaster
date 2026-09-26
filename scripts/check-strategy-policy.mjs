@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { Decimal } from "decimal.js";
 import { nearTouchBuyNotional } from "../dist/src/execution/depth.js";
 import { allocateBatchBudget } from "../dist/src/risk/batch-allocation.js";
+import { isRepairableRiskRejection } from "../dist/src/agent/decision-repair.js";
 import {
   loadStrategyPolicy,
   assertStrategyPolicy,
@@ -107,6 +108,54 @@ for (const instructions of [
 assert.throws(() =>
   allocateBatchBudget({ ...input, candidates: [candidate, candidate] }),
 );
+// A policy may explain an intentional omission; the explanation is final.
+const second = { ...candidate, id: "synthetic-second" };
+const explainedIds = [];
+const explained = allocateBatchBudget({
+  cycleBudget: new Decimal(5),
+  candidates: [candidate, second],
+  allocationPolicy: Object.assign(
+    () => [{ id: candidate.id, spend: new Decimal(1) }],
+    {
+      omissionReason: (item) => {
+        explainedIds.push(item.id);
+        assert(Object.isFrozen(item));
+        assert.notEqual(item, second);
+        return " synthetic exclusion ";
+      },
+    },
+  ),
+});
+assert.deepEqual(explainedIds, ["synthetic-second"]);
+assert.deepEqual(
+  explained.unfunded.map((item) => [
+    item.candidate.id,
+    item.reason,
+    item.policyExplanation,
+    item.rank,
+  ]),
+  [["synthetic-second", "POLICY_UNFUNDED", "synthetic exclusion", 1]],
+);
+const silent = allocateBatchBudget({
+  ...input,
+  allocationPolicy: Object.assign(() => [], {
+    omissionReason: () => undefined,
+  }),
+});
+assert.equal("policyExplanation" in silent.unfunded[0], false);
+for (const bad of ["", " ", "x".repeat(241), "line\nbreak", 7])
+  assert.throws(
+    () =>
+      allocateBatchBudget({
+        ...input,
+        allocationPolicy: Object.assign(() => [], {
+          omissionReason: () => bad,
+        }),
+      }),
+    /omission reason/,
+  );
+assert.equal(isRepairableRiskRejection("POLICY_UNFUNDED"), false);
+assert.equal(isRepairableRiskRejection("CYCLE_SPEND"), true);
 const temporaryDirectory = await mkdtemp(
   join(tmpdir(), "marketcaster-policy-"),
 );
@@ -139,8 +188,16 @@ try {
     { ...strategy, reconciliationTolerance: 7 },
     { ...strategy, selectMemoryContext: 7 },
     { ...strategy, resolutionReview: {} },
+    {
+      ...strategy,
+      allocation: Object.assign(() => [], { omissionReason: "synthetic" }),
+    },
   ])
     assert.throws(() => assertStrategyPolicy(invalid));
+  assertStrategyPolicy({
+    ...strategy,
+    allocation: Object.assign(() => [], { omissionReason: () => undefined }),
+  });
   const requests = [{ marketSlug: "synthetic", side: "YES" }];
   for (const point of [
     new Decimal("NaN"),
