@@ -96,11 +96,6 @@ export async function createDecisionProvider(
     throw new Error("LLM_API_KEY is required for the decision provider");
   }
   if (environment.LLM_PROVIDER === "openai") {
-    if (environment.LLM_FALLBACK_MODEL !== undefined) {
-      throw new Error(
-        "LLM_FALLBACK_MODEL is supported only by the Anthropic provider",
-      );
-    }
     if (options.reasoningEffort !== undefined) {
       throw new Error(
         "agent.reasoningEffort is supported only by the Anthropic provider",
@@ -132,9 +127,6 @@ export async function createDecisionProvider(
     ...(environment.LLM_CATALOG_MODEL === undefined
       ? {}
       : { catalogModelId: environment.LLM_CATALOG_MODEL }),
-    ...(environment.LLM_FALLBACK_MODEL === undefined
-      ? {}
-      : { fallbackModelId: environment.LLM_FALLBACK_MODEL }),
     ...(options.reasoningEffort === undefined
       ? {}
       : { reasoningEffort: options.reasoningEffort }),

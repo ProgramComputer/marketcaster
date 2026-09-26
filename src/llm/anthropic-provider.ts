@@ -183,8 +183,6 @@ export interface AnthropicDecisionProviderOptions {
   readonly apiKey: string;
   readonly modelId: string;
   readonly catalogModelId?: string;
-  /** Continues the conversation on this model after a safety refusal. */
-  readonly fallbackModelId?: string;
   readonly reasoningEffort?: ReasoningEffort;
   /** Turns on adaptive thinking for models where it is optional. */
   readonly extendedThinking?: boolean;
@@ -451,7 +449,6 @@ export class AnthropicDecisionProvider implements DecisionProvider {
   public readonly providerId = "anthropic";
   public readonly modelId: string;
   public readonly catalogModelId?: string;
-  public readonly fallbackModelId?: string;
   readonly #apiKey: string;
   readonly #reasoningEffort: ReasoningEffort | undefined;
   readonly #extendedThinking: boolean;
@@ -468,14 +465,6 @@ export class AnthropicDecisionProvider implements DecisionProvider {
       catalogModelId !== this.modelId
     ) {
       this.catalogModelId = catalogModelId;
-    }
-    const fallbackModelId = options.fallbackModelId?.trim();
-    if (
-      fallbackModelId !== undefined &&
-      fallbackModelId.length > 0 &&
-      fallbackModelId !== this.modelId
-    ) {
-      this.fallbackModelId = fallbackModelId;
     }
     this.#reasoningEffort = options.reasoningEffort;
     this.#extendedThinking = options.extendedThinking ?? false;
@@ -514,7 +503,6 @@ export class AnthropicDecisionProvider implements DecisionProvider {
         let catalogPhaseActive = this.catalogModelId !== undefined;
         let previousRequestModelId: string | undefined;
         let previousPhase: AnthropicDecisionPhase | undefined;
-        let fallbackActive = false;
         let pendingCorrection: AnthropicTurnCorrection | undefined;
         let turnCorrections = 0;
         const pendingServerToolUseIds = new Set<string>();
@@ -532,11 +520,9 @@ export class AnthropicDecisionProvider implements DecisionProvider {
         const thinks = (modelId: string): boolean =>
           this.#extendedThinking ||
           requiresAppendOnlyAnthropicConversation(modelId);
-        const preserveConversation = [
-          this.modelId,
-          this.catalogModelId,
-          this.fallbackModelId,
-        ].some((modelId) => modelId !== undefined && thinks(modelId));
+        const preserveConversation = [this.modelId, this.catalogModelId].some(
+          (modelId) => modelId !== undefined && thinks(modelId),
+        );
         while (
           pendingCorrection !== undefined ||
           schemaCorrectionPending ||
@@ -566,12 +552,9 @@ export class AnthropicDecisionProvider implements DecisionProvider {
             !repairActive &&
             !schemaCorrectionRound &&
             !finalRound;
-          const requestModelId =
-            fallbackActive && this.fallbackModelId !== undefined
-              ? this.fallbackModelId
-              : useCatalogModel
-                ? (this.catalogModelId ?? this.modelId)
-                : this.modelId;
+          const requestModelId = useCatalogModel
+            ? (this.catalogModelId ?? this.modelId)
+            : this.modelId;
           if (
             !preserveConversation &&
             previousRequestModelId !== undefined &&
@@ -831,15 +814,6 @@ export class AnthropicDecisionProvider implements DecisionProvider {
           try {
             if (parsedResponse.data.stop_reason === "refusal") {
               const category = anthropicRefusalCategory(responseBody);
-              if (this.fallbackModelId !== undefined && !fallbackActive) {
-                // Resend the same conversation on the fallback model; the
-                // refused turn is not appended.
-                fallbackActive = true;
-                diagnosticsPreviousMessageId = null;
-                previousInputTokens = undefined;
-                pendingCorrection = { schemaCorrectionRound, finalRound };
-                continue;
-              }
               throw new DecisionProviderError(
                 `Anthropic declined the request${category === undefined ? "" : ` (${category})`}`,
                 "REFUSAL",

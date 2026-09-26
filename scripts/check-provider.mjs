@@ -438,7 +438,6 @@ await (async () => {
     sequence,
     {
       modelId = "claude-opus-5-5",
-      fallbackModelId,
       reasoningEffort,
       extendedThinking,
       limits = {},
@@ -450,7 +449,6 @@ await (async () => {
     const provider = new AnthropicDecisionProvider({
       apiKey: "synthetic-fixture-key",
       modelId,
-      ...(fallbackModelId === undefined ? {} : { fallbackModelId }),
       ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
       ...(extendedThinking === undefined ? {} : { extendedThinking }),
       fetchImplementation: async (_url, init) => {
@@ -560,36 +558,14 @@ await (async () => {
   );
   assert.equal(stubborn.requests.length, 4);
 
-  // A refusal continues once on the fallback model; without one it is reported.
-  const fallback = run([refusal, submit], {
-    fallbackModelId: "claude-opus-4-6",
-    limits: { maximumRounds: 1 },
-  });
-  assert.equal((await fallback.decide).cycleSummary, validPlan.cycleSummary);
-  assert.equal(fallback.requests[0].model, "claude-opus-5-5");
-  assert.equal(fallback.requests[1].model, "claude-opus-4-6");
-  assert.deepEqual(
-    fallback.requests[1].messages,
-    fallback.requests[0].messages,
-  );
-  assert.equal(fallback.requests[1].thinking, undefined);
-  assert.deepEqual(fallback.requests[1].tool_choice, {
-    type: "tool",
-    name: "submit_trade_plan",
-  });
-  const refused = run([refusal]);
+  // A safety refusal stops the decision with its category and no retry.
+  const refused = run([refusal, submit]);
   await assert.rejects(
     refused.decide,
     (error) =>
       error.code === "REFUSAL" && /synthetic-category/u.test(error.message),
   );
-  const refusedAgain = run([refusal, refusal], {
-    fallbackModelId: "claude-opus-4-6",
-  });
-  await assert.rejects(
-    refusedAgain.decide,
-    (error) => error.code === "REFUSAL",
-  );
+  assert.equal(refused.requests.length, 1);
 
   // Effort and output size come from configuration; forced models keep their
   // forced tool choice and send no thinking configuration.
@@ -647,6 +623,6 @@ await (async () => {
   await relaxed.decide;
   assert.deepEqual(relaxed.requests[1].tool_choice, { type: "any" });
   process.stdout.write(
-    "Anthropic turn corrections, refusal fallback, effort, and configurable limits passed.\n",
+    "Anthropic turn corrections, refusal reporting, effort, and configurable limits passed.\n",
   );
 })();

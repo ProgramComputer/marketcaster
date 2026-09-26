@@ -91,7 +91,6 @@ export const RuntimeEnvironmentSchema = z
     LLM_BASE_URL: optionalHttpUrl,
     LLM_MODEL: z.string().min(1),
     LLM_CATALOG_MODEL: optionalModelId,
-    LLM_FALLBACK_MODEL: optionalModelId,
     MARKETCASTER_CONFIG_PATH: optionalFileSystemPath,
     MARKETCASTER_STRATEGY_PATH: optionalFileSystemPath,
     MARKETCASTER_DECISION_PROMPT_PATH: optionalFileSystemPath,
