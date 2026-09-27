@@ -26,7 +26,10 @@ export interface DecisionLimits {
   readonly contextPressureInputTokens: number;
 }
 
-export const HARD_MAXIMUM_DECISION_LIMITS: DecisionLimits = Object.freeze({
+/** The decision deadline is left to configuration and the cycle deadline. */
+export const HARD_MAXIMUM_DECISION_LIMITS: Readonly<
+  Omit<DecisionLimits, "timeoutMilliseconds">
+> = Object.freeze({
   maximumRounds: 40,
   maximumMarketDiscoveryRequests: 20,
   maximumWebSearches: 25,
@@ -36,7 +39,6 @@ export const HARD_MAXIMUM_DECISION_LIMITS: DecisionLimits = Object.freeze({
   maximumMarketAnalysisRequests: 20,
   maximumTradePreviewRequests: 12,
   maximumNoteOperations: 20,
-  timeoutMilliseconds: 1_500_000,
   maximumOutputTokens: 32_768,
   contextPressureInputTokens: 1_000_000,
 });
@@ -474,7 +476,7 @@ export function resolveDecisionLimits(
   };
   for (const key of Object.keys(
     HARD_MAXIMUM_DECISION_LIMITS,
-  ) as (keyof DecisionLimits)[]) {
+  ) as (keyof typeof HARD_MAXIMUM_DECISION_LIMITS)[]) {
     const value = resolved[key];
     const maximum = HARD_MAXIMUM_DECISION_LIMITS[key];
     if (value !== null && maximum !== null && value > maximum) {

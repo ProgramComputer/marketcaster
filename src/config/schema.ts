@@ -198,7 +198,7 @@ export const RepositoryConfigSchema = z
         passResearch: PassResearchConfigSchema,
         memory: AgentMemoryConfigSchema,
         state: AgentStateConfigSchema,
-        timeoutSeconds: PositiveIntegerSchema.max(1_500),
+        timeoutSeconds: PositiveIntegerSchema,
       })
       .strict(),
     risk: z

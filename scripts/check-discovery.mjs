@@ -201,6 +201,7 @@ await (async () => {
     input.agent.contextPressureInputTokens = 400_000;
     input.agent.reasoningEffort = "high";
     input.agent.extendedThinking = true;
+    input.agent.timeoutSeconds = 3_600;
     const parsed = RepositoryConfigSchema.parse(input);
     assert.equal(parsed.agent.maximumTradePreviewRequests, null);
     assert.equal(parsed.agent.reasoningEffort, "high");
@@ -209,6 +210,7 @@ await (async () => {
     assert.equal(limits.maximumTradePreviewRequests, null);
     assert.equal(limits.maximumOutputTokens, 32_768);
     assert.equal(limits.contextPressureInputTokens, 400_000);
+    assert.equal(limits.timeoutMilliseconds, 3_600_000);
 
     for (const [field, invalid] of [
       ["maximumTradePreviewRequests", 13],
@@ -217,6 +219,7 @@ await (async () => {
       ["contextPressureInputTokens", 0],
       ["reasoningEffort", "extreme"],
       ["extendedThinking", "adaptive"],
+      ["timeoutSeconds", 0],
     ]) {
       const candidate = globalThis.structuredClone(input);
       candidate.agent[field] = invalid;
