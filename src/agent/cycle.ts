@@ -48,6 +48,10 @@ import {
 import { buildCycleReport } from "../reporting/build-report.js";
 import { persistCrossCycleHistory } from "../reporting/cross-cycle-history.js";
 import {
+  loadEntryFills,
+  summarizeSettledPositions,
+} from "./settled-positions.js";
+import {
   assertNoUnresolvedLiveJournals,
   UnresolvedLiveJournalError,
 } from "../reporting/journal-recovery.js";
@@ -1377,10 +1381,25 @@ export async function runCycle(
     if (agentState.persistent && strategy.selectMemoryContext !== undefined) {
       agentStateContext = await agentState.load(memoryContextScope);
     }
+    const settledPositions =
+      strategy.selection.buildCriticalLearning === undefined ||
+      dependencies.writeReports === false
+        ? []
+        : summarizeSettledPositions(
+            initialSnapshot.recentActivities,
+            await loadEntryFills({
+              rootDirectory: dependencies.config.reporting.directory,
+              exchangeId: dependencies.exchange.id,
+              accountScope,
+            }),
+          );
     const contextInput: BuildAgentContextInput = {
       ...(strategy.selection.buildCriticalLearning === undefined
         ? {}
-        : { criticalLearningPolicy: strategy.selection.buildCriticalLearning }),
+        : {
+            criticalLearningPolicy: strategy.selection.buildCriticalLearning,
+            settledPositions,
+          }),
       observedAt: startedAt,
       exchangeId: dependencies.exchange.id,
       exchangeName:

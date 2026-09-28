@@ -218,6 +218,41 @@ function failure(
   return { persisted: false, reason };
 }
 
+export interface ReadCrossCycleHistoryInput {
+  readonly rootDirectory: string;
+  readonly exchangeId: CycleReport["exchangeId"];
+  readonly accountScope: string;
+}
+
+/**
+ * Reads the account-scoped index for derived, advisory views. A missing,
+ * unreadable, foreign-scoped, or invalid index is treated as no history.
+ */
+export async function readCrossCycleHistory(
+  input: ReadCrossCycleHistoryInput,
+): Promise<CrossCycleHistory | undefined> {
+  let accountScope: string;
+  try {
+    accountScope = assertSafeMemoryScope(input.accountScope);
+  } catch {
+    return undefined;
+  }
+  if (accountScope === UNSCOPED_MEMORY_SCOPE) return undefined;
+  const read = await readHistory(
+    historyPath(input.rootDirectory, input.exchangeId, accountScope),
+  );
+  if (read.kind !== "VALUE") return undefined;
+  const parsed = HistorySchema.safeParse(read.value);
+  if (
+    !parsed.success ||
+    parsed.data.exchangeId !== input.exchangeId ||
+    parsed.data.accountScope !== accountScope
+  ) {
+    return undefined;
+  }
+  return parsed.data as unknown as CrossCycleHistory;
+}
+
 /**
  * Updates a bounded, account-scoped cross-cycle index. Callers intentionally
  * invoke this only after the authoritative run journal has completed; every

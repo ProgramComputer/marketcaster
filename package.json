@@ -17,7 +17,7 @@
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node scripts/check-discovery.mjs && node scripts/check-risk.mjs && node scripts/check-provider.mjs && node scripts/check-boundaries.mjs && node scripts/check-policy.mjs && node scripts/check-position-reductions.mjs && node scripts/check-observe-policy.mjs && node --import tsx scripts/check-evidence.mjs && node --import tsx scripts/check-execution.mjs && node --import tsx scripts/check-memory-feedback.mjs"
+    "test": "node scripts/check-discovery.mjs && node scripts/check-risk.mjs && node scripts/check-provider.mjs && node scripts/check-boundaries.mjs && node scripts/check-policy.mjs && node scripts/check-position-reductions.mjs && node scripts/check-observe-policy.mjs && node --import tsx scripts/check-evidence.mjs && node --import tsx scripts/check-execution.mjs && node --import tsx scripts/check-memory-feedback.mjs && node --import tsx scripts/check-settled-positions.mjs"
   },
   "dependencies": {
     "decimal.js": "10.6.0",

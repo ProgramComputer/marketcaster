@@ -1,4 +1,5 @@
 import type { Decimal } from "decimal.js";
+import { z } from "zod";
 import type { AccountSnapshot } from "../domain/account.js";
 import type { ExecutionStatus } from "../domain/execution.js";
 import type {
@@ -25,6 +26,7 @@ import type { RecentPerformance } from "./recent-performance.js";
 import { summarizeRecentPerformance } from "./recent-performance.js";
 import type { OpportunityBoardItem } from "./opportunity-board.js";
 import type { PreviousCycleAdvisory } from "../reporting/previous-cycle-advisory.js";
+import type { SettledPosition } from "./settled-positions.js";
 
 export interface PositionValuationInput {
   readonly marketSlug: string;
@@ -89,6 +91,8 @@ export interface BuildAgentContextInput {
   readonly valuation?: PortfolioValuationInput;
   readonly recentPerformance?: RecentPerformance;
   readonly criticalLearningPolicy?: CriticalLearningPolicy;
+  /** Settlements joined to recorded entries, for the critical-learning policy. */
+  readonly settledPositions?: readonly SettledPosition[];
   readonly recentExecutionOutcomes?: readonly RecentExecutionOutcomeInput[];
   readonly previousCycle?: PreviousCycleAdvisory;
   readonly memory?: AgentMemoryContext;
@@ -247,6 +251,7 @@ export interface AgentContext {
     readonly winningPatternAssessment: string;
     readonly losingPatternAssessment: string;
     readonly positionManagementReminders: readonly string[];
+    readonly scorecard?: SettlementScorecard;
   };
   readonly markets: {
     readonly catalogCount: number;
@@ -327,7 +332,64 @@ function positionValuationMap(
 export type CriticalLearningPolicy = (
   performance: RecentPerformance,
   previousCycle: PreviousCycleAdvisory | undefined,
+  settledPositions: readonly SettledPosition[],
 ) => AgentContext["criticalLearning"];
+
+const DECIMAL_TEXT = /^-?\d+(?:\.\d+)?$/u;
+const CountSchema = z.number().int().min(0).max(10_000);
+const SettlementScorecardSchema = z
+  .object({
+    basis: z.string().min(1).max(400),
+    settledPositions: CountSchema,
+    groups: z
+      .array(
+        z
+          .object({
+            dimension: z.string().min(1).max(40),
+            group: z.string().min(1).max(60),
+            settled: CountSchema,
+            won: CountSchema,
+            lost: CountSchema,
+            unknown: CountSchema,
+            costUsd: z.string().regex(DECIMAL_TEXT),
+            realizedPnlUsd: z.string().regex(DECIMAL_TEXT),
+          })
+          .strict(),
+      )
+      .max(80),
+    calibration: z
+      .array(
+        z
+          .object({
+            band: z.string().min(1).max(40),
+            settled: CountSchema,
+            won: CountSchema,
+            meanProbability: z.string().regex(DECIMAL_TEXT),
+            meanEntryPrice: z.string().regex(DECIMAL_TEXT),
+          })
+          .strict(),
+      )
+      .max(20),
+  })
+  .strict();
+
+/**
+ * Policy-built summary of settled positions. The engine bounds its size; the
+ * grouping and interpretation belong to the deployment policy.
+ */
+export type SettlementScorecard = z.infer<typeof SettlementScorecardSchema>;
+
+function checkedCriticalLearning(
+  learning: AgentContext["criticalLearning"],
+): AgentContext["criticalLearning"] {
+  if (
+    learning.scorecard !== undefined &&
+    !SettlementScorecardSchema.safeParse(learning.scorecard).success
+  ) {
+    throw new TypeError("Strategy settlement scorecard is invalid");
+  }
+  return learning;
+}
 
 function buildCriticalLearning(
   performance: RecentPerformance,
@@ -655,7 +717,13 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
   const criticalLearning =
     input.criticalLearningPolicy === undefined
       ? buildCriticalLearning(performance)
-      : input.criticalLearningPolicy(performance, input.previousCycle);
+      : checkedCriticalLearning(
+          input.criticalLearningPolicy(
+            performance,
+            input.previousCycle,
+            input.settledPositions ?? [],
+          ),
+        );
 
   return {
     currentUtcTime,

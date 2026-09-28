@@ -19,6 +19,15 @@ run as trusted local code, not in a sandbox.
   why a candidate is intentionally left unfunded, in 1 to 240 printable ASCII
   characters. The model then receives a final `POLICY_UNFUNDED` rejection with
   that reason instead of a repairable `CYCLE_SPEND` rejection.
+- An optional `selection.buildCriticalLearning` hook receives `performance`,
+  `previousCycle` and `settledPositions`, and shapes the advisory learning block
+  in the prompt. `settledPositions` joins each settlement in the exchange
+  activity window to the BUY fills recorded in the cross-cycle history, with the
+  probabilities from each entry cycle's own report. Markets with recorded SELL
+  fills, fills on both sides, or no recorded entry are omitted, and zero realized
+  PnL is `UNKNOWN`. The block may include a `scorecard` of grouped counts, PnL
+  and probability bands; the engine rejects one that exceeds its size and field
+  bounds.
 - Optional cooldown durations apply to typed execution failures. State is isolated
   by account, exchange, market, outcome side, and action; it contains no raw errors.
 - An optional version 1 `evidenceContentAdapter` can extract text from a fetched
