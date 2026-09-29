@@ -30,6 +30,7 @@ import { reconcileAmbiguousSubmission } from "./reconcile.js";
 import {
   ManagedBuyBatch,
   ManagedBuyStateError,
+  isManagedBuyOrder,
   managedBuyResult,
   type ManagedBuyCheck,
 } from "./managed-buy-batch.js";
@@ -1137,9 +1138,14 @@ export async function executeValidatedOrders(
           }
         }
       }
+      // A filled managed BUY joins the batch like a resting one, so later
+      // reads are explained by its order ID, fill and fee rather than
+      // compared with a post-order read the venue may still be updating.
       if (
         result.status !== "AMBIGUOUS" &&
-        (result.status === "WORKING" || managedBatch !== undefined)
+        (result.status === "WORKING" ||
+          managedBatch !== undefined ||
+          (result.filledQuantity.gt(0) && isManagedBuyOrder(validated.order)))
       ) {
         try {
           managedBatch ??= new ManagedBuyBatch(currentSnapshot);

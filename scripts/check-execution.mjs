@@ -974,6 +974,8 @@ await (async () => {
     const start = D(options.start ?? 100);
     let raced = false;
     let canceled = 0;
+    let accountReads = 0;
+    const placedAtRead = new Map();
     function changeB(quantity, state = "PARTIALLY_FILLED") {
       const b = orders.get("order-2");
       orders.set(b.id, {
@@ -982,11 +984,12 @@ await (async () => {
         remainingQuantity: active({ state })
           ? b.quantity.minus(quantity)
           : D(0),
-        fees: D(quantity).mul("0.01"),
+        fees: D(quantity).mul(options.feeRate ?? "0.01"),
         state,
       });
     }
     function account() {
+      accountReads += 1;
       let currentBalance = start;
       let buyingPower = start;
       let marginRequirement = D(0);
@@ -999,6 +1002,12 @@ await (async () => {
             : order.averageFillPrice,
         );
         const cost = principal.plus(order.fees);
+        // The venue debits the fee from cash at once, but it may reach the
+        // position's cost only after the first read that follows the fill.
+        const feeInCost =
+          options.feeInCost === "posted" ||
+          (options.feeInCost === "lagged" &&
+            accountReads > placedAtRead.get(order.id) + 1);
         buyingPower = buyingPower.minus(cost);
         currentBalance = currentBalance
           .minus(cost)
@@ -1012,7 +1021,9 @@ await (async () => {
             side: order.side,
             quantity: order.filledQuantity,
             availableQuantity: order.filledQuantity,
-            costBasis: principal,
+            costBasis: feeInCost
+              ? cost.plus(options.costExtra ?? 0)
+              : principal,
             realizedPnl: D(0),
             expired: false,
           });
@@ -1118,9 +1129,10 @@ await (async () => {
             sent.length === 2 && options.roundedAverage
               ? D("0.57")
               : order.canonicalLimitPrice,
-          fees: filled.mul("0.01"),
+          fees: filled.mul(options.feeRate ?? "0.01"),
         };
         orders.set(stored.id, stored);
+        placedAtRead.set(stored.id, accountReads);
         return {
           orderId: stored.id,
           status:
@@ -1271,10 +1283,58 @@ await (async () => {
     ],
   });
   assert.equal(multi.sent.length, 4, "Multiple known working BUYs may coexist");
-  assert.equal(multi.execution.managedOrderChecks.length, 2);
+  // The filled first BUY starts the batch, so every later BUY is reconciled.
+  assert.equal(multi.execution.managedOrderChecks.length, 3);
 
   for (const bStatus of ["FILLED", "PARTIAL"])
     assert.equal((await scenario({ bStatus })).sent.length, 3);
+
+  // A fee that reaches position cost after the post-order read is explained
+  // by the order that paid it, whether the fill completed or kept resting.
+  for (const feeInCost of ["lagged", "posted"])
+    for (const bStatus of ["FILLED", undefined]) {
+      const run = await scenario({ feeInCost, bStatus });
+      assert.equal(run.sent.length, 3, `${feeInCost} fee, B ${bStatus}`);
+      assert.equal(run.execution.stoppedForAmbiguity, false);
+      assert.ok(
+        run.execution.attempts.every((attempt) => !attempt.skippedReason),
+        `${feeInCost} fee, B ${bStatus}: no order is skipped`,
+      );
+    }
+  // Below half a tick per contract, cash decides whether the fee is in cost.
+  for (const feeInCost of ["lagged", "posted"])
+    assert.equal(
+      (await scenario({ feeInCost, feeRate: "0.004", bStatus: "FILLED" })).sent
+        .length,
+      3,
+      `${feeInCost} sub-tick fee`,
+    );
+  // The venue may round the fee it adds to cost by a fraction of a cent.
+  assert.equal(
+    (
+      await scenario({
+        feeInCost: "lagged",
+        costExtra: "0.0002",
+        bStatus: "FILLED",
+      })
+    ).sent.length,
+    3,
+    "Sub-cent rounding of the fee in cost is explained",
+  );
+  const beyondCent = await scenario({
+    feeInCost: "posted",
+    costExtra: "0.02",
+    bStatus: "FILLED",
+  });
+  assert.equal(beyondCent.sent.length, 1, "Cost two cents past the fee stops");
+  assert.equal(beyondCent.execution.stoppedForAmbiguity, true);
+  const unexplained = await scenario({
+    feeInCost: "posted",
+    costExtra: "0.05",
+    bStatus: "FILLED",
+  });
+  assert.equal(unexplained.sent.length, 1, "Cost beyond fill and fee stops");
+  assert.equal(unexplained.execution.stoppedForAmbiguity, true);
   assert.equal((await scenario({ mode: "observe" })).sent.length, 0);
 
   const reserved = await scenario({ start: 13, bFilled: 1 });

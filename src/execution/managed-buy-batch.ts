@@ -19,6 +19,17 @@ const TERMINAL = new Set([
 const PRECISION = new Decimal("0.00000001");
 const equal = (a: Decimal, b: Decimal): boolean =>
   a.minus(b).abs().lte(PRECISION);
+const MAXIMUM_PRINCIPAL_TOTALS = 4_096;
+// Polymarket US may round the fee it adds to position cost differently from
+// the fee reported on the order; observed differences are under a tenth of a
+// cent. A cost that includes the fee therefore fixes the principal to a cent.
+const FEE_IN_COST_ROUNDING = new Decimal("0.01");
+
+/** A principal the position cost change allows, within `slack`. */
+interface PrincipalChoice {
+  readonly principal: Decimal;
+  readonly slack: Decimal;
+}
 
 interface SubmittedBuy {
   readonly order: ImmediateOrder;
@@ -65,6 +76,73 @@ function sameOrder(a: ExchangeOrder, b: ExchangeOrder): boolean {
     a.executionPolicy === b.executionPolicy &&
     a.restUntil?.getTime() === b.restUntil?.getTime()
   );
+}
+
+/** Orders the batch can track: current-cycle Polymarket US GTD BUYs. */
+export function isManagedBuyOrder(order: ImmediateOrder): boolean {
+  return (
+    order.action === "BUY" &&
+    order.executionPolicy === "GTD" &&
+    order.marketId.exchange === "polymarket-us"
+  );
+}
+
+/** Whether a principal choice fits this order's fill and reservation. */
+function fitsFill(
+  { principal, slack }: PrincipalChoice,
+  order: ExchangeOrder,
+  buy: SubmittedBuy,
+): boolean {
+  const unfilled = buy.order.quantity
+    .minus(order.filledQuantity)
+    .mul(buy.order.canonicalLimitPrice);
+  return (
+    principal.isFinite() &&
+    principal.gte(0) &&
+    principal
+      .minus(slack)
+      .lte(order.filledQuantity.mul(buy.order.canonicalLimitPrice)) &&
+    principal
+      .minus(slack)
+      .plus(order.fees ?? 0)
+      .plus(unfilled)
+      .lte(buy.reservedSpend) &&
+    (order.filledQuantity.eq(0) ||
+      principal
+        .div(order.filledQuantity)
+        .minus(order.averageFillPrice ?? 0)
+        .abs()
+        .lte(
+          buy.priceTick
+            .div(2)
+            .plus(slack.div(order.filledQuantity))
+            .plus(PRECISION),
+        ))
+  );
+}
+
+/** Every total of one principal choice per order, bounded. */
+function principalTotals(
+  choices: readonly (readonly PrincipalChoice[])[],
+): readonly PrincipalChoice[] {
+  let totals: PrincipalChoice[] = [
+    { principal: new Decimal(0), slack: new Decimal(0) },
+  ];
+  for (const options of choices) {
+    const next = new Map<string, PrincipalChoice>();
+    for (const total of totals)
+      for (const option of options) {
+        const sum = {
+          principal: total.principal.plus(option.principal),
+          slack: total.slack.plus(option.slack),
+        };
+        next.set(`${sum.principal.toFixed()}:${sum.slack.toFixed()}`, sum);
+      }
+    if (next.size > MAXIMUM_PRINCIPAL_TOTALS)
+      fail("Managed BUY cost reconciliation has too many fee interpretations");
+    totals = [...next.values()];
+  }
+  return totals;
 }
 
 export function managedBuyResult(order: ExchangeOrder): ExecutionResult {
@@ -114,12 +192,7 @@ export class ManagedBuyBatch {
     ) {
       fail("Managed BUY submission has a missing or duplicate order ID");
     }
-    if (
-      order.action !== "BUY" ||
-      order.executionPolicy !== "GTD" ||
-      order.marketId.exchange !== "polymarket-us" ||
-      this.hasMarket(order.marketSlug)
-    ) {
+    if (!isManagedBuyOrder(order) || this.hasMarket(order.marketSlug)) {
       fail(
         "Managed BUY continuation requires independent current-cycle markets",
       );
@@ -212,6 +285,7 @@ export class ManagedBuyBatch {
       expected.set(key(position), position);
     }
     let expectedCash = this.baseline.currentBalance;
+    const principalChoices: PrincipalChoice[][] = [];
     for (const order of orders) {
       const opposite = expected.get(
         key({ ...order, side: order.side === "YES" ? "NO" : "YES" }),
@@ -226,37 +300,35 @@ export class ManagedBuyBatch {
       );
       // Order averages can be rounded to the exchange's price tick. Position
       // cost basis retains the actual principal, including mixed-price fills.
-      const principal = (actual?.costBasis ?? new Decimal(0)).minus(
+      // Polymarket US debits a fill's fee from cash when it executes but may
+      // add it to the position's cost a moment later, so the cost change is
+      // the principal alone or the principal plus this order's reported fee.
+      const costChange = (actual?.costBasis ?? new Decimal(0)).minus(
         old?.costBasis ?? 0,
       );
-      if (
-        !principal.isFinite() ||
-        principal.lt(0) ||
-        principal.gt(order.filledQuantity.mul(buy.order.canonicalLimitPrice)) ||
-        principal
-          .plus(order.fees ?? 0)
-          .plus(
-            buy.order.quantity
-              .minus(order.filledQuantity)
-              .mul(buy.order.canonicalLimitPrice),
-          )
-          .gt(buy.reservedSpend) ||
-        (order.filledQuantity.gt(0) &&
-          principal
-            .div(order.filledQuantity)
-            .minus(order.averageFillPrice ?? 0)
-            .abs()
-            .gt(buy.priceTick.div(2).plus(PRECISION)))
-      ) {
+      const fees = order.fees ?? new Decimal(0);
+      const exact = { principal: costChange, slack: new Decimal(0) };
+      const principals = (
+        fees.isZero()
+          ? [exact]
+          : [
+              exact,
+              {
+                principal: costChange.minus(fees),
+                slack: FEE_IN_COST_ROUNDING,
+              },
+            ]
+      ).filter((choice) => fitsFill(choice, order, buy));
+      if (principals.length === 0) {
         fail(
           "Position cost does not match the verified BUY fill and reservation",
         );
       }
+      principalChoices.push(principals);
       // Polymarket US represents BUY NO as selling YES against $1 collateral.
       expectedCash = expectedCash
         .plus(order.side === "NO" ? order.filledQuantity : 0)
-        .minus(principal)
-        .minus(order.fees ?? 0);
+        .minus(fees);
       if (order.filledQuantity.eq(0)) continue;
       expected.set(key(order), {
         ...(old ?? {
@@ -270,10 +342,17 @@ export class ManagedBuyBatch {
         availableQuantity: (old?.availableQuantity ?? new Decimal(0)).plus(
           order.filledQuantity,
         ),
-        costBasis: (old?.costBasis ?? new Decimal(0)).plus(principal),
+        costBasis: (old?.costBasis ?? new Decimal(0)).plus(costChange),
       });
     }
-    if (!equal(account.currentBalance, expectedCash))
+    // Cash already reflects every fee, so it decides between the principals
+    // when a fee is too small to tell them apart by fill price.
+    const cashSpentOnPrincipal = expectedCash.minus(account.currentBalance);
+    if (
+      !principalTotals(principalChoices).some(({ principal, slack }) =>
+        cashSpentOnPrincipal.minus(principal).abs().lte(slack.plus(PRECISION)),
+      )
+    )
       fail("Account capital changed beyond verified current-cycle BUY fills");
     if (account.positions.length !== expected.size)
       fail("Account positions changed beyond verified current-cycle BUY fills");

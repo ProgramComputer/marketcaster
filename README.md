@@ -165,9 +165,10 @@ execution. When enabled, marketable quantity may fill immediately and any
 remainder may rest until the runtime-set expiration. Configuration limits that
 lifetime to at most 15 minutes.
 
-A verified current-cycle GTD BUY does not stop later independent BUYs. Before
-continuing, execution reconciles every tracked order by ID and verifies that
-its fills explain the account's positions and cash. Full submission cost
+A verified current-cycle GTD BUY, filled or working, does not stop later
+independent BUYs. Before continuing, execution reconciles every tracked order
+by ID and verifies that its fills and fees explain the account's positions and
+cash. Full submission cost
 remains reserved through the batch, including unfilled quantity. Available
 capital is bounded by both fresh exchange buying power and the batch's cash
 budget; exchange collateral is not deducted twice. This continuation applies
