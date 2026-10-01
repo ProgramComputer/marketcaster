@@ -427,6 +427,40 @@ export function mapPosition(
   };
 }
 
+type PolymarketPositionResolution = NonNullable<
+  PolymarketActivity["positionResolution"]
+>;
+
+/**
+ * Some settled positions report zero realized PnL and move the settled amount
+ * into the after-position cost. The resolution side (LONG settled YES, SHORT
+ * settled NO) and the position before settlement still determine it: the
+ * payout of a winning position minus its cost basis.
+ */
+function settledPositionPnl(
+  resolution: PolymarketPositionResolution,
+): Decimal | undefined {
+  const before = resolution.beforePosition;
+  const netPosition = before?.netPositionDecimal ?? before?.netPosition;
+  const costBasis = before?.baseCost?.value ?? before?.cost?.value;
+  const settledYes =
+    resolution.side === "POSITION_RESOLUTION_SIDE_LONG"
+      ? true
+      : resolution.side === "POSITION_RESOLUTION_SIDE_SHORT"
+        ? false
+        : undefined;
+  if (
+    netPosition === undefined ||
+    netPosition.isZero() ||
+    costBasis === undefined ||
+    settledYes === undefined
+  ) {
+    return undefined;
+  }
+  const won = netPosition.isPositive() === settledYes;
+  return (won ? netPosition.abs() : new Decimal(0)).minus(costBasis);
+}
+
 export function mapActivity(
   value: PolymarketActivity,
 ): readonly AccountActivity[] {
@@ -458,13 +492,16 @@ export function mapActivity(
   }
   if (value.positionResolution !== undefined) {
     const resolution = value.positionResolution;
-    const realizedPnl =
+    const reportedPnl =
       resolution.realizedPnl?.value ??
       resolution.afterPosition?.realized.value.minus(
         resolution.beforePosition?.realized.value ??
           schemaFailure("Resolution is missing before realized PnL"),
       ) ??
       schemaFailure("Resolution is missing realized PnL");
+    const realizedPnl = reportedPnl.isZero()
+      ? (settledPositionPnl(resolution) ?? reportedPnl)
+      : reportedPnl;
     return [
       {
         kind: "RESOLUTION",

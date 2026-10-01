@@ -1,4 +1,4 @@
-import type { Decimal } from "decimal.js";
+import { Decimal } from "decimal.js";
 import { z } from "zod";
 import type { AccountSnapshot } from "../domain/account.js";
 import type { ExecutionStatus } from "../domain/execution.js";
@@ -97,6 +97,11 @@ export interface BuildAgentContextInput {
   readonly previousCycle?: PreviousCycleAdvisory;
   readonly memory?: AgentMemoryContext;
   readonly agentState?: AgentStateContext;
+  /**
+   * False omits previous-cycle, recent-performance and realized-outcome history
+   * and skips the critical-learning policy. Defaults to true.
+   */
+  readonly historyEnabled?: boolean;
 }
 
 export interface PreloadedMarketInput {
@@ -206,7 +211,7 @@ export interface AgentContext {
     readonly spendableCapitalUsd?: string;
   };
   readonly positions: readonly PositionContext[];
-  readonly recentPerformance: {
+  readonly recentPerformance?: {
     readonly settlements: readonly {
       readonly marketSlug: string;
       readonly realizedPnlUsd: string;
@@ -394,13 +399,27 @@ function checkedCriticalLearning(
 function buildCriticalLearning(
   performance: RecentPerformance,
 ): AgentContext["criticalLearning"] {
-  const outcomes = [...performance.settlements, ...performance.closedTrades];
+  // One market can close in several fills and settle once; list it once by
+  // its net realized PnL.
+  const netByMarket = new Map<string, Decimal>();
+  for (const item of [
+    ...performance.settlements,
+    ...performance.closedTrades,
+  ]) {
+    netByMarket.set(
+      item.marketSlug,
+      (netByMarket.get(item.marketSlug) ?? new Decimal(0)).plus(
+        item.realizedPnl,
+      ),
+    );
+  }
+  const outcomes = [...netByMarket];
   const profitableMarketSlugs = outcomes
-    .filter((item) => item.realizedPnl.gt(0))
-    .map((item) => item.marketSlug);
+    .filter(([, pnl]) => pnl.gt(0))
+    .map(([marketSlug]) => marketSlug);
   const losingMarketSlugs = outcomes
-    .filter((item) => item.realizedPnl.lt(0))
-    .map((item) => item.marketSlug);
+    .filter(([, pnl]) => pnl.lt(0))
+    .map(([marketSlug]) => marketSlug);
   return {
     advisoryOnly: true,
     realizedOutcomeSampleSize: outcomes.length,
@@ -413,6 +432,21 @@ function buildCriticalLearning(
     positionManagementReminders: [
       "Historical summaries and notes are advisory; current evidence and validation remain required.",
     ],
+  };
+}
+
+const OMITTED_HISTORY_ASSESSMENT =
+  "Realized-outcome history is omitted by configuration.";
+
+function omittedHistoryLearning(): AgentContext["criticalLearning"] {
+  return {
+    advisoryOnly: true,
+    realizedOutcomeSampleSize: 0,
+    profitableMarketSlugs: [],
+    losingMarketSlugs: [],
+    winningPatternAssessment: OMITTED_HISTORY_ASSESSMENT,
+    losingPatternAssessment: OMITTED_HISTORY_ASSESSMENT,
+    positionManagementReminders: [],
   };
 }
 
@@ -714,8 +748,10 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
   );
   const allowPositionReductions =
     input.riskConstraints.allowPositionReductions ?? true;
-  const criticalLearning =
-    input.criticalLearningPolicy === undefined
+  const historyEnabled = input.historyEnabled ?? true;
+  const criticalLearning = !historyEnabled
+    ? omittedHistoryLearning()
+    : input.criticalLearningPolicy === undefined
       ? buildCriticalLearning(performance)
       : checkedCriticalLearning(
           input.criticalLearningPolicy(
@@ -788,43 +824,53 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
         : { spendableCapitalUsd: spendableCapital }),
     },
     positions,
-    recentPerformance: {
-      settlements: performance.settlements.map((settlement) => ({
-        marketSlug: settlement.marketSlug,
-        realizedPnlUsd: decimalString(
-          settlement.realizedPnl,
-          "settlement realizedPnl",
-        ),
-        resolvedAt: isoDate(settlement.resolvedAt, "settlement resolvedAt"),
-      })),
-      closedTrades: performance.closedTrades.map((trade) => ({
-        tradeId: trade.tradeId,
-        marketSlug: trade.marketSlug,
-        price: decimalString(trade.price, "closed trade price"),
-        quantity: decimalString(trade.quantity, "closed trade quantity"),
-        costBasisUsd: decimalString(trade.costBasis, "closed trade costBasis"),
-        realizedPnlUsd: decimalString(
-          trade.realizedPnl,
-          "closed trade realizedPnl",
-        ),
-        state: trade.state,
-        aggressor: trade.aggressor,
-        createdAt: isoDate(trade.createdAt, "closed trade createdAt"),
-        updatedAt: isoDate(trade.updatedAt, "closed trade updatedAt"),
-      })),
-      settlementRealizedPnlUsd: decimalString(
-        performance.settlementRealizedPnl,
-        "performance settlementRealizedPnl",
-      ),
-      closedTradeRealizedPnlUsd: decimalString(
-        performance.closedTradeRealizedPnl,
-        "performance closedTradeRealizedPnl",
-      ),
-      profitableOutcomeCount: performance.profitableOutcomeCount,
-      losingOutcomeCount: performance.losingOutcomeCount,
-      flatOutcomeCount: performance.flatOutcomeCount,
-      bustedTradeCount: performance.bustedTradeCount,
-    },
+    ...(historyEnabled
+      ? {
+          recentPerformance: {
+            settlements: performance.settlements.map((settlement) => ({
+              marketSlug: settlement.marketSlug,
+              realizedPnlUsd: decimalString(
+                settlement.realizedPnl,
+                "settlement realizedPnl",
+              ),
+              resolvedAt: isoDate(
+                settlement.resolvedAt,
+                "settlement resolvedAt",
+              ),
+            })),
+            closedTrades: performance.closedTrades.map((trade) => ({
+              tradeId: trade.tradeId,
+              marketSlug: trade.marketSlug,
+              price: decimalString(trade.price, "closed trade price"),
+              quantity: decimalString(trade.quantity, "closed trade quantity"),
+              costBasisUsd: decimalString(
+                trade.costBasis,
+                "closed trade costBasis",
+              ),
+              realizedPnlUsd: decimalString(
+                trade.realizedPnl,
+                "closed trade realizedPnl",
+              ),
+              state: trade.state,
+              aggressor: trade.aggressor,
+              createdAt: isoDate(trade.createdAt, "closed trade createdAt"),
+              updatedAt: isoDate(trade.updatedAt, "closed trade updatedAt"),
+            })),
+            settlementRealizedPnlUsd: decimalString(
+              performance.settlementRealizedPnl,
+              "performance settlementRealizedPnl",
+            ),
+            closedTradeRealizedPnlUsd: decimalString(
+              performance.closedTradeRealizedPnl,
+              "performance closedTradeRealizedPnl",
+            ),
+            profitableOutcomeCount: performance.profitableOutcomeCount,
+            losingOutcomeCount: performance.losingOutcomeCount,
+            flatOutcomeCount: performance.flatOutcomeCount,
+            bustedTradeCount: performance.bustedTradeCount,
+          },
+        }
+      : {}),
     recentExecutionOutcomes: (input.recentExecutionOutcomes ?? []).map(
       (outcome) => {
         const averageFillPrice = optionalDecimalString(
@@ -847,7 +893,7 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
         };
       },
     ),
-    ...(input.previousCycle === undefined
+    ...(!historyEnabled || input.previousCycle === undefined
       ? {}
       : { previousCycle: input.previousCycle }),
     criticalLearning: allowPositionReductions

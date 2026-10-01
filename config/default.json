@@ -66,6 +66,9 @@
       "maximumBeliefCharacters": 2000,
       "maximumPlanCharacters": 4000
     },
+    "history": {
+      "enabled": true
+    },
     "timeoutSeconds": 360
   },
   "risk": {

@@ -447,7 +447,15 @@ export const PositionsResponseSchema = z.union([
     .transform((value) => value.data),
 ]);
 
-const ResolutionPositionSchema = z.object({ realized: AmountSchema }).loose();
+const ResolutionPositionSchema = z
+  .object({
+    realized: AmountSchema,
+    netPosition: DecimalInputSchema.optional(),
+    netPositionDecimal: DecimalInputSchema.optional(),
+    cost: AmountSchema.optional(),
+    baseCost: AmountSchema.nullable().optional(),
+  })
+  .loose();
 
 export const TradeActivityPayloadSchema = z
   .object({
@@ -487,6 +495,7 @@ export const PositionResolutionPayloadSchema = z
     beforePosition: ResolutionPositionSchema.optional(),
     afterPosition: ResolutionPositionSchema.optional(),
     realizedPnl: AmountSchema.optional(),
+    side: z.string().optional(),
     updateTime: DateTimeSchema,
   })
   .loose()

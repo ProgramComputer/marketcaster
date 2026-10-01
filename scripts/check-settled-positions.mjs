@@ -8,6 +8,9 @@ import {
   summarizeSettledPositions,
 } from "../src/agent/settled-positions.ts";
 import { buildAgentContext } from "../src/agent/context-builder.ts";
+import { RepositoryConfigSchema } from "../src/config/schema.ts";
+import { mapActivity } from "../src/exchanges/polymarket-us/mappers.ts";
+import { ActivitySchema } from "../src/exchanges/polymarket-us/schemas.ts";
 
 // Wholly synthetic markets and accounts; nothing here contacts an exchange.
 const fill = (marketSlug, enteredAt, overrides = {}) => ({
@@ -301,6 +304,207 @@ const resolution = (marketSlug, realizedPnl, resolvedAt) => ({
     buildAgentContext(input(() => learning())).criticalLearning.scorecard,
     undefined,
     "a policy may omit the scorecard",
+  );
+}
+
+// A settlement reported at zero realized PnL is derived from the resolution
+// side and the position before settlement; reported results are unchanged.
+{
+  const amount = (value) => ({ value, currency: "USD" });
+  const settle = (marketSlug, side, before, afterRealized = "0") =>
+    mapActivity(
+      ActivitySchema.parse({
+        type: "ACTIVITY_TYPE_POSITION_RESOLUTION",
+        positionResolution: {
+          marketSlug,
+          side,
+          updateTime: "2040-01-03T00:00:00Z",
+          beforePosition: { realized: amount("0"), ...before },
+          afterPosition: { realized: amount(afterRealized), cost: amount("1") },
+        },
+      }),
+    )[0].realizedPnl.toString();
+  assert.equal(
+    settle("alpha", "POSITION_RESOLUTION_SIDE_SHORT", {
+      netPositionDecimal: "-80",
+      cost: amount("20.8"),
+      baseCost: amount("20"),
+    }),
+    "60",
+    "a NO position on a market that settled NO is paid",
+  );
+  assert.equal(
+    settle("bravo", "POSITION_RESOLUTION_SIDE_SHORT", {
+      netPositionDecimal: "50",
+      cost: amount("12.5"),
+      baseCost: null,
+    }),
+    "-12.5",
+    "a YES position on a market that settled NO loses its cost",
+  );
+  assert.equal(
+    settle("charlie", "POSITION_RESOLUTION_SIDE_LONG", {
+      netPosition: "10",
+      cost: amount("4"),
+    }),
+    "6",
+  );
+  assert.equal(
+    settle(
+      "delta",
+      "POSITION_RESOLUTION_SIDE_SHORT",
+      { netPositionDecimal: "10", cost: amount("4") },
+      "7.5",
+    ),
+    "7.5",
+    "a reported result is kept",
+  );
+  assert.equal(
+    settle("echo", "POSITION_RESOLUTION_SIDE_UNSPECIFIED", {
+      netPositionDecimal: "10",
+      cost: amount("4"),
+    }),
+    "0",
+    "an unknown side leaves zero",
+  );
+}
+
+// History is on by default and can be turned off.
+{
+  const agent = (overrides) => ({
+    ...RepositoryConfigSchema.shape.agent.parse({
+      maximumRounds: 10,
+      maximumWebSearches: 1,
+      maximumProviderWebSearchesPerResponse: 1,
+      maximumEvidenceSourceReadRequests: 1,
+      maximumMarketDiscoveryRequests: 1,
+      maximumMarketDetailRequests: 1,
+      maximumMarketAnalysisRequests: 1,
+      maximumTradePreviewRequests: 1,
+      maximumNoteOperations: 1,
+      passResearch: {
+        minimumDiscoveryRequests: 0,
+        minimumDistinctDiscoveryModes: 0,
+        minimumInspectedMarkets: 0,
+        minimumDistinctEventFamilies: 0,
+        minimumWebSearches: 0,
+        minimumMarketAnalyses: 0,
+        minimumTradePreviews: 0,
+      },
+      memory: {
+        enabled: false,
+        maximumNotes: 1,
+        maximumContextNotes: 1,
+        maximumNoteCharacters: 100,
+      },
+      state: {
+        enabled: false,
+        maximumBeliefs: 1,
+        maximumContextBeliefs: 1,
+        maximumBeliefCharacters: 100,
+        maximumPlanCharacters: 100,
+      },
+      timeoutSeconds: 60,
+      ...overrides,
+    }),
+  });
+  assert.equal(agent({}).history.enabled, true);
+  assert.equal(agent({ history: { enabled: false } }).history.enabled, false);
+}
+
+// Default critical learning lists each market once by its net realized PnL,
+// and omitted history leaves out prior cycles, performance and the policy.
+{
+  const zero = new Decimal(0);
+  const at = new Date("2040-01-05T00:00:00Z");
+  const closed = (tradeId, marketSlug, realizedPnl) => ({
+    tradeId,
+    marketSlug,
+    price: new Decimal("0.4"),
+    quantity: new Decimal(5),
+    costBasis: new Decimal(2),
+    realizedPnl: new Decimal(realizedPnl),
+    state: "TRADE_STATE_FILLED",
+    aggressor: true,
+    createdAt: at,
+    updatedAt: at,
+  });
+  const base = {
+    observedAt: at,
+    exchangeId: "polymarket-us",
+    exchangeName: "Fixture",
+    account: {
+      observedAt: at,
+      currentBalance: new Decimal(100),
+      buyingPower: new Decimal(100),
+      assetNotional: zero,
+      assetAvailable: zero,
+      openOrderValue: zero,
+      unsettledFunds: zero,
+      marginRequirement: zero,
+      positions: [],
+      openOrders: [],
+      recentActivities: [],
+    },
+    marketCatalog: { count: 0, categoryCounts: {} },
+    preloadedMarkets: [],
+    riskConstraints: {
+      maximumPositionCostBasisFraction: new Decimal("0.5"),
+      maximumCycleSpendFraction: new Decimal("0.5"),
+      maximumExecutionSpread: new Decimal("0.1"),
+      kellyFraction: new Decimal("0.5"),
+      uncertaintyBoundWeight: new Decimal("0.25"),
+      duplicateWindowMinutes: 30,
+      minimumIndependentSources: 1,
+      allowNakedShorts: false,
+      allowPositionReductions: false,
+      emergencyExitEnabled: false,
+      managedRestingBuyOrders: { enabled: false, maximumLifetimeMinutes: 15 },
+    },
+    recentPerformance: {
+      settlements: [
+        { marketSlug: "alpha", realizedPnl: zero, resolvedAt: at },
+        { marketSlug: "bravo", realizedPnl: new Decimal(3), resolvedAt: at },
+      ],
+      closedTrades: [
+        closed("t1", "charlie", "-1"),
+        closed("t2", "charlie", "-2"),
+        closed("t3", "charlie", "-0.5"),
+        closed("t4", "bravo", "-1"),
+      ],
+      settlementRealizedPnl: new Decimal(3),
+      closedTradeRealizedPnl: new Decimal("-4.5"),
+      profitableOutcomeCount: 1,
+      losingOutcomeCount: 4,
+      flatOutcomeCount: 1,
+      bustedTradeCount: 0,
+    },
+  };
+  const learning = buildAgentContext(base).criticalLearning;
+  assert.deepEqual(learning.profitableMarketSlugs, ["bravo"]);
+  assert.deepEqual(learning.losingMarketSlugs, ["charlie"]);
+  assert.equal(learning.realizedOutcomeSampleSize, 3);
+
+  let called = false;
+  const omitted = buildAgentContext({
+    ...base,
+    historyEnabled: false,
+    criticalLearningPolicy: () => {
+      called = true;
+      throw new Error("policy must not run without history");
+    },
+    previousCycle: { advisoryOnly: true },
+  });
+  assert.equal(called, false);
+  assert.equal("previousCycle" in omitted, false);
+  assert.equal("recentPerformance" in omitted, false);
+  assert.deepEqual(omitted.criticalLearning.profitableMarketSlugs, []);
+  assert.deepEqual(omitted.criticalLearning.losingMarketSlugs, []);
+  assert.equal(omitted.criticalLearning.realizedOutcomeSampleSize, 0);
+  assert.match(
+    omitted.criticalLearning.positionManagementReminders.join(" "),
+    /allowPositionReductions=false/u,
+    "rules still reach the model",
   );
 }
 

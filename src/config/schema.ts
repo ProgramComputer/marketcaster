@@ -65,6 +65,13 @@ const AgentStateConfigSchema = z
     }
   });
 
+/** False omits previous-cycle, recent-performance and realized-outcome history from model context. */
+const AgentHistoryConfigSchema = z
+  .object({
+    enabled: z.boolean(),
+  })
+  .strict();
+
 const PassResearchConfigSchema = z
   .object({
     minimumDiscoveryRequests: z.number().int().nonnegative().max(20),
@@ -198,6 +205,7 @@ export const RepositoryConfigSchema = z
         passResearch: PassResearchConfigSchema,
         memory: AgentMemoryConfigSchema,
         state: AgentStateConfigSchema,
+        history: AgentHistoryConfigSchema.default({ enabled: true }),
         timeoutSeconds: PositiveIntegerSchema,
       })
       .strict(),

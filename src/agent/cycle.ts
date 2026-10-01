@@ -914,8 +914,9 @@ export async function runCycle(
         );
       }
     }
+    const historyEnabled = dependencies.config.agent.history.enabled;
     const loadedPreviousCycle =
-      dependencies.writeReports === false
+      dependencies.writeReports === false || !historyEnabled
         ? undefined
         : await loadPreviousCycleAdvisory({
             rootDirectory: dependencies.config.reporting.directory,
@@ -1381,8 +1382,11 @@ export async function runCycle(
     if (agentState.persistent && strategy.selectMemoryContext !== undefined) {
       agentStateContext = await agentState.load(memoryContextScope);
     }
+    const criticalLearningPolicy = historyEnabled
+      ? strategy.selection.buildCriticalLearning
+      : undefined;
     const settledPositions =
-      strategy.selection.buildCriticalLearning === undefined ||
+      criticalLearningPolicy === undefined ||
       dependencies.writeReports === false
         ? []
         : summarizeSettledPositions(
@@ -1394,12 +1398,10 @@ export async function runCycle(
             }),
           );
     const contextInput: BuildAgentContextInput = {
-      ...(strategy.selection.buildCriticalLearning === undefined
+      ...(criticalLearningPolicy === undefined
         ? {}
-        : {
-            criticalLearningPolicy: strategy.selection.buildCriticalLearning,
-            settledPositions,
-          }),
+        : { criticalLearningPolicy, settledPositions }),
+      historyEnabled,
       observedAt: startedAt,
       exchangeId: dependencies.exchange.id,
       exchangeName:
