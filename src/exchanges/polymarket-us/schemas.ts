@@ -185,19 +185,27 @@ export const MarketResponseSchema = z.union([
 ]);
 
 const EventMarketReferenceSchema = z
-  .object({ slug: NonEmptyStringSchema })
+  .object({
+    slug: NonEmptyStringSchema,
+    active: z.boolean().optional(),
+    closed: z.boolean().optional(),
+    archived: z.boolean().optional(),
+  })
   .loose();
 
 const PolymarketEventSchema = z
   .object({
     id: IdentifierSchema,
     slug: NonEmptyStringSchema,
+    seriesSlug: OptionalNonEmptyStringSchema,
     active: z.boolean(),
     closed: z.boolean(),
     archived: z.boolean(),
     markets: z.array(EventMarketReferenceSchema).optional(),
   })
   .loose();
+
+export type PolymarketEvent = z.infer<typeof PolymarketEventSchema>;
 
 const EventsPayloadSchema = z
   .object({ events: z.array(PolymarketEventSchema) })

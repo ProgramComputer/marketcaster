@@ -12,6 +12,7 @@ import {
   type MarketsListParams,
   type PolymarketUSOptions,
   type PreviewOrderParams,
+  type SearchParams,
   type SeriesListParams,
 } from "polymarket-us";
 import pLimit, { type LimitFunction } from "p-limit";
@@ -45,6 +46,10 @@ export interface PolymarketUsClient {
   };
   readonly series: {
     list(params?: SeriesListParams): Promise<unknown>;
+  };
+  /** Optional so injected test clients without search keep working. */
+  readonly search?: {
+    query(params?: SearchParams): Promise<unknown>;
   };
 }
 

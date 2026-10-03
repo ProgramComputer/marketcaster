@@ -76,10 +76,30 @@ import {
   SeriesResponseSchema,
   SettlementResponseSchema,
   parseSdkResponse,
+  type PolymarketEvent,
   type PolymarketOrder,
   type PolymarketPosition,
 } from "./schemas.js";
 import { canonicalOrderToPolymarket } from "./side-conversion.js";
+
+/** Event identity taken from an exchange event record that lists the market. */
+interface NativeEventIdentity {
+  readonly eventId: string;
+  readonly eventSlug: string;
+  readonly seriesSlug?: string;
+}
+
+const NATIVE_EVENT_SEARCH_LIMIT = 5;
+
+function isOpenEventMarket(
+  market: NonNullable<PolymarketEvent["markets"]>[number],
+): boolean {
+  return (
+    market.active !== false &&
+    market.closed !== true &&
+    market.archived !== true
+  );
+}
 
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAXIMUM_PAGES = 1_000;
@@ -267,6 +287,12 @@ export class PolymarketUsExchange implements PredictionExchange {
   private readonly marketBySlug = new Map<string, Market>();
   private readonly pendingMarketBySlug = new Map<string, Promise<Market>>();
   private readonly seriesIdBySlug = new Map<string, number | null>();
+  // Null marks a market listed by two different events; it gets no event.
+  private readonly nativeEventByMarketSlug = new Map<
+    string,
+    NativeEventIdentity | null
+  >();
+  private readonly nativeEventSearchedSlugs = new Set<string>();
 
   public constructor(
     clientOrOptions: PolymarketUsExchangeOptions | PolymarketUsClient = {},
@@ -314,6 +340,70 @@ export class PolymarketUsExchange implements PredictionExchange {
     this.marketById.set(market.id.value, market);
     this.marketBySlug.set(market.slug, market);
     return market;
+  }
+
+  private rememberEvent(event: PolymarketEvent): void {
+    const identity: NativeEventIdentity = {
+      eventId: event.id,
+      eventSlug: event.slug,
+      ...(event.seriesSlug === undefined
+        ? {}
+        : { seriesSlug: event.seriesSlug }),
+    };
+    for (const { slug } of event.markets ?? []) {
+      const known = this.nativeEventByMarketSlug.get(slug);
+      this.nativeEventByMarketSlug.set(
+        slug,
+        known === undefined || known?.eventId === identity.eventId
+          ? identity
+          : null,
+      );
+    }
+  }
+
+  /**
+   * Polymarket US market records omit their event, but event records list
+   * their markets. A search by the market question proposes events; only an
+   * event that lists this exact market is accepted. Search failures leave the
+   * market as the exchange returned it.
+   */
+  private async withNativeEvent(
+    market: Market,
+    question: string | undefined,
+  ): Promise<Market> {
+    if (
+      market.eventId !== undefined ||
+      market.eventSlug !== undefined ||
+      market.seriesId !== undefined ||
+      market.seriesSlug !== undefined
+    ) {
+      return market;
+    }
+    const search = this.client.search;
+    if (
+      search !== undefined &&
+      !this.nativeEventByMarketSlug.has(market.slug) &&
+      !this.nativeEventSearchedSlugs.has(market.slug)
+    ) {
+      const trimmedQuestion = question?.trim();
+      const query =
+        trimmedQuestion === undefined || trimmedQuestion.length === 0
+          ? market.title
+          : trimmedQuestion;
+      try {
+        const raw = await this.safeRead(() =>
+          search.query({ query, limit: NATIVE_EVENT_SEARCH_LIMIT }),
+        );
+        const response = parseSdkResponse(EventsResponseSchema, raw, "search");
+        for (const event of response.events) this.rememberEvent(event);
+        this.nativeEventSearchedSlugs.add(market.slug);
+      } catch {
+        return market;
+      }
+    }
+    const identity = this.nativeEventByMarketSlug.get(market.slug);
+    if (identity === undefined || identity === null) return market;
+    return this.rememberMarket({ ...market, ...identity });
   }
 
   private async marketForId(id: MarketId): Promise<Market> {
@@ -501,25 +591,32 @@ export class PolymarketUsExchange implements PredictionExchange {
     const offset = this.groupOffset(query.cursor);
     try {
       if (query.kind === "EVENT") {
+        // The market list ignores an eventSlug filter; the event list honours
+        // its slug filter and names the event's markets.
         const raw = await this.safeRead(() =>
-          this.client.markets.list({
-            eventSlug: [value],
-            active: true,
-            closed: false,
-            archived: false,
-            limit,
-            offset,
-          }),
+          this.client.events.list({ slug: [value], limit: 2, offset: 0 }),
         );
-        const page = parseSdkResponse(
-          MarketsResponseSchema,
+        const response = parseSdkResponse(
+          EventsResponseSchema,
           raw,
           "event market members",
         );
-        const items = page.markets.map((market) => market.slug);
-        const eof =
-          ("eof" in page ? page.eof : undefined) ?? items.length < limit;
+        const matches = response.events.filter((event) => event.slug === value);
+        if (matches.length > 1) {
+          throw new ExchangeError(
+            `Event slug ${value} did not resolve uniquely`,
+            "SCHEMA",
+          );
+        }
+        const event = matches[0];
+        if (event === undefined) return { items: [], eof: true };
+        this.rememberEvent(event);
+        const members = (event.markets ?? [])
+          .filter(isOpenEventMarket)
+          .map((market) => market.slug);
+        const items = members.slice(offset, offset + limit);
         const nextOffset = offset + items.length;
+        const eof = nextOffset >= members.length;
         return {
           items,
           eof,
@@ -582,16 +679,19 @@ export class PolymarketUsExchange implements PredictionExchange {
       const raw = await this.safeRead(() =>
         this.client.markets.retrieve(numericId),
       );
-      const market = this.rememberMarket(
-        mapMarket(parseSdkResponse(MarketResponseSchema, raw, "market detail")),
+      const record = parseSdkResponse(
+        MarketResponseSchema,
+        raw,
+        "market detail",
       );
+      const market = this.rememberMarket(mapMarket(record));
       if (Number(market.id.value) !== numericId) {
         throw new ExchangeError(
           "Market response ID contradicts requested ID",
           "SCHEMA",
         );
       }
-      return market;
+      return await this.withNativeEvent(market, record.question);
     } catch (error) {
       throw normalizePolymarketError(error, "get market");
     }
@@ -605,16 +705,19 @@ export class PolymarketUsExchange implements PredictionExchange {
       const raw = await this.safeRead(() =>
         this.client.markets.retrieveBySlug(slug),
       );
-      const market = this.rememberMarket(
-        mapMarket(parseSdkResponse(MarketResponseSchema, raw, "market detail")),
+      const record = parseSdkResponse(
+        MarketResponseSchema,
+        raw,
+        "market detail",
       );
+      const market = this.rememberMarket(mapMarket(record));
       if (market.slug !== slug) {
         throw new ExchangeError(
           "Market response slug contradicts requested slug",
           "SCHEMA",
         );
       }
-      return market;
+      return await this.withNativeEvent(market, record.question);
     } catch (error) {
       throw normalizePolymarketError(error, "get market by slug");
     }
