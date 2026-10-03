@@ -975,6 +975,7 @@ await (async () => {
     let raced = false;
     let canceled = 0;
     let accountReads = 0;
+    let failedAccountReads = 0;
     const placedAtRead = new Map();
     function changeB(quantity, state = "PARTIALLY_FILLED") {
       const b = orders.get("order-2");
@@ -1070,6 +1071,13 @@ await (async () => {
         return { items: [], eof: true };
       },
       async getAccountSnapshot() {
+        if (
+          sent.length === 2 &&
+          failedAccountReads < (options.failReads ?? 0)
+        ) {
+          failedAccountReads += 1;
+          throw new Error("get positions: rate limited");
+        }
         return account();
       },
       async getMarketBySlug(slug) {
@@ -1288,6 +1296,20 @@ await (async () => {
 
   for (const bStatus of ["FILLED", "PARTIAL"])
     assert.equal((await scenario({ bStatus })).sent.length, 3);
+
+  // A failed post-order account read leaves a BUY known by its order ID known.
+  const unreadAfterB = await scenario({ failReads: 3 });
+  assert.equal(unreadAfterB.sent.length, 3, "C follows a later order-ID check");
+  assert.equal(unreadAfterB.execution.stoppedForAmbiguity, false);
+  assert.equal(unreadAfterB.execution.attempts[1].result.status, "WORKING");
+  assert.match(
+    unreadAfterB.execution.warnings[0],
+    /synthetic-b: .*rate limited/u,
+  );
+  const unreadable = await scenario({ failReads: Infinity });
+  assert.equal(unreadable.sent.length, 2, "An unreadable account stops C");
+  assert.equal(unreadable.execution.stoppedForAmbiguity, true);
+  assert.match(unreadable.execution.completion.stopReason, /rate limited/u);
 
   // A fee that reaches position cost after the post-order read is explained
   // by the order that paid it, whether the fill completed or kept resting.

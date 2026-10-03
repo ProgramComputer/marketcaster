@@ -1,5 +1,6 @@
 import type { AccountSnapshot } from "../domain/account.js";
 import type { PredictionExchange } from "../exchanges/exchange.js";
+import { safeErrorMessage } from "../utilities/redaction.js";
 
 export class IncompleteExchangeStateError extends Error {
   public constructor(message: string, options?: ErrorOptions) {
@@ -16,7 +17,7 @@ export async function reconstructAccount(
     snapshot = await exchange.getAccountSnapshot();
   } catch (cause) {
     throw new IncompleteExchangeStateError(
-      "The authoritative exchange account snapshot could not be reconstructed",
+      `The authoritative exchange account snapshot could not be reconstructed: ${safeErrorMessage(cause)}`,
       { cause },
     );
   }

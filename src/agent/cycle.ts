@@ -2612,6 +2612,7 @@ export async function runCycle(
     );
     const { validation, execution, safetyStop, shadowLedgerCapture } =
       validationExecution;
+    warnings.push(...(execution.warnings ?? []));
 
     // Make the prospective decision record durable before account reporting.
     // A post-order account API compatibility failure must not erase the exact

@@ -92,6 +92,7 @@ export interface ExecutionRun {
   readonly stoppedForAmbiguity: boolean;
   readonly completion?: ExecutionCompletion;
   readonly managedOrderChecks?: readonly ManagedBuyCheck[];
+  readonly warnings?: readonly string[];
 }
 
 export interface ExecutionCompletion {
@@ -711,6 +712,7 @@ export async function executeValidatedOrders(
   let committedCycleSpend = new Decimal(0);
   let managedBatch: ManagedBuyBatch | undefined;
   const managedOrderChecks: ManagedBuyCheck[] = [];
+  const warnings: string[] = [];
   const finish = (
     stopReason?: string,
     stoppedForAmbiguity = false,
@@ -737,6 +739,7 @@ export async function executeValidatedOrders(
         ),
       },
       ...(managedOrderChecks.length === 0 ? {} : { managedOrderChecks }),
+      ...(warnings.length === 0 ? {} : { warnings }),
     };
   };
 
@@ -1141,6 +1144,7 @@ export async function executeValidatedOrders(
       // A filled managed BUY joins the batch like a resting one, so later
       // reads are explained by its order ID, fill and fee rather than
       // compared with a post-order read the venue may still be updating.
+      let explainedByOrderId = false;
       if (
         result.status !== "AMBIGUOUS" &&
         (result.status === "WORKING" ||
@@ -1156,6 +1160,7 @@ export async function executeValidatedOrders(
             validated.market.priceTick,
             result.filledQuantity,
           );
+          explainedByOrderId = true;
         } catch (error) {
           result = {
             ...result,
@@ -1200,14 +1205,17 @@ export async function executeValidatedOrders(
           input.signal,
         );
       } catch (reconstructionError) {
-        result = {
-          ...result,
-          status: "AMBIGUOUS",
-          ambiguousReason:
-            reconstructionError instanceof Error
-              ? `Post-order account reconciliation failed: ${safeErrorMessage(reconstructionError)}`
-              : "Post-order account reconciliation failed",
-        };
+        const reason =
+          reconstructionError instanceof Error
+            ? `Post-order account reconciliation failed: ${safeErrorMessage(reconstructionError)}`
+            : "Post-order account reconciliation failed";
+        if (explainedByOrderId) {
+          // The batch already knows this order by its ID, fill and fee, and
+          // reconciles the account by order ID before any later BUY.
+          warnings.push(`${validated.order.marketSlug}: ${reason}`);
+        } else {
+          result = { ...result, status: "AMBIGUOUS", ambiguousReason: reason };
+        }
       }
       const failure: ExecutionFailure | undefined =
         result.status === "AMBIGUOUS" ||
