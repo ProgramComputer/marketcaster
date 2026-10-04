@@ -53,6 +53,8 @@ const AgentStateConfigSchema = z
     maximumContextBeliefs: PositiveIntegerSchema.max(100),
     maximumBeliefCharacters: PositiveIntegerSchema.max(4_000),
     maximumPlanCharacters: PositiveIntegerSchema.max(8_000),
+    // Beliefs created and plans last updated before this time are discarded.
+    discardBefore: z.iso.datetime({ offset: true }).optional(),
   })
   .strict()
   .superRefine((value, context) => {

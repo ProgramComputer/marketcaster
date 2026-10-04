@@ -135,6 +135,7 @@ import {
   FileAgentState,
   type AgentState,
   type AgentStateContext,
+  type AgentStateDiscard,
   StatelessAgentState,
 } from "./agent-state.js";
 import { buildCandidateFunnel } from "./candidate-funnel.js";
@@ -971,6 +972,15 @@ export async function runCycle(
               dependencies.config.agent.state.maximumBeliefCharacters,
             maximumPlanCharacters:
               dependencies.config.agent.state.maximumPlanCharacters,
+            ...(dependencies.config.agent.state.discardBefore === undefined
+              ? {}
+              : {
+                  discardBefore: dependencies.config.agent.state.discardBefore,
+                  onDiscard: (discarded: AgentStateDiscard) =>
+                    warnings.push(
+                      `Saved agent state from before ${dependencies.config.agent.state.discardBefore} was discarded: ${discarded.beliefs} beliefs${discarded.nextCyclePlan ? ", the next-cycle plan" : ""}${discarded.longTermPlan ? ", the long-term plan" : ""}.`,
+                    ),
+                }),
             now,
           })
         : new StatelessAgentState());

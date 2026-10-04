@@ -355,8 +355,21 @@ interface SnapshotRead {
   readonly normalized: boolean;
 }
 
+/** What a `discardBefore` cutoff removed from the stored state. */
+export interface AgentStateDiscard {
+  readonly beliefs: number;
+  readonly nextCyclePlan: boolean;
+  readonly longTermPlan: boolean;
+}
+
 export interface FileAgentStateOptions {
   readonly filePath: string;
+  /**
+   * Beliefs created before this time and plans last updated before it are
+   * dropped whenever the state is read, and the trimmed state is written back.
+   */
+  readonly discardBefore?: string;
+  readonly onDiscard?: (discarded: AgentStateDiscard) => void;
   readonly selectContextBeliefs?: AgentBeliefContextSelector;
   readonly maximumBeliefs?: number;
   readonly maximumContextBeliefs?: number;
@@ -400,6 +413,10 @@ export class FileAgentState implements AgentState {
   private readonly maximumInvalidationConditionCharacters: number;
   private readonly now: () => Date;
   private readonly idFactory: () => string;
+  private readonly discardBefore: number | undefined;
+  private readonly onDiscard:
+    ((discarded: AgentStateDiscard) => void) | undefined;
+  private discardReported = false;
   private mutationQueue: Promise<void> = Promise.resolve();
 
   public constructor(options: FileAgentStateOptions) {
@@ -444,6 +461,16 @@ export class FileAgentState implements AgentState {
     );
     this.now = options.now ?? (() => new Date());
     this.idFactory = options.idFactory ?? randomUUID;
+    if (options.discardBefore === undefined) {
+      this.discardBefore = undefined;
+    } else {
+      const cutoff = Date.parse(options.discardBefore);
+      if (!Number.isFinite(cutoff)) {
+        throw new RangeError("discardBefore must be a timestamp");
+      }
+      this.discardBefore = cutoff;
+    }
+    this.onDiscard = options.onDiscard;
   }
 
   private normalizeText(value: string, label: string, maximum: number): string {
@@ -691,7 +718,9 @@ export class FileAgentState implements AgentState {
             longTermPlan: null,
           }
         : parsed.data;
-    const snapshot = this.normalizeSnapshot(migrated);
+    const snapshot = this.withoutEntriesBeforeCutoff(
+      this.normalizeSnapshot(migrated),
+    );
     return {
       snapshot,
       exists: true,
@@ -699,6 +728,37 @@ export class FileAgentState implements AgentState {
         parsed.data.version === 1 ||
         JSON.stringify(snapshot) !== JSON.stringify(parsed.data),
     };
+  }
+
+  private withoutEntriesBeforeCutoff(
+    snapshot: AgentStateSnapshot,
+  ): AgentStateSnapshot {
+    const cutoff = this.discardBefore;
+    if (cutoff === undefined) return snapshot;
+    const beliefs = snapshot.beliefs.filter(
+      (belief) => Date.parse(belief.createdAt) >= cutoff,
+    );
+    const keep = (plan: AgentPlan | null): AgentPlan | null =>
+      plan !== null && Date.parse(plan.updatedAt) >= cutoff ? plan : null;
+    const nextCyclePlan = keep(snapshot.nextCyclePlan);
+    const longTermPlan = keep(snapshot.longTermPlan);
+    const discarded = {
+      beliefs: snapshot.beliefs.length - beliefs.length,
+      nextCyclePlan: snapshot.nextCyclePlan !== null && nextCyclePlan === null,
+      longTermPlan: snapshot.longTermPlan !== null && longTermPlan === null,
+    };
+    if (
+      discarded.beliefs === 0 &&
+      !discarded.nextCyclePlan &&
+      !discarded.longTermPlan
+    ) {
+      return snapshot;
+    }
+    if (!this.discardReported) {
+      this.discardReported = true;
+      this.onDiscard?.(discarded);
+    }
+    return { version: 2, beliefs, nextCyclePlan, longTermPlan };
   }
 
   private async writeSnapshot(
