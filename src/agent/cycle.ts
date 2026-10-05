@@ -132,6 +132,10 @@ import {
 } from "./memory.js";
 import { AdvisoryTradePreviewResolver } from "./trade-preview.js";
 import {
+  summarizeRejectedPlan,
+  type RejectedPlanIssueInput,
+} from "./rejected-plan-summary.js";
+import {
   FileAgentState,
   type AgentState,
   type AgentStateContext,
@@ -580,6 +584,28 @@ function materializeTargetDecision(
     riskProposals,
     reconciliation,
   };
+}
+
+function logRejectedPlan(
+  logger: Logger,
+  decision: AgentDecision,
+  orders: () => readonly RiskProposal[],
+  issues: readonly RejectedPlanIssueInput[],
+): void {
+  try {
+    stageLogger(logger, "agent-research").warn(
+      {
+        rejectedMarkets: summarizeRejectedPlan({
+          decision,
+          orders: orders(),
+          issues,
+        }),
+      },
+      "Final plan rejected before any order",
+    );
+  } catch {
+    // Logging is best effort; the guard error that follows is the outcome.
+  }
 }
 
 function targetRepairFeedback(
@@ -2124,6 +2150,18 @@ export async function runCycle(
       );
     }
     if (!authoritativeCoverage.valid || !finalGuards.evidence.valid) {
+      logRejectedPlan(
+        dependencies.logger,
+        rawDecision,
+        () =>
+          materializeTargetDecision(
+            rawDecision,
+            initialSnapshot,
+            initialValuation,
+            strategy,
+          ).riskProposals,
+        [...authoritativeCoverage.issues, ...finalGuards.evidence.issues],
+      );
       const reasons = [
         ...authoritativeCoverage.issues.map(
           (issue) => `${issue.code}: ${issue.message}`,
@@ -2218,6 +2256,16 @@ export async function runCycle(
       targetPlan.reconciliation?.dispositions ?? []
     ).filter((disposition) => disposition.kind === "BLOCKED");
     if (blockedTargets.length > 0) {
+      logRejectedPlan(
+        dependencies.logger,
+        rawDecision,
+        () => targetPlan.riskProposals,
+        blockedTargets.map((disposition) => ({
+          code: disposition.reason,
+          marketSlug: disposition.marketSlug,
+          message: disposition.message,
+        })),
+      );
       throw new SafetyGuardError(
         `Terminal decision retained blocked portfolio targets after repair: ${blockedTargets
           .map(
