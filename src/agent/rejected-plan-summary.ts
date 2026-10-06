@@ -14,6 +14,14 @@ export interface RejectedPlanSource {
   readonly claimExcerpt: string | null;
 }
 
+export interface RejectedPlanOrder {
+  readonly marketSlug: string;
+  readonly action: string;
+  readonly side: string;
+  readonly price: string | null;
+  readonly maximumRiskUsd: string;
+}
+
 export interface RejectedPlanMarket {
   readonly marketSlug: string;
   readonly target: {
@@ -22,12 +30,7 @@ export interface RejectedPlanMarket {
     readonly maximumEntryPrice: string | null;
     readonly minimumExitPrice: string | null;
   } | null;
-  readonly orders: readonly {
-    readonly action: string;
-    readonly side: string;
-    readonly price: string | null;
-    readonly maximumRiskUsd: string;
-  }[];
+  readonly orders: readonly RejectedPlanOrder[];
   readonly issues: readonly {
     readonly code: string;
     readonly message: string;
@@ -36,20 +39,39 @@ export interface RejectedPlanMarket {
   }[];
 }
 
+export interface RejectedPlanSummary {
+  readonly rejectedMarkets: readonly RejectedPlanMarket[];
+  /** Orders on markets without an issue, discarded with the rest of the plan. */
+  readonly droppedOrders: readonly RejectedPlanOrder[];
+}
+
+function summarizeOrder(order: RiskProposal): RejectedPlanOrder {
+  return {
+    marketSlug: order.marketSlug,
+    action: order.action,
+    side: order.side,
+    price:
+      (order.action === "BUY"
+        ? order.maximumEntryPrice
+        : order.minimumExitPrice
+      )?.toFixed() ?? null,
+    maximumRiskUsd: order.maximumRiskUsd.toFixed(2),
+  };
+}
+
 /**
- * Describes each market behind a rejected final plan: the model's target, the
- * orders it would have produced, and every guard issue with the cited note
- * and quote, so a console log explains the rejection without the journal.
+ * Describes a rejected final plan: for each market with a guard issue, the
+ * model's target, the orders it would have produced, and every issue with the
+ * cited note and quote; then every other order discarded with the plan. A
+ * console log can then explain the rejection without the journal.
  */
 export function summarizeRejectedPlan(input: {
   readonly decision: AgentDecision;
   readonly orders: readonly RiskProposal[];
   readonly issues: readonly RejectedPlanIssueInput[];
-}): readonly RejectedPlanMarket[] {
-  const marketSlugs = [
-    ...new Set(input.issues.map((issue) => issue.marketSlug)),
-  ];
-  return marketSlugs.map((marketSlug) => {
+}): RejectedPlanSummary {
+  const marketSlugs = new Set(input.issues.map((issue) => issue.marketSlug));
+  const rejectedMarkets = [...marketSlugs].map((marketSlug) => {
     const target = input.decision.portfolioTargets.find(
       (candidate) => candidate.marketSlug === marketSlug,
     );
@@ -74,16 +96,7 @@ export function summarizeRejectedPlan(input: {
             },
       orders: input.orders
         .filter((order) => order.marketSlug === marketSlug)
-        .map((order) => ({
-          action: order.action,
-          side: order.side,
-          price:
-            (order.action === "BUY"
-              ? order.maximumEntryPrice
-              : order.minimumExitPrice
-            )?.toFixed() ?? null,
-          maximumRiskUsd: order.maximumRiskUsd.toFixed(2),
-        })),
+        .map(summarizeOrder),
       issues: input.issues
         .filter((issue) => issue.marketSlug === marketSlug)
         .map((issue) => {
@@ -100,4 +113,10 @@ export function summarizeRejectedPlan(input: {
         }),
     };
   });
+  return {
+    rejectedMarkets,
+    droppedOrders: input.orders
+      .filter((order) => !marketSlugs.has(order.marketSlug))
+      .map(summarizeOrder),
+  };
 }

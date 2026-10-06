@@ -594,13 +594,7 @@ function logRejectedPlan(
 ): void {
   try {
     stageLogger(logger, "agent-research").warn(
-      {
-        rejectedMarkets: summarizeRejectedPlan({
-          decision,
-          orders: orders(),
-          issues,
-        }),
-      },
+      summarizeRejectedPlan({ decision, orders: orders(), issues }),
       "Final plan rejected before any order",
     );
   } catch {
