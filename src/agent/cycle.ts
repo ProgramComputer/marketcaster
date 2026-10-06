@@ -1432,6 +1432,11 @@ export async function runCycle(
         ? {}
         : { criticalLearningPolicy, settledPositions }),
       historyEnabled,
+      ...(dependencies.config.agent.history.outcomeUnit === undefined
+        ? {}
+        : {
+            historyOutcomeUnit: dependencies.config.agent.history.outcomeUnit,
+          }),
       observedAt: startedAt,
       exchangeId: dependencies.exchange.id,
       exchangeName:

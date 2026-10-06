@@ -6,9 +6,21 @@ import type {
 } from "../domain/activity.js";
 import { isEffectiveTrade } from "../domain/activity.js";
 
+/**
+ * ENTRY counts each selected settlement and closing fill as one outcome;
+ * MARKET counts each market once by the net realized PnL of its entries.
+ */
+export type RecentOutcomeUnit = "ENTRY" | "MARKET";
+
 export interface RecentPerformanceOptions {
   readonly maximumSettlements?: number;
   readonly maximumClosedTrades?: number;
+  readonly outcomeUnit?: RecentOutcomeUnit;
+}
+
+export interface RecentMarketOutcome {
+  readonly marketSlug: string;
+  readonly realizedPnl: Decimal;
 }
 
 export interface RecentSettlement {
@@ -35,6 +47,10 @@ export interface RecentPerformance {
   readonly closedTrades: readonly RecentClosedTrade[];
   readonly settlementRealizedPnl: Decimal;
   readonly closedTradeRealizedPnl: Decimal;
+  /** Unit of the outcome counts below. */
+  readonly outcomeUnit: RecentOutcomeUnit;
+  /** Selected entries netted per market, in order of first appearance. */
+  readonly marketOutcomes: readonly RecentMarketOutcome[];
   readonly profitableOutcomeCount: number;
   readonly losingOutcomeCount: number;
   readonly flatOutcomeCount: number;
@@ -122,16 +138,33 @@ export function summarizeRecentPerformance(
     (total, trade) => total.plus(trade.realizedPnl),
     new Decimal(0),
   );
-  const outcomes = [
-    ...settlements.map((settlement) => settlement.realizedPnl),
-    ...closedTrades.map((trade) => trade.realizedPnl),
-  ];
+  const entries = [...settlements, ...closedTrades];
+  const netByMarket = new Map<string, Decimal>();
+  for (const entry of entries) {
+    netByMarket.set(
+      entry.marketSlug,
+      (netByMarket.get(entry.marketSlug) ?? new Decimal(0)).plus(
+        entry.realizedPnl,
+      ),
+    );
+  }
+  const marketOutcomes = [...netByMarket].map(([marketSlug, realizedPnl]) => ({
+    marketSlug,
+    realizedPnl,
+  }));
+  const outcomeUnit = options.outcomeUnit ?? "ENTRY";
+  const outcomes =
+    outcomeUnit === "MARKET"
+      ? marketOutcomes.map((outcome) => outcome.realizedPnl)
+      : entries.map((entry) => entry.realizedPnl);
 
   return {
     settlements,
     closedTrades,
     settlementRealizedPnl,
     closedTradeRealizedPnl,
+    outcomeUnit,
+    marketOutcomes,
     profitableOutcomeCount: outcomes.filter((pnl) => pnl.gt(0)).length,
     losingOutcomeCount: outcomes.filter((pnl) => pnl.lt(0)).length,
     flatOutcomeCount: outcomes.filter((pnl) => pnl.eq(0)).length,

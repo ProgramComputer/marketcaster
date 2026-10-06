@@ -22,7 +22,10 @@ import { statelessMemoryContext } from "./memory.js";
 import type { AgentStateContext } from "./agent-state.js";
 import { statelessAgentStateContext } from "./agent-state.js";
 import { calculatePerformance } from "../portfolio/performance.js";
-import type { RecentPerformance } from "./recent-performance.js";
+import type {
+  RecentOutcomeUnit,
+  RecentPerformance,
+} from "./recent-performance.js";
 import { summarizeRecentPerformance } from "./recent-performance.js";
 import type { OpportunityBoardItem } from "./opportunity-board.js";
 import type { PreviousCycleAdvisory } from "../reporting/previous-cycle-advisory.js";
@@ -102,6 +105,8 @@ export interface BuildAgentContextInput {
    * and skips the critical-learning policy. Defaults to true.
    */
   readonly historyEnabled?: boolean;
+  /** Unit for recent realized-outcome counts. Defaults to ENTRY. */
+  readonly historyOutcomeUnit?: RecentOutcomeUnit;
 }
 
 export interface PreloadedMarketInput {
@@ -231,6 +236,8 @@ export interface AgentContext {
     }[];
     readonly settlementRealizedPnlUsd: string;
     readonly closedTradeRealizedPnlUsd: string;
+    /** Present when the outcome counts are per market rather than per entry. */
+    readonly outcomeUnit?: "MARKET";
     readonly profitableOutcomeCount: number;
     readonly losingOutcomeCount: number;
     readonly flatOutcomeCount: number;
@@ -723,7 +730,12 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
   );
   const performance =
     input.recentPerformance ??
-    summarizeRecentPerformance(input.account.recentActivities);
+    summarizeRecentPerformance(
+      input.account.recentActivities,
+      input.historyOutcomeUnit === undefined
+        ? {}
+        : { outcomeUnit: input.historyOutcomeUnit },
+    );
   const activityBreakdown = calculatePerformance(
     input.account.recentActivities,
   );
@@ -864,6 +876,9 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
               performance.closedTradeRealizedPnl,
               "performance closedTradeRealizedPnl",
             ),
+            ...(performance.outcomeUnit === "MARKET"
+              ? { outcomeUnit: "MARKET" as const }
+              : {}),
             profitableOutcomeCount: performance.profitableOutcomeCount,
             losingOutcomeCount: performance.losingOutcomeCount,
             flatOutcomeCount: performance.flatOutcomeCount,

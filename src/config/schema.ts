@@ -67,10 +67,15 @@ const AgentStateConfigSchema = z
     }
   });
 
-/** False omits previous-cycle, recent-performance and realized-outcome history from model context. */
+/**
+ * False omits previous-cycle, recent-performance and realized-outcome history from model context.
+ * outcomeUnit counts recent realized outcomes per settlement or closing fill (ENTRY, the default)
+ * or once per market by net realized PnL (MARKET).
+ */
 const AgentHistoryConfigSchema = z
   .object({
     enabled: z.boolean(),
+    outcomeUnit: z.enum(["ENTRY", "MARKET"]).optional(),
   })
   .strict();
 
