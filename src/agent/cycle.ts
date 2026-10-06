@@ -135,6 +135,7 @@ import {
   summarizeRejectedPlan,
   type RejectedPlanIssueInput,
 } from "./rejected-plan-summary.js";
+import { collectSpreadMisses, type SpreadMiss } from "./spread-misses.js";
 import {
   FileAgentState,
   type AgentState,
@@ -602,6 +603,27 @@ function logRejectedPlan(
   }
 }
 
+function logSpreadMisses(
+  logger: Logger,
+  limits: { readonly startingList: Decimal; readonly trading: Decimal },
+  collect: () => readonly SpreadMiss[],
+): void {
+  try {
+    stageLogger(logger, "agent-research").info(
+      {
+        spreadLimits: {
+          startingList: limits.startingList.toFixed(),
+          trading: limits.trading.toFixed(),
+        },
+        spreadMisses: collect(),
+      },
+      "Markets over the spread limit",
+    );
+  } catch {
+    // Logging is best effort and never changes the cycle.
+  }
+}
+
 function targetRepairFeedback(
   plan: MaterializedTargetDecision,
   validation: Awaited<ReturnType<typeof validateProposals>>,
@@ -1042,6 +1064,7 @@ export async function runCycle(
     );
     const catalogSupplements =
       dependencies.config.marketSelection.catalogSupplements;
+    const startingListQuotedSlugs = new Set<string>();
     const discovery = await withStageTimeout(
       "market-discovery",
       dependencies.config.cycle.stageBudgetsSeconds.marketDiscovery === null
@@ -1125,6 +1148,7 @@ export async function runCycle(
                 marketSlug,
                 enrichmentSignal,
               );
+              startingListQuotedSlugs.add(marketSlug);
               const quoteStatus =
                 details.bbo === undefined
                   ? "UNAVAILABLE"
@@ -2112,6 +2136,33 @@ export async function runCycle(
       rawDecision.portfolioTargets,
     );
     await journal?.recordArtifact("decision-submissions", submissionHistory);
+    logSpreadMisses(
+      dependencies.logger,
+      {
+        startingList: dependencies.config.marketSelection.maximumSpread,
+        trading: dependencies.config.risk.maximumExecutionSpread,
+      },
+      () =>
+        collectSpreadMisses({
+          quotesBySlug: new Map(
+            discovery.detailResolver.resolvedDetails.flatMap((details) =>
+              details.bbo === undefined
+                ? []
+                : [[details.market.slug, details.bbo] as const],
+            ),
+          ),
+          startingListQuotedSlugs,
+          startingListSlugs: new Set(opportunityBoard.map((item) => item.slug)),
+          startingListMaximumSpread:
+            dependencies.config.marketSelection.maximumSpread,
+          inspectedMarketSlugs: researchTools.inspectedMarketSlugs,
+          decision: rawDecision,
+          tradeMaximumSpread: dependencies.config.risk.maximumExecutionSpread,
+          tradeRejections: (decisionSubmissions.at(-1)?.issues ?? []).filter(
+            (issue) => issue.stage === "RISK",
+          ),
+        }),
+    );
     for (const target of submissionHistory.omittedTargets) {
       warnings.push(
         `Final plan omitted previously submitted ${target.marketSlug} ${target.side}; earlier validation codes: ${target.priorIssueCodes.join(", ") || "none"}. See decision-submissions for the recorded attempts.`,
