@@ -1,6 +1,7 @@
 import type { AgentDecision } from "./decision-schema.js";
 import type { AccountSnapshot } from "../domain/account.js";
 import type { OutcomeSide } from "../domain/primitives.js";
+import { toModelSide } from "./model-view.js";
 
 export type DecisionCoverageIssueCode =
   | "MISSING_HELD_POSITION_DECISION"
@@ -114,7 +115,7 @@ export function validateDecisionCoverage(input: {
     issues.push({
       code: "MISSING_HELD_POSITION_DECISION",
       marketSlug: position.marketSlug,
-      message: `${position.marketSlug} is held on ${position.side} and requires an explicit portfolio target; use its current cost-basis fraction to hold unchanged or zero to exit`,
+      message: `${position.marketSlug} is held on ${toModelSide(position.side)} and requires an explicit portfolio target; use its current cost-basis fraction to hold unchanged or zero to exit`,
     });
   }
 
@@ -155,7 +156,7 @@ export function validateDecisionCoverage(input: {
     issues.push({
       code: "CONFLICTING_HELD_SIDES",
       marketSlug,
-      message: `${marketSlug} has both YES and NO holdings and cannot be represented by one market-level decision`,
+      message: `${marketSlug} has both LONG and SHORT holdings and cannot be represented by one market-level decision`,
     });
   }
 
@@ -183,7 +184,7 @@ export function validateDecisionCoverage(input: {
         issues.push({
           code: "HELD_SIDE_MISMATCH",
           marketSlug: slug,
-          message: `${slug} target side ${target.side} does not match held side ${heldPosition.side}`,
+          message: `${slug} target side ${toModelSide(target.side)} does not match held side ${toModelSide(heldPosition.side)}`,
         });
       }
       if (
@@ -194,7 +195,7 @@ export function validateDecisionCoverage(input: {
         issues.push({
           code: "INVALID_HELD_DISPOSITION",
           marketSlug: slug,
-          message: `${slug} held position requires HOLD_UNCHANGED with side ${heldPosition.side}`,
+          message: `${slug} held position requires HOLD_UNCHANGED with side ${toModelSide(heldPosition.side)}`,
         });
       }
     } else if (disposition !== undefined && disposition.outcome !== "PASS") {

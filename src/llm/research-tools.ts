@@ -22,6 +22,7 @@ import {
   parseModelAgentDecision,
 } from "../agent/decision-schema.js";
 import type { DetailedMarketContext } from "../agent/context-builder.js";
+import { fromModelSide, MODEL_SIDES, modelJson } from "../agent/model-view.js";
 import type { SelectionPolicy } from "../agent/opportunity-board.js";
 import {
   MarketDiscoveryNarrowingRequiredError,
@@ -166,9 +167,9 @@ const MarketDiscoveryInputSchema = z
     minimumBookDepth: NonNegativeDecimalStringSchema.optional(),
     bookDepthWithinPricePoints: ProbabilityPointDeltaStringSchema.optional(),
     minimumOpenInterest: NonNegativeDecimalStringSchema.optional(),
-    minimumYesPrice: ProbabilityPointDeltaStringSchema.optional(),
-    maximumYesPrice: ProbabilityPointDeltaStringSchema.optional(),
-    yesPriceBasis: z.enum(["LAST_TRADE", "BOOK_MIDPOINT"]).optional(),
+    minimumLongPrice: ProbabilityPointDeltaStringSchema.optional(),
+    maximumLongPrice: ProbabilityPointDeltaStringSchema.optional(),
+    longPriceBasis: z.enum(["LAST_TRADE", "BOOK_MIDPOINT"]).optional(),
     maximumDataAgeSeconds: z.number().int().nonnegative().optional(),
   })
   .strict()
@@ -202,25 +203,25 @@ const MarketDiscoveryInputSchema = z
       });
     }
     if (
-      (value.minimumYesPrice !== undefined ||
-        value.maximumYesPrice !== undefined) &&
-      value.yesPriceBasis === undefined
+      (value.minimumLongPrice !== undefined ||
+        value.maximumLongPrice !== undefined) &&
+      value.longPriceBasis === undefined
     ) {
       context.addIssue({
         code: "custom",
-        path: ["yesPriceBasis"],
-        message: "Price-band filters require yesPriceBasis",
+        path: ["longPriceBasis"],
+        message: "Price-band filters require longPriceBasis",
       });
     }
     if (
-      value.minimumYesPrice !== undefined &&
-      value.maximumYesPrice !== undefined &&
-      value.minimumYesPrice.gt(value.maximumYesPrice)
+      value.minimumLongPrice !== undefined &&
+      value.maximumLongPrice !== undefined &&
+      value.minimumLongPrice.gt(value.maximumLongPrice)
     ) {
       context.addIssue({
         code: "custom",
-        path: ["maximumYesPrice"],
-        message: "maximumYesPrice must not be less than minimumYesPrice",
+        path: ["maximumLongPrice"],
+        message: "maximumLongPrice must not be less than minimumLongPrice",
       });
     }
     if (
@@ -255,7 +256,7 @@ const MarketAnalysisInputSchema = z
 const TradePreviewInputSchema = z
   .object({
     marketSlug: z.string().trim().min(1).max(500),
-    side: z.enum(["YES", "NO"]),
+    side: z.enum(MODEL_SIDES).transform(fromModelSide),
     action: z.enum(["BUY", "SELL"]),
     quantity: PositiveDecimalStringSchema,
     limitPrice: StrictProbabilityStringSchema,
@@ -312,7 +313,7 @@ const AgentStateInputSchema = z.discriminatedUnion("action", [
       action: z.literal("ADD_BELIEF"),
       thesisId: z.string().trim().min(1).max(200).optional(),
       familyKey: z.string().trim().min(1).max(300).optional(),
-      forecastYesProbability: z.number().min(0).max(1).nullable().optional(),
+      forecastLongProbability: z.number().min(0).max(1).nullable().optional(),
       type: z.enum([
         "EVENT_ANALYSIS",
         "MARKET_STRUCTURE",
@@ -343,7 +344,7 @@ const AgentStateInputSchema = z.discriminatedUnion("action", [
       action: z.literal("UPDATE_BELIEF"),
       thesisId: z.string().trim().min(1).max(200).optional(),
       familyKey: z.string().trim().min(1).max(300).optional(),
-      forecastYesProbability: z.number().min(0).max(1).nullable().optional(),
+      forecastLongProbability: z.number().min(0).max(1).nullable().optional(),
       beliefId: z.uuid(),
       type: z
         .enum([
@@ -549,6 +550,11 @@ const DetailedMarketContextSchema = z
     openInterest: z.string().optional(),
     minimumTradeQuantity: z.string(),
     priceTick: z.string(),
+    sideLabels: z
+      .object({ long: z.string().min(1), short: z.string().min(1) })
+      .strict()
+      .optional(),
+    assetPriceTerms: z.record(z.string(), z.unknown()).optional(),
     yesBid: z.string().optional(),
     yesAsk: z.string().optional(),
     noBid: z.string().optional(),
@@ -923,18 +929,18 @@ function discoverMarketsInputJsonSchema(
         type: "string",
         description: prompts.minimumOpenInterest,
       },
-      minimumYesPrice: {
+      minimumLongPrice: {
         type: "string",
-        description: prompts.minimumYesPrice,
+        description: prompts.minimumLongPrice,
       },
-      maximumYesPrice: {
+      maximumLongPrice: {
         type: "string",
-        description: prompts.maximumYesPrice,
+        description: prompts.maximumLongPrice,
       },
-      yesPriceBasis: {
+      longPriceBasis: {
         type: "string",
         enum: ["LAST_TRADE", "BOOK_MIDPOINT"],
-        description: prompts.yesPriceBasis,
+        description: prompts.longPriceBasis,
       },
       maximumDataAgeSeconds: {
         type: "integer",
@@ -1012,7 +1018,7 @@ function tradePreviewInputJsonSchema(
       },
       side: {
         type: "string",
-        enum: ["YES", "NO"],
+        enum: [...MODEL_SIDES],
         description: prompts.side,
       },
       action: {
@@ -1092,12 +1098,12 @@ function agentStateInputJsonSchema(
         description:
           "Optional common event-family identity for related beliefs.",
       },
-      forecastYesProbability: {
+      forecastLongProbability: {
         type: ["number", "null"],
         minimum: 0,
         maximum: 1,
         description:
-          "Current YES probability estimate for this thesis. This is not authoritative settlement evidence; null clears the estimate.",
+          "Current probability estimate for the market's LONG side under this thesis. This is not authoritative settlement evidence; null clears the estimate.",
       },
       action: {
         type: "string",
@@ -1387,6 +1393,28 @@ function buildDecisionToolDefinitions(
       terminal: true,
     },
   ]);
+}
+
+/** The model names a belief's forecast by the LONG side; the store keeps YES. */
+function stateOperationFromModel(
+  input: z.output<typeof AgentStateInputSchema>,
+): AgentStateOperation {
+  if (!("forecastLongProbability" in input)) return input;
+  const { forecastLongProbability, ...operation } = input;
+  return forecastLongProbability === undefined
+    ? operation
+    : { ...operation, forecastYesProbability: forecastLongProbability };
+}
+
+/** A tool body re-serialized in the model's long/short terms. */
+function modelToolContent(content: string): string {
+  let body: unknown;
+  try {
+    body = JSON.parse(content);
+  } catch {
+    return content;
+  }
+  return modelJson(body);
 }
 
 function safeToolError(
@@ -3000,6 +3028,17 @@ export class DecisionResearchSession {
     input: unknown,
     signal: AbortSignal,
   ): Promise<ToolExecutionResult> {
+    const result = await this.executeTool(name, input, signal);
+    return result.kind === "TOOL_RESULT"
+      ? { ...result, content: modelToolContent(result.content) }
+      : result;
+  }
+
+  private async executeTool(
+    name: string,
+    input: unknown,
+    signal: AbortSignal,
+  ): Promise<ToolExecutionResult> {
     if (this.terminalDecisionSubmitted) {
       throw new Error("No tools may run after submit_trade_plan");
     }
@@ -3234,8 +3273,19 @@ export class DecisionResearchSession {
     }
 
     const protectedCursor = parsed.data.cursor;
+    const { minimumLongPrice, maximumLongPrice, longPriceBasis, ...filters } =
+      parsed.data;
     const baseRequest: MarketDiscoveryRequest = {
-      ...parsed.data,
+      ...filters,
+      ...(minimumLongPrice === undefined
+        ? {}
+        : { minimumYesPrice: minimumLongPrice }),
+      ...(maximumLongPrice === undefined
+        ? {}
+        : { maximumYesPrice: maximumLongPrice }),
+      ...(longPriceBasis === undefined
+        ? {}
+        : { yesPriceBasis: longPriceBasis }),
       cursor: undefined,
     };
     const fingerprint = requestFingerprint("markets", {
@@ -4052,7 +4102,10 @@ export class DecisionResearchSession {
     }
     try {
       signal.throwIfAborted();
-      const result = await this.agentStateHandler(parsed.data, signal);
+      const result = await this.agentStateHandler(
+        stateOperationFromModel(parsed.data),
+        signal,
+      );
       signal.throwIfAborted();
       return {
         kind: "TOOL_RESULT",

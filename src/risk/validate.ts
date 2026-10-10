@@ -30,6 +30,7 @@ import {
   estimateExchangeTakerFeePerContract,
   feeForEdgeEvaluation,
 } from "./edge.js";
+import { toModelSide } from "../agent/model-view.js";
 import { calculateKellyBudget } from "./kelly.js";
 import {
   positionReductionDisabled,
@@ -270,7 +271,7 @@ function validateFreshMarket(
   const yesBid = bbo.yes.bid;
   const yesAsk = bbo.yes.ask;
   if (yesBid !== undefined && yesAsk !== undefined && yesBid.gt(yesAsk)) {
-    reject("CROSSED_BOOK", "YES order book is crossed");
+    reject("CROSSED_BOOK", "LONG order book is crossed");
   }
 
   const bestBookBid = book.yesBids.reduce<Decimal | undefined>(
@@ -327,10 +328,11 @@ function validateSideAndAction(
 function canonicalSpread(bbo: MarketBbo, side: OutcomeSide): Decimal {
   const quote = side === "YES" ? bbo.yes : bbo.no;
   if (quote.bid === undefined || quote.ask === undefined) {
-    reject("MISSING_QUOTE", `Missing ${side} bid or ask`);
+    reject("MISSING_QUOTE", `Missing ${toModelSide(side)} bid or ask`);
   }
   const spread = quote.ask.minus(quote.bid);
-  if (spread.lt(0)) reject("CROSSED_BOOK", `${side} quote is crossed`);
+  if (spread.lt(0))
+    reject("CROSSED_BOOK", `${toModelSide(side)} quote is crossed`);
   return spread;
 }
 

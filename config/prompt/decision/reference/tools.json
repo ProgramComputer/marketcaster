@@ -31,13 +31,13 @@
       "minimumLiquidityUsd": "Optional nonnegative decimal-string minimum liquidity in USD. Markets whose liquidity metric is unavailable do not satisfy this filter.",
       "minimumVolumeUsd": "Optional nonnegative decimal-string minimum cumulative total volume in USD. Markets whose cumulative volume is unavailable do not satisfy this filter unless the result explicitly reports an exchange-applied minimumVolumeSatisfiedUsd qualification.",
       "minimumPriceMovement": "Optional decimal string from 0 through 1 requiring at least this absolute probability-point movement. Interpret priceMovement using each row's priceMovementWindow and priceMovementBasis; rows without a usable movement metric do not satisfy this filter.",
-      "maximumSpread": "Optional decimal string from 0 through 1 requiring the current two-sided YES ask-minus-bid spread to be no greater than this value. Markets without a usable two-sided book do not satisfy this filter.",
-      "minimumBookDepth": "Optional nonnegative decimal-string minimum two-sided order-book depth in contracts. Depth is the smaller of eligible YES bid depth and YES ask depth inside bookDepthWithinPricePoints; markets without usable depth do not satisfy this filter.",
+      "maximumSpread": "Optional decimal string from 0 through 1 requiring the current two-sided LONG ask-minus-bid spread, which both sides share, to be no greater than this value. Markets without a usable two-sided book do not satisfy this filter.",
+      "minimumBookDepth": "Optional nonnegative decimal-string minimum two-sided order-book depth in contracts. Depth is the smaller of eligible LONG bid depth and LONG ask depth inside bookDepthWithinPricePoints; markets without usable depth do not satisfy this filter.",
       "bookDepthWithinPricePoints": "Optional decimal string from 0 through 1 defining how far from the best bid and ask to sum depth. Use with minimumBookDepth; zero measures only quantity at the best prices.",
       "minimumOpenInterest": "Optional nonnegative decimal-string minimum exchange-reported open interest in contracts. Markets whose open-interest metric is unavailable do not satisfy this filter.",
-      "minimumYesPrice": "Optional decimal string from 0 through 1 requiring the selected YES price metric to be at least this value. Set yesPriceBasis whenever a YES price bound is used.",
-      "maximumYesPrice": "Optional decimal string from 0 through 1 requiring the selected YES price metric to be no greater than this value. Set yesPriceBasis whenever a YES price bound is used.",
-      "yesPriceBasis": "Price basis for minimumYesPrice or maximumYesPrice: LAST_TRADE or BOOK_MIDPOINT. A book midpoint requires both a valid YES bid and ask. Omit when no YES price bound is used.",
+      "minimumLongPrice": "Optional decimal string from 0 through 1 requiring the selected LONG price metric to be at least this value. Set longPriceBasis whenever a LONG price bound is used.",
+      "maximumLongPrice": "Optional decimal string from 0 through 1 requiring the selected LONG price metric to be no greater than this value. Set longPriceBasis whenever a LONG price bound is used.",
+      "longPriceBasis": "Price basis for minimumLongPrice or maximumLongPrice: LAST_TRADE or BOOK_MIDPOINT. A book midpoint requires both a valid LONG bid and ask. Omit when no LONG price bound is used.",
       "maximumDataAgeSeconds": "Optional nonnegative integer maximum age for the exchange-timestamped order-book data used by spread, depth, or BOOK_MIDPOINT filters. Markets without a usable exchange timestamp do not satisfy this filter."
     }
   },
@@ -51,13 +51,13 @@
     }
   },
   "get_market_details": {
-    "description": "Fetch settlement rules, current bid/ask prices, close time, current exposure, and exchange-reported cumulative volume, price movement, and volatility metrics when available for an exact market slug from the exchange catalog. Metric windows and bases are returned with their values. Full order-book depth is refreshed later by deterministic validation.",
+    "description": "Fetch settlement rules, each side's exchange label and current bid/ask (sides), any exchange asset-price terms, close time, current exposure, and exchange-reported cumulative volume, price movement, and volatility metrics when available for an exact market slug from the exchange catalog. Metric windows and bases are returned with their values. Full order-book depth is refreshed later by deterministic validation.",
     "arguments": {
       "marketSlug": "An exact slug returned by discover_markets or present in the supplied portfolio context."
     }
   },
   "get_market_family_details": {
-    "description": "Inspect a bounded native event or series family in one call. Starting from an exact catalog market slug, returns exact settlement rules, fresh bid/ask prices, close time, exposure, and mechanical qualification inputs for every returned sibling. Event identity takes precedence over series identity; an ungrouped market returns a one-member market family.",
+    "description": "Inspect a bounded native event or series family in one call. Starting from an exact catalog market slug, returns exact settlement rules, each side's exchange label and fresh bid/ask (sides), any exchange asset-price terms, close time, exposure, and mechanical qualification inputs for every returned sibling. Event identity takes precedence over series identity; an ungrouped market returns a one-member market family.",
     "arguments": {
       "marketSlug": "An exact seed slug returned by discover_markets or present in the supplied portfolio context.",
       "limit": "Maximum family members to inspect and return, from 1 through 30. Omit to use the default."
@@ -74,10 +74,10 @@
     "description": "Request a non-binding read-only preview for a draft trade against current exchange conditions. The result separates current-book expected spend, exchange-reported fees, the conservative fee reserve, and maximum spend at the supplied limit. A successful preview does not reserve funds or liquidity, approve risk, guarantee a fill, or replace final deterministic validation and execution-time preview.",
     "arguments": {
       "marketSlug": "An exact market slug already inspected with get_market_details or get_market_family_details, or present in the supplied portfolio context.",
-      "side": "Canonical outcome side: YES or NO.",
+      "side": "Market side: LONG or SHORT. Every market has two sides; LONG is the side the exchange marks long and SHORT is the other. Each market's sides list shows the exchange's own label for each, such as Yes/No, a team, Over/Under, or a spread.",
       "action": "Trade action: BUY or SELL.",
       "quantity": "Positive decimal-string contract quantity for this exploratory preview.",
-      "limitPrice": "Decimal string strictly between 0 and 1 in canonical selected-side terms: maximum purchase price for BUY or minimum sale price for SELL."
+      "limitPrice": "Decimal string strictly between 0 and 1 in the selected side's own price terms: maximum purchase price for BUY or minimum sale price for SELL."
     }
   },
   "manage_notes": {
@@ -112,7 +112,7 @@
     }
   },
   "submit_trade_plan": {
-    "description": "Submit the terminal desired-exposure list plus compact pass dispositions. Every held position requires a target: reuse its supplied current cost-basis fraction to hold unchanged or use zero to exit. Every seriously evaluated non-held candidate requires either a target or a pass disposition. targetCostBasisFraction is desired TOTAL same-side cost basis divided by current risk equity. estimatedProbability is P(selected side), including P(NO) for a NO target. maximumEntryPrice, when non-null, is only the worst acceptable BUY ceiling; deterministic validation may tighten it. The runtime controls time in force, expiration, size, and final price guards. Deterministic validation blends the point estimate toward the adverse interval bound using the supplied uncertaintyBoundWeight, then derives entry and exit price guards from that authorization probability and current fees.",
+    "description": "Submit the terminal desired-exposure list plus compact pass dispositions. Every held position requires a target: reuse its supplied current cost-basis fraction to hold unchanged or use zero to exit. Every seriously evaluated non-held candidate requires either a target or a pass disposition. targetCostBasisFraction is desired TOTAL same-side cost basis divided by current risk equity. estimatedProbability is P(selected side), including P(SHORT) for a SHORT target. Each side is LONG or SHORT as listed in the market's sides; buying either side costs at most its price, and SELL only reduces a side already held. maximumEntryPrice, when non-null, is only the worst acceptable BUY ceiling; deterministic validation may tighten it. The runtime controls time in force, expiration, size, and final price guards. Deterministic validation blends the point estimate toward the adverse interval bound using the supplied uncertaintyBoundWeight, then derives entry and exit price guards from that authorization probability and current fees.",
     "arguments": {}
   }
 }

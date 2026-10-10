@@ -54,9 +54,9 @@ const ResearchToolPromptsSchema = z
             minimumBookDepth: PromptTextSchema,
             bookDepthWithinPricePoints: PromptTextSchema,
             minimumOpenInterest: PromptTextSchema,
-            minimumYesPrice: PromptTextSchema,
-            maximumYesPrice: PromptTextSchema,
-            yesPriceBasis: PromptTextSchema,
+            minimumLongPrice: PromptTextSchema,
+            maximumLongPrice: PromptTextSchema,
+            longPriceBasis: PromptTextSchema,
             maximumDataAgeSeconds: PromptTextSchema,
           })
           .strict(),

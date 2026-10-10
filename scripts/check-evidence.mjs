@@ -1093,7 +1093,7 @@ await (async () => {
         "preview_trade",
         {
           marketSlug: fallback.slug,
-          side: "YES",
+          side: "LONG",
           action: "BUY",
           quantity: "1",
           limitPrice: "0.5",

@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { AgentConfig } from "../config/schema.js";
 import type { AgentDecision } from "../agent/decision-schema.js";
 import type { EvidenceValidationIssue } from "../agent/evidence-provenance.js";
+import { modelJson } from "../agent/model-view.js";
 import type { DecisionPrompt } from "../agent/prompt-builder.js";
 import type { DecisionRequestProvenance } from "../reporting/decision-input-provenance.js";
 import type {
@@ -419,7 +420,7 @@ export async function reviewDecisionSubmission(
     kind: "REPAIR",
     toolResult: {
       kind: "TOOL_RESULT",
-      content: JSON.stringify({
+      content: modelJson({
         ok: false,
         code: "TRADE_PLAN_VALIDATION_REJECTED",
         message: `Deterministic coverage, evidence provenance, reconciliation, or risk validation rejected the terminal plan. Continue with the remaining research budget, then submit one complete replacement plan. This is bounded repair attempt ${attempt} of ${MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS}.`,

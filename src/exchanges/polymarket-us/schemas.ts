@@ -68,6 +68,13 @@ function requireOne(
   }
 }
 
+const MarketSideSchema = z
+  .object({
+    description: z.string(),
+    long: z.boolean(),
+  })
+  .loose();
+
 export const PolymarketMarketSchema = z
   .object({
     id: IdentifierSchema,
@@ -119,6 +126,12 @@ export const PolymarketMarketSchema = z
     seriesId: IdentifierSchema.optional(),
     seriesSlug: OptionalNonEmptyStringSchema,
     tags: z.array(MarketTagSchema).optional(),
+    // Malformed side or price terms must never drop a market from the catalog.
+    marketSides: z.array(MarketSideSchema).optional().catch(undefined),
+    assetPriceTerms: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .catch(undefined),
   })
   .loose()
   .superRefine((value, context) => {

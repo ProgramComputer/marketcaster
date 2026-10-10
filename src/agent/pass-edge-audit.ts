@@ -5,6 +5,7 @@ import type { PredictionExchange } from "../exchanges/exchange.js";
 import { estimateExchangeTakerFeePerContract } from "../risk/edge.js";
 import type { AgentDecision, CandidateDisposition } from "./decision-schema.js";
 import type { DecisionCoverageIssue } from "./decision-coverage.js";
+import { toModelSide } from "./model-view.js";
 
 export interface PassEdgeAuditCheck {
   readonly marketSlug: string;
@@ -231,7 +232,7 @@ export async function auditNoPositiveEdgePasses(input: {
     issues.push({
       code: "CONTRADICTORY_NO_POSITIVE_EDGE",
       marketSlug: disposition.marketSlug,
-      message: `${disposition.marketSlug} is passed as NO_POSITIVE_EDGE, but its supplied interval implies a policy-adjusted P(${strongest.side})=${strongest.authorization.toFixed()} against frozen fresh ask ${strongest.ask.toFixed()}, estimated fee ${strongest.fee.toFixed()}, and net edge ${strongest.edge.toFixed()} per contract. Preview and evaluate ${strongest.side}; target it if evidence and settlement remain valid, or use a specific settlement, evidence, spread, depth, or risk blocker. Do not apply another confidence haircut outside the probability interval.`,
+      message: `${disposition.marketSlug} is passed as NO_POSITIVE_EDGE, but its supplied interval implies a policy-adjusted P(${toModelSide(strongest.side)})=${strongest.authorization.toFixed()} against frozen fresh ask ${strongest.ask.toFixed()}, estimated fee ${strongest.fee.toFixed()}, and net edge ${strongest.edge.toFixed()} per contract. Preview and evaluate ${toModelSide(strongest.side)}; target it if evidence and settlement remain valid, or use a specific settlement, evidence, spread, depth, or risk blocker. Do not apply another confidence haircut outside the probability interval.`,
     });
   }
 

@@ -241,7 +241,7 @@ try {
       portfolioTargets: [
         {
           marketSlug: "fixture-market",
-          side: "YES",
+          side: "LONG",
           targetCostBasisFraction: "0.25",
           estimatedProbability: "0.8",
           probabilityLowerBound: "0.7",
@@ -261,6 +261,7 @@ try {
     signal,
   );
   assert.equal(submitted.kind, "DECISION");
+  assert.equal(submitted.decision.portfolioTargets[0].side, "YES");
   assert.equal(
     submitted.decision.portfolioTargets[0].estimatedProbability.toFixed(),
     "0.8",

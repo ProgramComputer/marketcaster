@@ -152,6 +152,9 @@ The model returns `targetCostBasisFraction`: desired total same-side cost basis
 as a fraction of current risk equity. It does not return a one-shot order size.
 An explicit zero requests an exit. Every holding must receive a target.
 
+The model names sides LONG and SHORT, the exchange's long and short sides, and
+sees each side's exchange label; internally the engine keeps YES and NO.
+
 A pure reconciler computes the remaining BUY or SELL delta from the
 authoritative cycle-start position. Kelly sizing, concentration, buying power,
 cycle spend, spread, fees, source requirements, and book depth can shrink or

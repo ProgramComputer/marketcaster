@@ -205,6 +205,8 @@ export function mapMarket(value: KalshiMarket): Market {
         }),
     ...optional("openInterest", value.open_interest_fp),
     ...optional("updatedAt", value.updated_time),
+    // Kalshi's API names its two sides yes (long) and no.
+    sideLabels: { long: "Yes", short: "No" },
   };
 }
 

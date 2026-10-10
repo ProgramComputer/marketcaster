@@ -5,6 +5,7 @@ import type { ExecutionResult } from "../../domain/execution.js";
 import type {
   Market,
   MarketBbo,
+  MarketSideLabels,
   OrderBook,
   SettlementStatus,
 } from "../../domain/market.js";
@@ -82,6 +83,44 @@ function assertProbability(value: Decimal, fieldName: string): void {
 
 function optional<T>(key: string, value: T | undefined): Record<string, T> {
   return value === undefined ? {} : { [key]: value };
+}
+
+/** The exchange's side labels, kept only when exactly one of two sides is long. */
+function marketSideLabels(
+  sides: PolymarketMarket["marketSides"],
+): MarketSideLabels | undefined {
+  if (sides?.length !== 2) return undefined;
+  const long = sides.filter((side) => side.long);
+  const short = sides.filter((side) => !side.long);
+  const longLabel = long[0]?.description.trim();
+  const shortLabel = short[0]?.description.trim();
+  if (
+    long.length !== 1 ||
+    short.length !== 1 ||
+    longLabel === undefined ||
+    shortLabel === undefined ||
+    longLabel.length === 0 ||
+    shortLabel.length === 0
+  ) {
+    return undefined;
+  }
+  return { long: longLabel, short: shortLabel };
+}
+
+const MAXIMUM_ASSET_PRICE_TERMS_CHARACTERS = 4_000;
+
+/** Asset-price terms as sent, without the exchange's chart presentation settings. */
+function assetPriceTerms(
+  terms: PolymarketMarket["assetPriceTerms"],
+): Readonly<Record<string, unknown>> | undefined {
+  if (terms === undefined) return undefined;
+  const contractTerms = Object.fromEntries(
+    Object.entries(terms).filter(([key]) => key !== "chart"),
+  );
+  return JSON.stringify(contractTerms).length >
+    MAXIMUM_ASSET_PRICE_TERMS_CHARACTERS
+    ? undefined
+    : contractTerms;
 }
 
 export function mapMarket(value: PolymarketMarket): Market {
@@ -189,6 +228,8 @@ export function mapMarket(value: PolymarketMarket): Market {
         }),
     ...optional("openInterest", value.openInterest),
     ...optional("updatedAt", value.updatedAt),
+    ...optional("sideLabels", marketSideLabels(value.marketSides)),
+    ...optional("assetPriceTerms", assetPriceTerms(value.assetPriceTerms)),
   };
 }
 

@@ -1,6 +1,7 @@
 import { Decimal } from "decimal.js";
 import { z } from "zod";
 import { DecisionEvidenceSchema } from "./decision-evidence.js";
+import { fromModelSide, MODEL_SIDES, toModelView } from "./model-view.js";
 import {
   EvidenceBundleCollectionSchema,
   EvidenceBundleIdsSchema,
@@ -440,9 +441,9 @@ const AgentDecisionModelJsonSchemaWithDispositions = {
           marketSlug: { type: "string", minLength: 1, maxLength: 500 },
           side: {
             type: "string",
-            enum: ["YES", "NO"],
+            enum: [...MODEL_SIDES],
             description:
-              "Selected contract side. All probability fields on this target are P(this side), not always P(YES).",
+              "Selected market side as listed in the market's sides: LONG is the side the exchange marks long, SHORT the other. All probability fields on this target are P(this side).",
           },
           targetCostBasisFraction: {
             type: "string",
@@ -452,7 +453,7 @@ const AgentDecisionModelJsonSchemaWithDispositions = {
             type: "string",
             pattern: DECIMAL_PATTERN.source,
             description:
-              "Point estimate of P(selected side). For side NO, convert a YES probability q to 1-q before recording it.",
+              "Point estimate of P(selected side). For side SHORT, convert a LONG probability q to 1-q before recording it.",
           },
           probabilityLowerBound: {
             type: "string",
@@ -574,9 +575,9 @@ const AgentDecisionModelJsonSchemaWithDispositions = {
           marketSlug: { type: "string", minLength: 1, maxLength: 500 },
           side: {
             type: ["string", "null"],
-            enum: ["YES", "NO", null],
+            enum: [...MODEL_SIDES, null],
             description:
-              "Selected contract side. When non-null, all probability fields on this disposition are P(this side), not always P(YES).",
+              "Selected market side as listed in the market's sides: LONG or SHORT. When non-null, all probability fields on this disposition are P(this side).",
           },
           outcome: { type: "string", enum: ["HOLD_UNCHANGED", "PASS"] },
           reasonCode: {
@@ -596,7 +597,7 @@ const AgentDecisionModelJsonSchemaWithDispositions = {
             type: ["string", "null"],
             pattern: DECIMAL_PATTERN.source,
             description:
-              "P(selected side), not always P(YES). For side NO, convert a YES probability q to 1-q. Required and non-null with probabilityLowerBound and probabilityUpperBound when reasonCode is NO_POSITIVE_EDGE.",
+              "P(selected side). For side SHORT, convert a LONG probability q to 1-q. Required and non-null with probabilityLowerBound and probabilityUpperBound when reasonCode is NO_POSITIVE_EDGE.",
           },
           probabilityLowerBound: {
             type: ["string", "null"],
@@ -721,10 +722,12 @@ const ModelEvidenceBundleSchema = z
   })
   .strict();
 
+const ModelSideSchema = z.enum(MODEL_SIDES);
+
 const ModelProposalSchema = z
   .object({
     marketSlug: z.string(),
-    side: z.enum(["YES", "NO"]),
+    side: ModelSideSchema,
     action: z.enum(["BUY", "SELL"]),
     estimatedProbability: z.string(),
     maximumEntryPrice: z.string().nullable().optional(),
@@ -742,7 +745,7 @@ const ModelProposalSchema = z
 const ModelPortfolioTargetSchema = z
   .object({
     marketSlug: z.string(),
-    side: z.enum(["YES", "NO"]),
+    side: ModelSideSchema,
     targetCostBasisFraction: z.string(),
     estimatedProbability: z.string(),
     probabilityLowerBound: z.string(),
@@ -761,7 +764,7 @@ const ModelPortfolioTargetSchema = z
 const ModelCandidateDispositionSchema = z
   .object({
     marketSlug: z.string(),
-    side: z.enum(["YES", "NO"]).nullable().optional(),
+    side: ModelSideSchema.nullable().optional(),
     outcome: z.enum(["HOLD_UNCHANGED", "PASS"]),
     reasonCode: z.enum([
       "NO_POSITIVE_EDGE",
@@ -889,7 +892,7 @@ function normalizeModelAgentDecision(
         }),
     portfolioTargets: wireDecision.portfolioTargets.map((target) => ({
       marketSlug: target.marketSlug,
-      side: target.side,
+      side: fromModelSide(target.side),
       targetCostBasisFraction: target.targetCostBasisFraction,
       estimatedProbability: target.estimatedProbability,
       probabilityLowerBound: target.probabilityLowerBound,
@@ -916,7 +919,7 @@ function normalizeModelAgentDecision(
         marketSlug: disposition.marketSlug,
         ...(disposition.side === null || disposition.side === undefined
           ? {}
-          : { side: disposition.side }),
+          : { side: fromModelSide(disposition.side) }),
         outcome: disposition.outcome,
         reasonCode: disposition.reasonCode,
         rationale: disposition.rationale,
@@ -940,7 +943,7 @@ function normalizeModelAgentDecision(
     ),
     proposals: wireDecision.proposals.map((proposal) => ({
       marketSlug: proposal.marketSlug,
-      side: proposal.side,
+      side: fromModelSide(proposal.side),
       action: proposal.action,
       estimatedProbability: proposal.estimatedProbability,
       ...(proposal.maximumEntryPrice === null ||
@@ -978,10 +981,13 @@ export function parseModelAgentDecision(value: unknown): AgentDecision {
 
 /**
  * Migration helper for bounded historical fixtures/artifacts that used the
- * former proposal wire contract. Never use this at the live tool boundary.
+ * former proposal wire contract and YES/NO sides. Never use this at the live
+ * tool boundary.
  */
 export function parseLegacyModelAgentDecision(value: unknown): AgentDecision {
-  return normalizeModelAgentDecision(ModelDecisionSchema.parse(value));
+  return normalizeModelAgentDecision(
+    ModelDecisionSchema.parse(toModelView(value)),
+  );
 }
 
 export function createPassDecision(cycleSummary: string): AgentDecision {

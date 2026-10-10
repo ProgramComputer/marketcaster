@@ -158,7 +158,7 @@ export async function checkCycleForecastMemory(directory, prompts) {
             basisMarketSlugs: [market.slug],
             evidenceUpdatedAt: now().toISOString(),
             invalidationConditions: [],
-            forecastYesProbability: 0.8,
+            forecastLongProbability: 0.8,
           },
           signal,
         );
@@ -170,7 +170,7 @@ export async function checkCycleForecastMemory(directory, prompts) {
             portfolioTargets: [
               {
                 marketSlug: market.slug,
-                side: "YES",
+                side: "LONG",
                 targetCostBasisFraction: "0",
                 estimatedProbability: "0.2",
                 probabilityLowerBound: "0.1",

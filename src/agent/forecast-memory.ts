@@ -74,7 +74,7 @@ export function reviewForecastMemory(input: {
         ...base,
         code: "AMBIGUOUS_FORECAST_MARKET",
         message:
-          "A single YES probability cannot be attributed to multiple or unspecified contracts. The scalar is advisory and needs a single-market revision; the belief text remains available.",
+          "A single LONG-side probability cannot be attributed to multiple or unspecified contracts. The scalar is advisory and needs a single-market revision; the belief text remains available.",
       });
       continue;
     }
@@ -108,7 +108,7 @@ export function reviewForecastMemory(input: {
       targetYesProbability: yesProbability.toNumber(),
       targetSubmittedAt: latest.submittedAt,
       message:
-        "This advisory scalar differs from the latest subsequent target for the same contract after conversion to P(YES). Preserve both observations for review; the target remains independently eligible.",
+        "This advisory scalar differs from the latest subsequent target for the same contract after conversion to P(LONG). Preserve both observations for review; the target remains independently eligible.",
     });
   }
   return { issues, checkedBeliefIds, unverifiedBeliefs };

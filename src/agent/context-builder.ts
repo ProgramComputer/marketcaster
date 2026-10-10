@@ -7,6 +7,7 @@ import type {
   MarketBbo,
   MarketMetricBasis,
   MarketMetricWindow,
+  MarketSideLabels,
   OrderBook,
   MarketTag,
   SettlementRulesProvenance,
@@ -178,6 +179,8 @@ export interface DetailedMarketContext {
   readonly openInterest?: string;
   readonly minimumTradeQuantity: string;
   readonly priceTick: string;
+  readonly sideLabels?: MarketSideLabels;
+  readonly assetPriceTerms?: Readonly<Record<string, unknown>>;
   readonly yesBid?: string;
   readonly yesAsk?: string;
   readonly noBid?: string;
@@ -683,6 +686,12 @@ function buildDetailedMarket(
       `${market.slug} minimumTradeQuantity`,
     ),
     priceTick: decimalString(market.priceTick, `${market.slug} priceTick`),
+    ...(market.sideLabels === undefined
+      ? {}
+      : { sideLabels: market.sideLabels }),
+    ...(market.assetPriceTerms === undefined
+      ? {}
+      : { assetPriceTerms: market.assetPriceTerms }),
     ...(yesBid === undefined ? {} : { yesBid }),
     ...(yesAsk === undefined ? {} : { yesAsk }),
     ...(noBid === undefined ? {} : { noBid }),
@@ -917,7 +926,7 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
           ...criticalLearning,
           positionManagementReminders: [
             ...criticalLearning.positionManagementReminders,
-            "risk.allowPositionReductions=false: canonical SELL YES and SELL NO are disabled, including trims, zero-target exits, and emergency exits. BUY YES and BUY NO remain subject to existing safeguards; raw exchange side does not determine this policy. Keep any requested reduction as blocked intent, not an intended hold; do not retry to override POSITION_REDUCTION_DISABLED. Cancellations and exchange settlement are unaffected.",
+            "risk.allowPositionReductions=false: SELL LONG and SELL SHORT are disabled, including trims, zero-target exits, and emergency exits. BUY LONG and BUY SHORT remain subject to existing safeguards. Keep any requested reduction as blocked intent, not an intended hold; do not retry to override POSITION_REDUCTION_DISABLED. Cancellations and exchange settlement are unaffected.",
           ],
         },
     markets: {

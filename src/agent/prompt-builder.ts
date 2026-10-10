@@ -4,6 +4,7 @@ import {
   type DecisionPromptTemplates,
 } from "../config/prompts.js";
 import { redactPotentialSecrets } from "../utilities/redaction.js";
+import { modelJson } from "./model-view.js";
 
 export { redactPotentialSecrets } from "../utilities/redaction.js";
 
@@ -13,7 +14,7 @@ export interface DecisionPrompt {
 }
 
 export function serializeAgentContext(context: AgentContext): string {
-  return redactPotentialSecrets(JSON.stringify(context, null, 2));
+  return redactPotentialSecrets(modelJson(context, 2));
 }
 
 export function buildDecisionPrompt(

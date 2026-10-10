@@ -114,6 +114,7 @@ import {
   type EvidenceValidationReport,
 } from "./evidence-provenance.js";
 import { buildDecisionPrompt } from "./prompt-builder.js";
+import { toModelSide } from "./model-view.js";
 import {
   provenanceIdentityFromEnvironment,
   renderedInputProvenance,
@@ -1893,7 +1894,7 @@ export async function runCycle(
           liveCoverageIssues.push({
             code: "STALE_LIVE_PROBABILITY",
             marketSlug: target.marketSlug,
-            message: `${target.marketSlug} fresh policy forecast estimates P(${target.side})=${freshProbability.toFixed()}, not ${target.estimatedProbability.toFixed()}; reassess its total target from the fresh probability`,
+            message: `${target.marketSlug} fresh policy forecast estimates P(${toModelSide(target.side)})=${freshProbability.toFixed()}, not ${target.estimatedProbability.toFixed()}; reassess its total target from the fresh probability`,
           });
         }
       }

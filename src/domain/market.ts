@@ -23,6 +23,15 @@ export interface SettlementRulesProvenance {
   readonly completeness: "UNKNOWN";
 }
 
+/**
+ * The exchange's own label for each side of a market. LONG is the side a long
+ * order buys; labels vary by market ("Yes", a team, "Over", "+7.50").
+ */
+export interface MarketSideLabels {
+  readonly long: string;
+  readonly short: string;
+}
+
 export interface Market {
   readonly id: MarketId;
   readonly slug: string;
@@ -59,6 +68,9 @@ export interface Market {
   readonly minimumTradeQuantity: Decimal;
   readonly priceTick: Decimal;
   readonly updatedAt?: Date;
+  readonly sideLabels?: MarketSideLabels;
+  /** Exchange-supplied asset-price contract terms, as the exchange sends them. */
+  readonly assetPriceTerms?: Readonly<Record<string, unknown>>;
 }
 
 export interface QuoteLevel {

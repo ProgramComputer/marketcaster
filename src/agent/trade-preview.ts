@@ -64,7 +64,7 @@ export class PositionReductionDisabledPreviewError extends Error {
 
   public constructor() {
     super(
-      "Canonical SELL actions on YES and NO, including trims and emergency exits, are disabled by risk.allowPositionReductions; do not retry to override this policy",
+      "SELL actions on LONG and SHORT, including trims and emergency exits, are disabled by risk.allowPositionReductions; do not retry to override this policy",
     );
     this.name = "PositionReductionDisabledPreviewError";
   }
