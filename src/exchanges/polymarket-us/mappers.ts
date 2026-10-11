@@ -117,8 +117,14 @@ function assetPriceTerms(
   const contractTerms = Object.fromEntries(
     Object.entries(terms).filter(([key]) => key !== "chart"),
   );
-  return JSON.stringify(contractTerms).length >
-    MAXIMUM_ASSET_PRICE_TERMS_CHARACTERS
+  let length: number;
+  try {
+    length = JSON.stringify(contractTerms).length;
+  } catch {
+    // Terms nested too deeply to serialize are omitted, never fatal to the market.
+    return undefined;
+  }
+  return length > MAXIMUM_ASSET_PRICE_TERMS_CHARACTERS
     ? undefined
     : contractTerms;
 }

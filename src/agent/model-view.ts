@@ -32,6 +32,9 @@ export const MODEL_FIELD_NAMES: ReadonlyMap<string, string> = new Map([
   ["targetYesProbability", "targetLongProbability"],
 ]);
 
+/** Lists whose entries are field names rather than free text. */
+const FIELD_NAME_LISTS: ReadonlySet<string> = new Set(["unavailableMetrics"]);
+
 const SIDE_QUOTE_FIELDS: ReadonlySet<string> = new Set([
   "sideLabels",
   "yesBid",
@@ -76,17 +79,23 @@ function modelSides(
 /**
  * Rewrites a JSON-ready value into the model's terms: YES/NO side values become
  * LONG/SHORT, a market's yes/no quotes and exchange side labels become one
- * `sides` list, and YES-named fields take their long-side names. Applying it
- * twice changes nothing.
+ * `sides` list, and YES-named fields take their long-side names. Free text,
+ * exchange labels included, is never rewritten, so applying it twice changes
+ * nothing.
  */
 export function toModelView(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(toModelView);
-  if (typeof value === "string") return MODEL_FIELD_NAMES.get(value) ?? value;
   if (!isPlainObject(value)) return value;
+  // Never overwrite a field the object already carries under the model's name.
+  const renamed = (key: string): string => {
+    const name = MODEL_FIELD_NAMES.get(key);
+    return name === undefined || Object.hasOwn(value, name) ? key : name;
+  };
+  const hasSides = Object.hasOwn(value, "sides");
   const entries: [string, unknown][] = [];
   let sidesPlaced = false;
   for (const [key, entry] of Object.entries(value)) {
-    if (SIDE_QUOTE_FIELDS.has(key)) {
+    if (SIDE_QUOTE_FIELDS.has(key) && !hasSides) {
       if (!sidesPlaced) {
         entries.push(["sides", modelSides(value)]);
         sidesPlaced = true;
@@ -97,7 +106,18 @@ export function toModelView(value: unknown): unknown {
       entries.push([key, toModelSide(entry)]);
       continue;
     }
-    entries.push([MODEL_FIELD_NAMES.get(key) ?? key, toModelView(entry)]);
+    if (FIELD_NAME_LISTS.has(key) && Array.isArray(entry)) {
+      entries.push([
+        key,
+        entry.map((name: unknown) =>
+          typeof name === "string"
+            ? (MODEL_FIELD_NAMES.get(name) ?? name)
+            : name,
+        ),
+      ]);
+      continue;
+    }
+    entries.push([renamed(key), toModelView(entry)]);
   }
   return Object.fromEntries(entries);
 }
