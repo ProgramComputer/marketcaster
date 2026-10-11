@@ -32,8 +32,16 @@ export const MODEL_FIELD_NAMES: ReadonlyMap<string, string> = new Map([
   ["targetYesProbability", "targetLongProbability"],
 ]);
 
-/** Lists whose entries are field names rather than free text. */
-const FIELD_NAME_LISTS: ReadonlySet<string> = new Set(["unavailableMetrics"]);
+/** Lists whose entries name fields or metrics rather than carry free text. */
+const NAME_LISTS: ReadonlySet<string> = new Set([
+  "unavailableMetrics",
+  "requestedBookMetrics",
+]);
+
+const MODEL_LIST_NAMES: ReadonlyMap<string, string> = new Map([
+  ...MODEL_FIELD_NAMES,
+  ["YES_PRICE", "LONG_PRICE"],
+]);
 
 const SIDE_QUOTE_FIELDS: ReadonlySet<string> = new Set([
   "sideLabels",
@@ -106,12 +114,12 @@ export function toModelView(value: unknown): unknown {
       entries.push([key, toModelSide(entry)]);
       continue;
     }
-    if (FIELD_NAME_LISTS.has(key) && Array.isArray(entry)) {
+    if (NAME_LISTS.has(key) && Array.isArray(entry)) {
       entries.push([
         key,
         entry.map((name: unknown) =>
           typeof name === "string"
-            ? (MODEL_FIELD_NAMES.get(name) ?? name)
+            ? (MODEL_LIST_NAMES.get(name) ?? name)
             : name,
         ),
       ]);
