@@ -298,6 +298,29 @@ export const AgentDecisionSchema = z
         })),
       ],
     );
+    // Models resubmitting after a rejection sometimes drop the bundle array
+    // but keep the IDs; per-reference issues alone read like a misnamed ID.
+    const missingBundleIds = [
+      ...new Set(
+        issues
+          .filter((issue) => issue.code === "MISSING_BUNDLE_ID")
+          .map((issue) => issue.bundleId),
+      ),
+    ];
+    if (
+      missingBundleIds.length > 0 &&
+      (decision.evidenceBundles ?? []).length === 0
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["evidenceBundles"],
+        message: `This submission has no evidenceBundles array, but it cites evidence bundle IDs ${missingBundleIds
+          .map((id) => `"${id}"`)
+          .join(
+            ", ",
+          )}. Bundles from an earlier submission do not carry over: include evidenceBundles defining every cited ID, or remove those IDs and cite the evidence inline.`,
+      });
+    }
     for (const issue of issues) {
       const path = [...issue.path];
       let message = issue.message;

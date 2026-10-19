@@ -14,7 +14,7 @@ import {
   type FetchImplementation,
   fetchProviderResponse,
   isTradePlanSchemaValidationError,
-  MAXIMUM_TRADE_PLAN_SCHEMA_CORRECTION_ATTEMPTS,
+  FREE_TRADE_PLAN_SCHEMA_CORRECTION_TURNS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS,
   type ReasoningEffort,
@@ -1190,17 +1190,10 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                   });
                   if (
                     call.name === "submit_trade_plan" &&
-                    isTradePlanSchemaValidationError(result)
+                    isTradePlanSchemaValidationError(result) &&
+                    schemaCorrectionAttemptsOffered <
+                      FREE_TRADE_PLAN_SCHEMA_CORRECTION_TURNS
                   ) {
-                    if (
-                      schemaCorrectionAttemptsOffered >=
-                      MAXIMUM_TRADE_PLAN_SCHEMA_CORRECTION_ATTEMPTS
-                    ) {
-                      throw new DecisionProviderError(
-                        "Anthropic submitted a trade plan that failed schema validation after one correction attempt",
-                        "INVALID_DECISION",
-                      );
-                    }
                     schemaCorrectionAttemptsOffered += 1;
                     schemaCorrectionFinalRound = finalRound;
                     schemaCorrectionPending = true;

@@ -148,7 +148,7 @@ await (async () => {
     const repeated = harness([invalid, invalid]);
     await assert.rejects(
       repeated.decide(),
-      (error) => error.code === "INVALID_DECISION",
+      (error) => error.code === "ROUND_LIMIT",
     );
     assert.equal(repeated.requests.length, 2);
     assert.equal(repeated.reviews, 0);
