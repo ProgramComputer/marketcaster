@@ -1768,6 +1768,10 @@ export async function runCycle(
       string,
       ReturnType<PredictionExchange["getBbo"]>
     >();
+    const passEdgeBookCache = new Map<
+      string,
+      ReturnType<PredictionExchange["getOrderBook"]>
+    >();
     const validateDecisionGuards = async (
       candidateDecision: AgentDecision,
       signal: AbortSignal,
@@ -1845,6 +1849,7 @@ export async function runCycle(
             uncertaintyBoundWeight:
               dependencies.config.risk.uncertaintyBoundWeight,
             quoteCache: passEdgeQuoteCache,
+            bookCache: passEdgeBookCache,
             minimumMaterialEdge: strategy.passAuditMinimumEdge,
             signal,
           }),

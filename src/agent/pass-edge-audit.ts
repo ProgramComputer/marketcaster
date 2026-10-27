@@ -1,5 +1,11 @@
 import { Decimal } from "decimal.js";
-import type { Market, MarketBbo, SideBbo } from "../domain/market.js";
+import type {
+  Market,
+  MarketBbo,
+  OrderBook,
+  QuoteLevel,
+  SideBbo,
+} from "../domain/market.js";
 import type { OutcomeSide } from "../domain/primitives.js";
 import type { PredictionExchange } from "../exchanges/exchange.js";
 import { estimateExchangeTakerFeePerContract } from "../risk/edge.js";
@@ -28,13 +34,32 @@ export interface PassEdgeAuditCheck {
   readonly materialEdgeThreshold?: string;
 }
 
+/** Order book of an audited market. Recording it never changes a check or an issue. */
+export interface PassEdgeAuditBook {
+  readonly marketSlug: string;
+  readonly observedAt?: string;
+  readonly yesBids?: readonly {
+    readonly price: string;
+    readonly quantity: string;
+  }[];
+  readonly yesAsks?: readonly {
+    readonly price: string;
+    readonly quantity: string;
+  }[];
+  readonly error?: "BOOK_ERROR";
+}
+
 export interface PassEdgeAuditReport {
   readonly schemaVersion: 1;
   readonly auditPolicy: "BOTH_SIDES_AT_FROZEN_FRESH_BBO";
   readonly checkedDispositionCount: number;
   readonly checks: readonly PassEdgeAuditCheck[];
   readonly issues: readonly DecisionCoverageIssue[];
+  /** Present only when the caller supplies a book cache. */
+  readonly books?: readonly PassEdgeAuditBook[];
 }
+
+const MAXIMUM_RECORDED_BOOK_LEVELS = 50;
 
 function probabilityForSide(
   disposition: CandidateDisposition,
@@ -99,6 +124,39 @@ async function frozenBbo(
   return bbo;
 }
 
+function recordedLevels(levels: readonly QuoteLevel[]) {
+  return levels.slice(0, MAXIMUM_RECORDED_BOOK_LEVELS).map((level) => ({
+    price: level.price.toFixed(),
+    quantity: level.quantity.toFixed(),
+  }));
+}
+
+async function recordedBook(
+  market: Market,
+  exchange: PredictionExchange,
+  bookCache: Map<string, Promise<OrderBook>>,
+  signal: AbortSignal,
+): Promise<PassEdgeAuditBook> {
+  try {
+    let pending = bookCache.get(market.slug);
+    if (pending === undefined) {
+      signal.throwIfAborted();
+      pending = exchange.getOrderBook(market.id);
+      bookCache.set(market.slug, pending);
+    }
+    const book = await pending;
+    return {
+      marketSlug: market.slug,
+      observedAt: book.observedAt.toISOString(),
+      yesBids: recordedLevels(book.yesBids),
+      yesAsks: recordedLevels(book.yesAsks),
+    };
+  } catch {
+    signal.throwIfAborted();
+    return { marketSlug: market.slug, error: "BOOK_ERROR" };
+  }
+}
+
 /**
  * Rejects a NO_POSITIVE_EDGE pass when the model's own interval implies a
  * material conservative edge on either side at a frozen fresh quote. This is
@@ -115,6 +173,8 @@ export async function auditNoPositiveEdgePasses(input: {
   readonly minimumMaterialEdge?: Decimal;
   readonly uncertaintyBoundWeight: Decimal;
   readonly quoteCache: Map<string, Promise<MarketBbo>>;
+  /** When supplied, each audited market's order book is included in the report. */
+  readonly bookCache?: Map<string, Promise<OrderBook>>;
   readonly signal: AbortSignal;
 }): Promise<PassEdgeAuditReport> {
   const dispositions = input.decision.candidateDispositions.filter(
@@ -127,6 +187,7 @@ export async function auditNoPositiveEdgePasses(input: {
   );
   const checks: PassEdgeAuditCheck[] = [];
   const issues: DecisionCoverageIssue[] = [];
+  const books: PassEdgeAuditBook[] = [];
 
   for (const disposition of dispositions.slice(0, 12)) {
     const market = input.marketsBySlug.get(disposition.marketSlug);
@@ -147,6 +208,19 @@ export async function auditNoPositiveEdgePasses(input: {
         status: "QUOTE_ERROR",
       });
       continue;
+    }
+    if (
+      input.bookCache !== undefined &&
+      !books.some((book) => book.marketSlug === market.slug)
+    ) {
+      books.push(
+        await recordedBook(
+          market,
+          input.exchange,
+          input.bookCache,
+          input.signal,
+        ),
+      );
     }
 
     const candidates: {
@@ -242,5 +316,6 @@ export async function auditNoPositiveEdgePasses(input: {
     checkedDispositionCount: dispositions.length,
     checks,
     issues,
+    ...(input.bookCache === undefined ? {} : { books }),
   };
 }
