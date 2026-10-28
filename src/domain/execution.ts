@@ -14,6 +14,8 @@ export interface ExecutionResult {
   readonly finalState: OrderState;
   readonly rejectionReason?: string;
   readonly ambiguousReason?: string;
+  /** Exchange trade IDs of the fills reported with the order's submission. */
+  readonly tradeIds?: readonly string[];
 }
 
 export interface DepthResult {

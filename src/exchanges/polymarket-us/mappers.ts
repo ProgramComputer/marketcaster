@@ -734,6 +734,7 @@ export function mapOrder(
     state,
     ...optional("createdAt", value.createTime ?? value.insertTime),
     ...optional("updatedAt", value.updateTime),
+    ...optional("lastTransactAt", value.lastTransactTime),
   };
 }
 
@@ -838,6 +839,11 @@ export function mapCreateOrderResult(
       execution.type === "EXECUTION_TYPE_PARTIAL_FILL" ||
       execution.type === "EXECUTION_TYPE_FILL",
   );
+  const tradeIds = fillExecutions.flatMap((execution) =>
+    execution.tradeId === undefined ? [] : [execution.tradeId],
+  );
+  const withTradeIds = (result: ExecutionResult): ExecutionResult =>
+    tradeIds.length === 0 ? result : { ...result, tradeIds };
   const summedFillQuantity = fillExecutions.reduce(
     (sum, execution) =>
       sum.plus(
@@ -911,7 +917,7 @@ export function mapCreateOrderResult(
     (execution) => execution.type === "EXECUTION_TYPE_REJECTED",
   );
   if (rejection !== undefined || finalState === "REJECTED") {
-    return {
+    return withTradeIds({
       status: "REJECTED",
       orderId: value.id,
       filledQuantity,
@@ -920,14 +926,14 @@ export function mapCreateOrderResult(
       finalState: "REJECTED",
       rejectionReason:
         rejection?.orderRejectReason ?? rejection?.text ?? "Order rejected",
-    };
+    });
   }
   if (
     allowResting &&
     ["NEW", "OPEN", "INFLIGHT", "PARTIALLY_FILLED"].includes(finalState) &&
     filledQuantity.lt(requestedQuantity)
   ) {
-    return {
+    return withTradeIds({
       status: "WORKING",
       orderId: value.id,
       filledQuantity,
@@ -940,13 +946,13 @@ export function mapCreateOrderResult(
           ? undefined
           : yesPriceToCanonicalPrice(canonicalSide, averageYesPrice),
       ),
-    };
+    });
   }
   if (
     !["FILLED", "CANCELED", "EXPIRED"].includes(finalState) &&
     !filledQuantity.eq(requestedQuantity)
   ) {
-    return {
+    return withTradeIds({
       status: "AMBIGUOUS",
       orderId: value.id,
       filledQuantity,
@@ -961,7 +967,7 @@ export function mapCreateOrderResult(
       ),
       ambiguousReason:
         "Synchronous create response did not reach a final state",
-    };
+    });
   }
 
   const status = filledQuantity.eq(requestedQuantity)
@@ -969,7 +975,7 @@ export function mapCreateOrderResult(
     : filledQuantity.gt(0)
       ? "PARTIAL"
       : "NO_FILL";
-  return {
+  return withTradeIds({
     status,
     orderId: value.id,
     filledQuantity,
@@ -982,5 +988,5 @@ export function mapCreateOrderResult(
         ? undefined
         : yesPriceToCanonicalPrice(canonicalSide, averageYesPrice),
     ),
-  };
+  });
 }

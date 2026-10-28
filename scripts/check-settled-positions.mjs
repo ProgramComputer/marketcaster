@@ -61,8 +61,13 @@ const resolution = (marketSlug, realizedPnl, resolvedAt) => ({
   );
   assert.deepEqual(
     positions.map((position) => position.marketSlug),
-    ["foxtrot", "alpha", "bravo"],
-    "newest settlement first; SELL, two-sided and later fills are omitted",
+    ["foxtrot", "alpha", "bravo", "charlie", "delta"],
+    "newest settlement first; fills after settlement are omitted",
+  );
+  assert.equal(
+    positions.find((position) => position.marketSlug === "delta").side,
+    undefined,
+    "a market bought on both sides has no single side",
   );
   const alpha = positions.find((position) => position.marketSlug === "alpha");
   assert.equal(alpha.outcome, "WON");

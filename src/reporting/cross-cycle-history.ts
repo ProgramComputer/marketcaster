@@ -88,6 +88,7 @@ export interface CrossCycleHistoryEntry {
   readonly agentState: AgentStateReport["after"];
   readonly agentStateChanges: AgentStateReport["changes"];
   readonly currentCycleExecutions: readonly ExecutionReport[];
+  readonly restingOrderOutcomes?: CycleReport["restingOrderOutcomes"];
 }
 
 export interface CrossCycleHistory {
@@ -205,6 +206,9 @@ function historyEntry(report: CycleReport): CrossCycleHistoryEntry {
     agentState: report.agentState.after,
     agentStateChanges: report.agentState.changes,
     currentCycleExecutions: report.currentCycleExecutions,
+    ...(report.restingOrderOutcomes === undefined
+      ? {}
+      : { restingOrderOutcomes: report.restingOrderOutcomes }),
   };
 }
 

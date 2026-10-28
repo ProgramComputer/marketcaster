@@ -33,6 +33,7 @@ import type {
   PortfolioTargetReconciliationReport,
   CandidateDispositionReport,
   DecisionEvidenceReport,
+  RestingOrderOutcomeReport,
 } from "./types.js";
 
 interface DecisionEvidenceReportInput {
@@ -134,6 +135,7 @@ export interface BuildCycleReportInput {
   readonly targetReconciliation?: PortfolioTargetReconciliationResult;
   readonly validation: ProposalValidationResult;
   readonly execution: ExecutionRun;
+  readonly restingOrderOutcomes?: readonly RestingOrderOutcomeReport[];
   readonly warnings?: readonly string[];
   readonly errors?: CycleReport["errors"];
   readonly statusOverride?: Extract<
@@ -718,6 +720,7 @@ function executionReports(execution: ExecutionRun): readonly ExecutionReport[] {
       ...(result?.ambiguousReason === undefined
         ? {}
         : { ambiguousReason: result.ambiguousReason }),
+      ...(result?.tradeIds === undefined ? {} : { tradeIds: result.tradeIds }),
     };
   });
 }
@@ -948,6 +951,10 @@ export function buildCycleReport(input: BuildCycleReportInput): CycleReport {
       })),
     },
     currentCycleExecutions: executions,
+    ...(input.restingOrderOutcomes === undefined ||
+    input.restingOrderOutcomes.length === 0
+      ? {}
+      : { restingOrderOutcomes: input.restingOrderOutcomes }),
     executions,
     warnings: [
       ...input.valuationBefore.warnings,

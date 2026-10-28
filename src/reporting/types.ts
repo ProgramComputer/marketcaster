@@ -281,6 +281,20 @@ export interface ExecutionReport {
   readonly finalState: string;
   readonly skippedReason?: string;
   readonly ambiguousReason?: string;
+  /** Exchange trade IDs of the fills reported with the order's submission. */
+  readonly tradeIds?: readonly string[];
+}
+
+/** The exchange's final view of an order that was still resting when an earlier cycle ended. */
+export interface RestingOrderOutcomeReport {
+  readonly orderId: string;
+  readonly marketSlug: string;
+  readonly state: string;
+  readonly filledQuantity: string;
+  readonly averageFillPrice?: string;
+  readonly fees?: string;
+  readonly lastTransactAt?: string;
+  readonly observedAt: string;
 }
 
 export interface ErrorReport {
@@ -402,6 +416,8 @@ export interface CycleReport {
   };
   /** Execution attempts made by this cycle only. */
   readonly currentCycleExecutions: readonly ExecutionReport[];
+  /** Final states of earlier cycles' resting orders, looked up once each. */
+  readonly restingOrderOutcomes?: readonly RestingOrderOutcomeReport[];
   /** @deprecated Use currentCycleExecutions. Retained for report consumers. */
   readonly executions: readonly ExecutionReport[];
   readonly warnings: readonly string[];

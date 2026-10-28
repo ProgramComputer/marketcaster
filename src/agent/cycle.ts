@@ -49,6 +49,7 @@ import { buildCycleReport } from "../reporting/build-report.js";
 import { persistCrossCycleHistory } from "../reporting/cross-cycle-history.js";
 import {
   loadEntryFills,
+  lookUpRestingOrders,
   summarizeSettledPositions,
 } from "./settled-positions.js";
 import {
@@ -1058,6 +1059,26 @@ export async function runCycle(
       snapshot: initialSnapshot,
       valuation: initialValuation,
     });
+    const oldestActivityAt = Math.min(
+      ...initialSnapshot.recentActivities.map((activity) =>
+        activity.kind === "RESOLUTION"
+          ? activity.resolvedAt.getTime()
+          : activity.createdAt.getTime(),
+      ),
+    );
+    // Earlier resting orders may have filled after their cycle ended; each is
+    // looked up once, and a failed lookup is retried by a later cycle.
+    const restingOrderOutcomes =
+      dependencies.writeReports === false || !Number.isFinite(oldestActivityAt)
+        ? []
+        : await lookUpRestingOrders({
+            rootDirectory: dependencies.config.reporting.directory,
+            exchangeId: dependencies.exchange.id,
+            accountScope,
+            exchange: dependencies.exchange,
+            since: new Date(oldestActivityAt),
+            observedAt: initialSnapshot.observedAt,
+          }).catch(() => []);
 
     const discoveryLogger = stageLogger(
       dependencies.logger,
@@ -1450,6 +1471,7 @@ export async function runCycle(
               rootDirectory: dependencies.config.reporting.directory,
               exchangeId: dependencies.exchange.id,
               accountScope,
+              restingOrderOutcomes,
             }),
           );
     const contextInput: BuildAgentContextInput = {
@@ -2887,6 +2909,7 @@ export async function runCycle(
         : { targetReconciliation: targetPlan.reconciliation }),
       validation,
       execution,
+      restingOrderOutcomes,
       warnings,
       ...(safetyStop ? { statusOverride: "SAFETY_STOP" } : {}),
     });

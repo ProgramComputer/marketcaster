@@ -656,6 +656,7 @@ const CommonOrderShape = {
   insertTime: DateTimeSchema.optional(),
   createTime: DateTimeSchema.optional(),
   updateTime: DateTimeSchema.optional(),
+  lastTransactTime: DateTimeSchema.optional(),
   commissionNotionalTotalCollected: AmountSchema.optional(),
 } as const;
 
@@ -781,6 +782,7 @@ export const ExecutionSchema = z
     type: NonEmptyStringSchema,
     text: z.string().optional(),
     orderRejectReason: z.string().optional(),
+    tradeId: NonEmptyStringSchema.optional(),
     commissionNotionalCollected: AmountSchema.optional(),
   })
   .loose();

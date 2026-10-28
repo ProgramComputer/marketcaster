@@ -35,6 +35,8 @@ export interface ExchangeOrder {
   readonly state: OrderState;
   readonly createdAt?: Date;
   readonly updatedAt?: Date;
+  /** The exchange's time of the order's latest fill or state change. */
+  readonly lastTransactAt?: Date;
 }
 
 export interface ImmediateOrder {
