@@ -1112,9 +1112,10 @@ export async function runCycle(
                     orderBy: ["id"],
                     orderDirection: "asc" as const,
                   },
-                  // The ID tie-breaker keeps equal volumes in one order.
+                  // Volume alone: with a second `id` key the exchange returns
+                  // plain newest-first order.
                   rankingOrder: {
-                    orderBy: ["volume", "id"],
+                    orderBy: ["volume"],
                     orderDirection: "desc" as const,
                   },
                 }
