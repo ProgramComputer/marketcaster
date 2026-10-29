@@ -11,6 +11,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "cycle": "node dist/src/index.js",
+    "reconcile": "node dist/src/reconcile.js",
     "dev": "tsx src/index.ts",
     "experiment:market-selection": "node dist/src/experiments/market-selection.js",
     "format": "prettier --write .",

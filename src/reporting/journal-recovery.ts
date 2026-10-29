@@ -59,6 +59,16 @@ const ACTIVE_ORDER_STATES = new Set([
   "PARTIALLY_FILLED",
 ]);
 const MAXIMUM_MANAGED_RESTING_LIFETIME_MILLISECONDS = 15 * 60_000;
+const ORDER_RESOLUTION_KIND_PREFIX = "order-resolution.";
+
+/** Artifact kind of a later journal's proof of a prior order attempt's outcome. */
+export function orderResolutionKind(
+  runId: string,
+  cycleId: string,
+  attemptId: string,
+): string {
+  return `${ORDER_RESOLUTION_KIND_PREFIX}${runId}.${cycleId}.${attemptId}`;
+}
 
 export type JournalRecoveryIssueReason =
   | "JOURNAL_UNREADABLE"
@@ -81,6 +91,7 @@ export interface JournalRecoveryIssue {
   readonly intentPath?: string;
   readonly submissionPath?: string;
   readonly reconciliationPath?: string;
+  readonly resolutionPath?: string;
   readonly message: string;
 }
 
@@ -94,6 +105,7 @@ export interface JournalRecoveryReference {
   readonly intentPath: string;
   readonly submissionPath?: string;
   readonly reconciliationPath?: string;
+  readonly resolutionPath?: string;
 }
 
 export interface JournalRecoveryInspection {
@@ -150,6 +162,17 @@ interface OrderArtifactDiscovery {
   readonly attempts: ReadonlyMap<string, OrderArtifactPaths>;
   readonly issues: readonly JournalRecoveryIssue[];
   readonly hasOrderArtifacts: boolean;
+}
+
+interface OrderResolution {
+  readonly path: string;
+  readonly envelope: RunArtifactEnvelope;
+  readonly manifest: RunJournalManifest;
+}
+
+interface ScannedJournal {
+  readonly manifest: RunJournalManifest;
+  readonly journalDirectory: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -453,7 +476,11 @@ function issue(
   paths: Partial<
     Pick<
       JournalRecoveryIssue,
-      "attemptId" | "intentPath" | "submissionPath" | "reconciliationPath"
+      | "attemptId"
+      | "intentPath"
+      | "submissionPath"
+      | "reconciliationPath"
+      | "resolutionPath"
     >
   > = {},
 ): JournalRecoveryIssue {
@@ -620,6 +647,83 @@ async function readOrderArtifact(
   return value as unknown as RunArtifactEnvelope;
 }
 
+function attemptKey(runId: string, cycleId: string, attemptId: string): string {
+  return `${runId}/${cycleId}/${attemptId}`;
+}
+
+async function discoverOrderResolutions(
+  journals: readonly ScannedJournal[],
+): Promise<{
+  readonly resolutions: ReadonlyMap<string, readonly OrderResolution[]>;
+  readonly issues: readonly JournalRecoveryIssue[];
+}> {
+  const resolutions = new Map<string, OrderResolution[]>();
+  const issues: JournalRecoveryIssue[] = [];
+  for (const { manifest, journalDirectory } of journals) {
+    for (const [kind, artifactPath] of Object.entries(manifest.artifacts)) {
+      if (!kind.startsWith(ORDER_RESOLUTION_KIND_PREFIX)) continue;
+      const invalid = (message: string): void => {
+        issues.push(
+          issue(
+            "ORDER_ARTIFACT_INVALID",
+            manifest.runId,
+            manifest.cycleId,
+            journalDirectory,
+            message,
+          ),
+        );
+      };
+      const path = resolve(journalDirectory, artifactPath);
+      if (!withinDirectory(journalDirectory, path)) {
+        invalid("Order resolution path escapes its journal directory");
+        continue;
+      }
+      let value: unknown;
+      try {
+        value = await readJson(path);
+      } catch {
+        invalid("Order resolution is missing or unreadable");
+        continue;
+      }
+      if (
+        !isRecord(value) ||
+        value.schemaVersion !== 1 ||
+        value.runId !== manifest.runId ||
+        value.cycleId !== manifest.cycleId ||
+        value.accountScope !== manifest.accountScope ||
+        value.kind !== kind ||
+        !isTimestamp(value.recordedAt) ||
+        !isRecord(value.data) ||
+        !isRecord(value.data.target)
+      ) {
+        invalid("Order resolution has an invalid identity");
+        continue;
+      }
+      const { runId, cycleId, attemptId } = value.data.target;
+      if (
+        typeof runId !== "string" ||
+        typeof cycleId !== "string" ||
+        typeof attemptId !== "string" ||
+        runId === manifest.runId ||
+        orderResolutionKind(runId, cycleId, attemptId) !== kind
+      ) {
+        invalid("Order resolution names an invalid order attempt");
+        continue;
+      }
+      const key = attemptKey(runId, cycleId, attemptId);
+      resolutions.set(key, [
+        ...(resolutions.get(key) ?? []),
+        {
+          path,
+          envelope: value as unknown as RunArtifactEnvelope,
+          manifest,
+        },
+      ]);
+    }
+  }
+  return { resolutions, issues };
+}
+
 function submissionResult(
   envelope: RunArtifactEnvelope,
   correlation: OrderCorrelation,
@@ -678,6 +782,7 @@ function reconciliationResult(
 async function inspectLiveJournal(
   manifest: RunJournalManifest,
   journalDirectory: string,
+  resolutions: ReadonlyMap<string, readonly OrderResolution[]>,
 ): Promise<{
   readonly noIntent: boolean;
   readonly resolved: readonly JournalRecoveryReference[];
@@ -862,6 +967,47 @@ async function inspectLiveJournal(
       }
     }
 
+    let resolutionPath: string | undefined;
+    if (durableResult !== "TERMINAL") {
+      const candidates =
+        resolutions.get(
+          attemptKey(manifest.runId, manifest.cycleId, attemptId),
+        ) ?? [];
+      const resolution = candidates[0];
+      if (resolution !== undefined) {
+        const resolutionCorrelation = orderCorrelation(
+          resolution.envelope,
+          manifest,
+        );
+        const result = isRecord(resolution.envelope.data)
+          ? resolution.envelope.data.result
+          : undefined;
+        if (
+          candidates.length > 1 ||
+          resolution.manifest.accountScope !== manifest.accountScope ||
+          resolution.manifest.exchangeId !== manifest.exchangeId ||
+          resolutionCorrelation === undefined ||
+          !sameOrderCorrelation(intentCorrelation, resolutionCorrelation) ||
+          (isRecord(result) && result.status === "WORKING") ||
+          inspectDurableResult(result, intentCorrelation, false) !== "TERMINAL"
+        ) {
+          issues.push(
+            issue(
+              "ORDER_ARTIFACT_INVALID",
+              manifest.runId,
+              manifest.cycleId,
+              journalDirectory,
+              `Order ${attemptId} resolution does not prove a terminal outcome of its durable intent`,
+              { ...referencePaths, resolutionPath: resolution.path },
+            ),
+          );
+          continue;
+        }
+        durableResult = "TERMINAL";
+        resolutionPath = resolution.path;
+      }
+    }
+
     if (durableResult !== "TERMINAL") {
       issues.push(
         issue(
@@ -889,6 +1035,7 @@ async function inspectLiveJournal(
       ...(paths.reconciliationPath === undefined
         ? {}
         : { reconciliationPath: paths.reconciliationPath }),
+      ...(resolutionPath === undefined ? {} : { resolutionPath }),
     });
   }
   if (manifest.stage === "AMBIGUOUS" && intentCount === 0) {
@@ -915,6 +1062,7 @@ export async function inspectLiveJournalRecovery(
   const runsDirectory = resolve(rootDirectory, "runs");
   const issues: JournalRecoveryIssue[] = [];
   const resolvedAttempts: JournalRecoveryReference[] = [];
+  const journals: ScannedJournal[] = [];
   let scannedJournalCount = 0;
   let liveJournalCount = 0;
   let safeNoIntentJournalCount = 0;
@@ -996,33 +1144,44 @@ export async function inspectLiveJournalRecovery(
       ) {
         continue;
       }
-      if (manifest.mode === "observe") {
-        const discovery = await discoverOrderArtifacts(
-          manifest,
-          journalDirectory,
-        );
-        issues.push(...discovery.issues);
-        if (discovery.hasOrderArtifacts) {
-          issues.push(
-            issue(
-              "OBSERVE_ORDER_ARTIFACT",
-              manifest.runId,
-              manifest.cycleId,
-              journalDirectory,
-              "An observe-only journal contains an order artifact, violating the non-trading invariant",
-            ),
-          );
-        }
-        continue;
-      }
-      liveJournalCount += 1;
-      const inspection = await inspectLiveJournal(manifest, journalDirectory);
-      if (inspection.noIntent && inspection.issues.length === 0) {
-        safeNoIntentJournalCount += 1;
-      }
-      resolvedAttempts.push(...inspection.resolved);
-      issues.push(...inspection.issues);
+      journals.push({ manifest, journalDirectory });
     }
+  }
+
+  // A later journal may hold the proof of an earlier attempt's outcome.
+  const resolutionDiscovery = await discoverOrderResolutions(journals);
+  issues.push(...resolutionDiscovery.issues);
+  for (const { manifest, journalDirectory } of journals) {
+    if (manifest.mode === "observe") {
+      const discovery = await discoverOrderArtifacts(
+        manifest,
+        journalDirectory,
+      );
+      issues.push(...discovery.issues);
+      if (discovery.hasOrderArtifacts) {
+        issues.push(
+          issue(
+            "OBSERVE_ORDER_ARTIFACT",
+            manifest.runId,
+            manifest.cycleId,
+            journalDirectory,
+            "An observe-only journal contains an order artifact, violating the non-trading invariant",
+          ),
+        );
+      }
+      continue;
+    }
+    liveJournalCount += 1;
+    const inspection = await inspectLiveJournal(
+      manifest,
+      journalDirectory,
+      resolutionDiscovery.resolutions,
+    );
+    if (inspection.noIntent && inspection.issues.length === 0) {
+      safeNoIntentJournalCount += 1;
+    }
+    resolvedAttempts.push(...inspection.resolved);
+    issues.push(...inspection.issues);
   }
   return {
     scannedJournalCount,

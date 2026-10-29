@@ -227,6 +227,12 @@ Safety mechanisms remain part of the application:
   profiles.
 - Live cycles use a per-exchange lock and inspect durable journals before new
   account or order work.
+- `npm run reconcile` reads the account, without order methods, to prove the
+  outcome of an immediate-or-cancel order whose response was lost: no open
+  order, the account's taker trades in the order's window within its limit,
+  and a position change equal to their total. It records the proof in a new
+  observe-only journal, which the journal check accepts for that exact order.
+  Anything else leaves the order unresolved.
 
 The checked-in values in `config/default.json` are conservative reference
 values. Review them and complete observe-mode validation before enabling live
