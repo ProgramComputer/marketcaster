@@ -782,7 +782,7 @@ export const ExecutionSchema = z
     type: NonEmptyStringSchema,
     text: z.string().optional(),
     orderRejectReason: z.string().optional(),
-    tradeId: NonEmptyStringSchema.optional(),
+    tradeId: OptionalNonEmptyStringSchema,
     commissionNotionalCollected: AmountSchema.optional(),
   })
   .loose();
