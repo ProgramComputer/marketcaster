@@ -135,7 +135,7 @@ export type TerminalDecisionReview =
     };
 
 export const MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS = 8;
-export const MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS = 3;
+export const MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS = 4;
 /**
  * Malformed submit_trade_plan calls are never fatal by count. The first gets a
  * forced correction turn that uses no round; later ones are ordinary tool
