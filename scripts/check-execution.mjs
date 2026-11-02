@@ -891,6 +891,8 @@ await (async () => {
   const { executeValidatedOrders } =
     await import("../src/execution/executor.ts");
   const { buildCycleReport } = await import("../src/reporting/build-report.ts");
+  const { ManagedBuyBatch } =
+    await import("../src/execution/managed-buy-batch.ts");
   // Synthetic fixtures only. No real adapter, credentials, files, or network.
   globalThis.fetch = () => {
     throw new Error("Network is forbidden in this test");
@@ -962,12 +964,32 @@ await (async () => {
     };
   }
 
+  function sellCandidate(slug) {
+    const entry = candidate(slug, "YES", false);
+    return {
+      ...entry,
+      proposal: {
+        ...entry.proposal,
+        action: "SELL",
+        minimumExitPrice: D("0.39"),
+      },
+      order: { ...entry.order, action: "SELL", canonicalLimitPrice: D("0.39") },
+    };
+  }
+
   async function scenario(options = {}) {
-    const candidates = options.candidates ?? [
-      candidate("synthetic-a"),
-      candidate("synthetic-b", "NO"),
-      candidate("synthetic-c"),
-    ];
+    const candidates = (
+      options.candidates ?? [
+        candidate("synthetic-a"),
+        candidate("synthetic-b", "NO"),
+        candidate("synthetic-c"),
+      ]
+    ).map((entry) => {
+      if (options.executionPolicy !== "IOC") return entry;
+      const order = { ...entry.order, executionPolicy: "IOC" };
+      delete order.restUntil;
+      return { ...entry, order };
+    });
     const sent = [];
     const orders = new Map();
     const reads = new Map();
@@ -977,6 +999,7 @@ await (async () => {
     let accountReads = 0;
     let failedAccountReads = 0;
     const placedAtRead = new Map();
+    const diagnostics = [];
     function changeB(quantity, state = "PARTIALLY_FILLED") {
       const b = orders.get("order-2");
       orders.set(b.id, {
@@ -995,7 +1018,9 @@ await (async () => {
       let buyingPower = start;
       let marginRequirement = D(0);
       let locked = D(0);
-      const positions = [];
+      const positions = (options.initialPositions ?? []).map((position) => ({
+        ...position,
+      }));
       for (const order of orders.values()) {
         const principal = order.filledQuantity.mul(
           order.id === "order-2" && options.roundedAverage
@@ -1003,6 +1028,27 @@ await (async () => {
             : order.averageFillPrice,
         );
         const cost = principal.plus(order.fees);
+        if (order.action === "SELL") {
+          const index = positions.findIndex(
+            (position) =>
+              position.marketSlug === order.marketSlug &&
+              position.side === order.side,
+          );
+          assert.ok(index >= 0, "Synthetic SELL requires a held position");
+          const old = positions[index];
+          const remaining = old.quantity.minus(order.filledQuantity);
+          if (remaining.isZero()) positions.splice(index, 1);
+          else
+            positions[index] = {
+              ...old,
+              quantity: remaining,
+              availableQuantity: remaining,
+              costBasis: old.costBasis.mul(remaining).div(old.quantity),
+            };
+          currentBalance = currentBalance.plus(principal).minus(order.fees);
+          buyingPower = buyingPower.plus(principal).minus(order.fees);
+          continue;
+        }
         // The venue debits the fee from cash at once, but it may reach the
         // position's cost only after the first read that follows the fill.
         const feeInCost =
@@ -1015,7 +1061,14 @@ await (async () => {
           .plus(order.side === "NO" ? order.filledQuantity : 0);
         if (order.side === "NO")
           marginRequirement = marginRequirement.plus(order.filledQuantity);
-        if (order.filledQuantity.gt(0))
+        if (
+          order.filledQuantity.gt(0) &&
+          !(
+            options.emptyImmediatePositions &&
+            accountReads === placedAtRead.get(order.id) + 1
+          ) &&
+          !options.missingPosition
+        )
           positions.push({
             marketId: order.marketId,
             marketSlug: order.marketSlug,
@@ -1027,6 +1080,9 @@ await (async () => {
               : principal,
             realizedPnl: D(0),
             expired: false,
+            ...(options.diagnosticBadDate
+              ? { updatedAt: new Date("invalid") }
+              : {}),
           });
         if (options.exchangeLocks && active(order))
           locked = locked
@@ -1036,10 +1092,35 @@ await (async () => {
       const openOrders = [...orders.values()].filter(active);
       if (sent.length >= 2 && options.unknownOrder)
         openOrders.push({ ...orders.get("order-2"), id: "external-order" });
-      if (sent.length >= 2 && options.externalCash)
+      if (
+        sent.length >= (options.externalCashAfter ?? 2) &&
+        options.externalCash
+      )
         currentBalance = currentBalance.minus(1);
+      if (options.precheckCapital && accountReads > 1) {
+        currentBalance = currentBalance.minus(1);
+        buyingPower = buyingPower.minus(1);
+      }
+      if (sent.length >= 2 && options.externalBuyingPower)
+        buyingPower = buyingPower.plus(1);
+      if (sent.length >= 2 && options.externalMargin)
+        marginRequirement = marginRequirement.plus(1);
       if (sent.length >= 2 && options.externalPosition)
         positions.push({ ...positions[0], marketSlug: "external-market" });
+      if (sent.length >= 2 && positions[0]) {
+        if (options.externalQuantity)
+          positions[0] = {
+            ...positions[0],
+            quantity: positions[0].quantity.plus(1),
+          };
+        if (options.externalAvailable)
+          positions[0] = { ...positions[0], availableQuantity: D(0) };
+        if (options.externalMarketId)
+          positions[0] = {
+            ...positions[0],
+            marketId: { exchange: "polymarket-us", value: "external-id" },
+          };
+      }
       return {
         observedAt: now,
         currentBalance,
@@ -1111,11 +1192,12 @@ await (async () => {
       async placeImmediateOrder(order) {
         sent.push(order.marketSlug);
         const working =
-          (sent.length === 1 && options.firstWorking) ||
-          (sent.length === 2 &&
-            options.bStatus !== "FILLED" &&
-            options.bStatus !== "PARTIAL") ||
-          (sent.length === 3 && options.cWorking);
+          order.executionPolicy !== "IOC" &&
+          ((sent.length === 1 && options.firstWorking) ||
+            (sent.length === 2 &&
+              options.bStatus !== "FILLED" &&
+              options.bStatus !== "PARTIAL") ||
+            (sent.length === 3 && options.cWorking));
         const filled = working
           ? D(options.bFilled ?? 5)
           : options.bStatus === "PARTIAL" && sent.length === 2
@@ -1176,6 +1258,20 @@ await (async () => {
           };
         if (id === "order-2" && count >= 2 && options.missingFees)
           return { ...orders.get(id), fees: undefined };
+        if (id === "order-2" && options.terminalChanged)
+          return {
+            ...orders.get(id),
+            filledQuantity: D(9),
+            remainingQuantity: D(0),
+            state: "CANCELED",
+          };
+        if (id === "order-2" && options.terminalWorking)
+          return {
+            ...orders.get(id),
+            filledQuantity: D(9),
+            remainingQuantity: D(1),
+            state: "PARTIALLY_FILLED",
+          };
         if (
           id === "order-2" &&
           count >= 2 &&
@@ -1205,9 +1301,21 @@ await (async () => {
       riskEquity: D(100),
       validated: candidates,
       now: () => now,
-      managedRestingBuyOrders: { enabled: true, maximumLifetimeMinutes: 5 },
+      managedRestingBuyOrders: {
+        enabled: options.managedEnabled ?? options.executionPolicy !== "IOC",
+        maximumLifetimeMinutes: 5,
+      },
+      onDiagnostic: async (event) => {
+        diagnostics.push(event);
+        if (options.observerThrows)
+          throw new Error("Synthetic observer unavailable");
+        if (options.observerNeverSettles)
+          return new Promise(() => {
+            // Deliberately unresolved review sink; it must not stall execution.
+          });
+      },
       policy: {
-        allowPositionReductions: false,
+        allowPositionReductions: options.allowPositionReductions ?? false,
         maximumCycleSpendFraction: D(options.cycleFraction ?? "0.5"),
         duplicateWindowMinutes: 1,
         maximumExecutionSpread: D("0.1"),
@@ -1222,6 +1330,7 @@ await (async () => {
       canceled,
       candidates,
       snapshot,
+      diagnostics,
       after: account(),
     };
   }
@@ -1358,6 +1467,321 @@ await (async () => {
   assert.equal(unexplained.sent.length, 1, "Cost beyond fill and fee stops");
   assert.equal(unexplained.execution.stoppedForAmbiguity, true);
   assert.equal((await scenario({ mode: "observe" })).sent.length, 0);
+
+  // Terminal IOC fills use exact-order accounting before independent BUYs.
+  // The immediate post-fill read may omit a position or its paid fee.
+  const changedCapital = await scenario({
+    executionPolicy: "IOC",
+    precheckCapital: true,
+  });
+  assert.equal(changedCapital.sent.length, 0);
+  const skippedPrecheck = changedCapital.diagnostics.find(
+    (event) => event.kind === "PORTFOLIO_PRECHECK",
+  );
+  assert.equal(skippedPrecheck.verdict, "SKIPPED");
+  assert.match(skippedPrecheck.reason, /capital changed/u);
+  assert.deepEqual(
+    skippedPrecheck.data.differences.find(
+      (item) => item.field === "currentBalance",
+    ),
+    {
+      field: "currentBalance",
+      expected: "100",
+      observed: "99",
+    },
+  );
+  for (const feeInCost of ["lagged", "posted"])
+    for (const bStatus of ["FILLED", "PARTIAL"]) {
+      const run = await scenario({
+        executionPolicy: "IOC",
+        feeInCost,
+        bStatus,
+        emptyImmediatePositions: true,
+      });
+      assert.equal(run.sent.length, 3, `IOC ${feeInCost}, ${bStatus}`);
+      assert.equal(run.execution.stoppedForAmbiguity, false);
+      assert.equal(run.canceled, 0);
+      assert.ok(
+        run.diagnostics.some(
+          (event) =>
+            event.kind === "POST_FILL_ACCOUNT" &&
+            event.data.account.positions.length === 0,
+        ),
+      );
+      assert.ok(
+        run.diagnostics.some(
+          (event) =>
+            event.kind === "BUY_RECONCILIATION" &&
+            event.verdict === "PASSED" &&
+            event.data.controls.terminalIocUnchanged,
+        ),
+      );
+      assert.doesNotThrow(() => JSON.stringify(run.diagnostics));
+    }
+  const iocRounding = await scenario({
+    executionPolicy: "IOC",
+    feeInCost: "lagged",
+    costExtra: "0.0003",
+    bStatus: "FILLED",
+  });
+  assert.equal(
+    iocRounding.sent.length,
+    3,
+    "IOC fee posting permits bounded venue rounding",
+  );
+  const noFirst = await scenario({
+    executionPolicy: "IOC",
+    bStatus: "FILLED",
+    emptyImmediatePositions: true,
+    feeInCost: "lagged",
+    candidates: [
+      candidate("synthetic-no-first", "NO"),
+      candidate("synthetic-next"),
+    ],
+  });
+  assert.equal(
+    noFirst.sent.length,
+    2,
+    "IOC NO fill accounts for collateral without adding spendable proceeds",
+  );
+  const noProceeds = await scenario({
+    executionPolicy: "IOC",
+    start: 8,
+    candidates: [
+      candidate("synthetic-no-budget", "NO"),
+      candidate("synthetic-budget-next"),
+    ],
+  });
+  assert.equal(
+    noProceeds.sent.length,
+    1,
+    "IOC NO collateral proceeds cannot finance another BUY",
+  );
+  const partialReserve = await scenario({
+    executionPolicy: "IOC",
+    start: "11.4",
+    bStatus: "PARTIAL",
+  });
+  assert.equal(
+    partialReserve.sent.length,
+    3,
+    "Only a verified terminal IOC fill releases its unfilled reservation",
+  );
+  assert.equal(
+    (
+      await scenario({
+        executionPolicy: "IOC",
+        bStatus: "FILLED",
+        feeInCost: "lagged",
+        observerThrows: true,
+      })
+    ).sent.length,
+    3,
+    "An optional diagnostic observer cannot alter execution",
+  );
+  let observerTimeout;
+  try {
+    const neverSettling = await Promise.race([
+      scenario({
+        executionPolicy: "IOC",
+        bStatus: "FILLED",
+        observerNeverSettles: true,
+      }),
+      new Promise((_, reject) => {
+        observerTimeout = globalThis.setTimeout(
+          () => reject(new Error("Diagnostic observer blocked execution")),
+          2000,
+        );
+      }),
+    ]);
+    assert.equal(neverSettling.sent.length, 3);
+  } finally {
+    globalThis.clearTimeout(observerTimeout);
+  }
+  assert.equal(
+    (
+      await scenario({
+        executionPolicy: "IOC",
+        bStatus: "FILLED",
+        diagnosticBadDate: true,
+      })
+    ).sent.length,
+    3,
+    "Diagnostic serialization failure cannot alter execution",
+  );
+
+  const held = {
+    marketId: { exchange: "polymarket-us", value: "synthetic-held" },
+    marketSlug: "synthetic-held",
+    side: "YES",
+    quantity: D(10),
+    availableQuantity: D(10),
+    costBasis: D(4),
+    realizedPnl: D(0),
+    expired: false,
+  };
+  const saleOptions = {
+    executionPolicy: "IOC",
+    initialPositions: [held],
+    allowPositionReductions: true,
+    feeInCost: "posted",
+    candidates: [candidate("synthetic-buy"), sellCandidate("synthetic-held")],
+  };
+  const sale = await scenario(saleOptions);
+  assert.equal(
+    sale.sent.length,
+    2,
+    "A verified terminal IOC BUY does not disable an unrelated SELL",
+  );
+  assert.equal(sale.execution.attempts[1].result.status, "FILLED");
+  assert.ok(
+    sale.diagnostics.find(
+      (event) =>
+        event.kind === "BUY_RECONCILIATION" && event.verdict === "PASSED",
+    ),
+  );
+  const changedBeforeSale = await scenario({
+    ...saleOptions,
+    externalCash: true,
+    externalCashAfter: 1,
+  });
+  assert.equal(
+    changedBeforeSale.sent.length,
+    1,
+    "Unexplained account changes block a SELL before IOC batch retirement",
+  );
+  assert.equal(changedBeforeSale.execution.stoppedForAmbiguity, true);
+  const managedSale = await scenario({
+    ...saleOptions,
+    executionPolicy: "GTD",
+  });
+  assert.equal(
+    managedSale.sent.length,
+    1,
+    "Managed GTD continuation retains its BUY-only restriction",
+  );
+  assert.match(
+    managedSale.execution.attempts[1].skippedReason,
+    /independent market/u,
+  );
+  const repeatedIoc = await scenario({
+    executionPolicy: "IOC",
+    bStatus: "FILLED",
+    feeInCost: "posted",
+    candidates: [
+      candidate("synthetic-repeat"),
+      candidate("synthetic-repeat"),
+      candidate("synthetic-independent"),
+    ],
+  });
+  assert.deepEqual(repeatedIoc.sent, [
+    "synthetic-repeat",
+    "synthetic-independent",
+  ]);
+  assert.match(
+    repeatedIoc.execution.attempts[1].skippedReason,
+    /Fresh position changed/u,
+  );
+
+  const iocCandidate = {
+    ...candidate("synthetic-ioc-registration").order,
+    executionPolicy: "IOC",
+  };
+  delete iocCandidate.restUntil;
+  const gtdCandidate = candidate("synthetic-gtd-registration").order;
+  const registrationResult = {
+    status: "FILLED",
+    orderId: "synthetic-registration",
+    filledQuantity: D(10),
+    remainingQuantity: D(0),
+    averageFillPrice: D("0.4"),
+    fees: D("0.1"),
+    finalState: "FILLED",
+  };
+  for (const [first, next] of [
+    [iocCandidate, gtdCandidate],
+    [gtdCandidate, iocCandidate],
+  ]) {
+    const batch = new ManagedBuyBatch(complete.snapshot);
+    batch.register(
+      first,
+      "synthetic-first",
+      D("4.2"),
+      D("0.01"),
+      registrationResult,
+    );
+    assert.throws(
+      () =>
+        batch.register(
+          next,
+          "synthetic-next",
+          D("4.2"),
+          D("0.01"),
+          registrationResult,
+        ),
+      /cannot mix/u,
+    );
+  }
+  assert.equal(
+    (await scenario({ executionPolicy: "IOC", managedEnabled: true })).sent
+      .length,
+    0,
+    "Enabled managed BUY policy still requires GTD",
+  );
+  assert.equal(
+    (await scenario({ managedEnabled: false })).sent.length,
+    0,
+    "Disabled managed BUY policy still rejects GTD",
+  );
+  for (const option of [
+    "unknownOrder",
+    "externalCash",
+    "externalPosition",
+    "externalQuantity",
+    "externalBuyingPower",
+    "externalMargin",
+    "externalAvailable",
+    "externalMarketId",
+    "mismatch",
+    "missingFees",
+    "terminalChanged",
+    "terminalWorking",
+  ]) {
+    const run = await scenario({
+      executionPolicy: "IOC",
+      bStatus: "FILLED",
+      [option]: true,
+    });
+    assert.equal(
+      run.sent.length,
+      2,
+      `IOC ${option}: fail closed before another BUY`,
+    );
+    assert.equal(run.execution.stoppedForAmbiguity, true, option);
+    assert.ok(
+      run.diagnostics.some(
+        (event) =>
+          event.kind === "BUY_RECONCILIATION" && event.verdict === "FAILED",
+      ),
+      `IOC ${option}: failure diagnostics retained`,
+    );
+  }
+  for (const options of [
+    { missingPosition: true },
+    { feeInCost: "posted", costExtra: "0.03" },
+  ]) {
+    const run = await scenario({
+      executionPolicy: "IOC",
+      bStatus: "FILLED",
+      ...options,
+    });
+    assert.equal(
+      run.sent.length,
+      1,
+      "An unexplained IOC position cannot rebase the account",
+    );
+    assert.equal(run.execution.stoppedForAmbiguity, true);
+  }
 
   const reserved = await scenario({ start: 13, bFilled: 1 });
   assert.equal(

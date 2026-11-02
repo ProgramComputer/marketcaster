@@ -2,7 +2,10 @@ import { readFile, readdir } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { Decimal } from "decimal.js";
 import type { ExchangeId } from "../domain/primitives.js";
-import { assertSafeMemoryScope } from "../exchanges/memory-scope.js";
+import {
+  assertSafeMemoryScope,
+  UNSCOPED_MEMORY_SCOPE,
+} from "../exchanges/memory-scope.js";
 import {
   type RunArtifactEnvelope,
   type RunJournalManifest,
@@ -123,6 +126,28 @@ export interface InspectLiveJournalRecoveryInput {
     readonly runId: string;
     readonly cycleId: string;
   };
+}
+
+/** Read-only projection produced only after the recovery verifier accepts a proof. */
+export interface VerifiedOrderResolution extends JournalRecoveryReference {
+  readonly resolutionPath: string;
+  readonly exchangeId: ExchangeId;
+  readonly accountScope: string;
+  readonly marketSlug: string;
+  readonly side: "YES" | "NO";
+  readonly action: "BUY" | "SELL";
+  /** Original submission time; never the later resolution journal's time. */
+  readonly submittedAt: string;
+  readonly filledQuantity: Decimal;
+  readonly averageFillPrice?: Decimal;
+  readonly fees: Decimal;
+  readonly intentId?: string;
+  readonly orderId?: string;
+  readonly tradeIds?: readonly string[];
+  /** Earliest original fill time, when the proof's trade evidence covers the result. */
+  readonly firstFilledAt?: string;
+  readonly estimatedProbability?: Decimal;
+  readonly authorizationProbability?: Decimal;
 }
 
 export class UnresolvedLiveJournalError extends Error {
@@ -779,10 +804,176 @@ function reconciliationResult(
   return inspectDurableResult(envelope.data.finalResult, correlation, false);
 }
 
+function nonemptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function probability(value: unknown): Decimal | undefined {
+  const parsed = finiteDecimal(value);
+  return parsed?.gte(0) === true && parsed.lte(1) ? parsed : undefined;
+}
+
+/** Trade evidence supplies identity/time only when it covers the terminal result. */
+function resolutionTrades(
+  data: Record<string, unknown>,
+  correlation: OrderCorrelation,
+  filledQuantity: Decimal,
+  averageFillPrice: Decimal | undefined,
+  orderId: string | undefined,
+):
+  | { readonly tradeIds: readonly string[]; readonly firstFilledAt: string }
+  | undefined {
+  const evidence = data.evidence;
+  if (
+    !filledQuantity.gt(0) ||
+    averageFillPrice === undefined ||
+    !isRecord(evidence) ||
+    !isRecord(evidence.window) ||
+    evidence.window.from !== correlation.submittedAt ||
+    !isTimestamp(evidence.window.to) ||
+    !Array.isArray(evidence.trades) ||
+    evidence.trades.length === 0 ||
+    evidence.trades.length > 1_000
+  )
+    return undefined;
+  const ids = new Set<string>();
+  let firstFilledAt: string | undefined;
+  let firstFilledAtMilliseconds = Infinity;
+  const submittedAtMilliseconds = Date.parse(correlation.submittedAt);
+  const windowEndMilliseconds = Date.parse(evidence.window.to);
+  let quantity = new Decimal(0);
+  let yesNotional = new Decimal(0);
+  for (const trade of evidence.trades as unknown[]) {
+    if (!isRecord(trade)) return undefined;
+    const tradeId = nonemptyString(trade.tradeId);
+    const size = finiteDecimal(trade.quantity);
+    const price = finiteDecimal(trade.price);
+    const createdAtMilliseconds =
+      typeof trade.createdAt === "string" ? Date.parse(trade.createdAt) : NaN;
+    if (
+      tradeId === undefined ||
+      ids.has(tradeId) ||
+      size?.gt(0) !== true ||
+      price?.gt(0) !== true ||
+      !price.lt(1) ||
+      !isTimestamp(trade.createdAt) ||
+      createdAtMilliseconds < submittedAtMilliseconds ||
+      createdAtMilliseconds > windowEndMilliseconds ||
+      (trade.marketSlug !== undefined &&
+        trade.marketSlug !== correlation.marketSlug) ||
+      (trade.side !== undefined && trade.side !== correlation.side) ||
+      (trade.action !== undefined && trade.action !== correlation.action) ||
+      (trade.orderId !== undefined &&
+        (orderId === undefined || trade.orderId !== orderId)) ||
+      trade.state === "TRADE_STATE_BUSTED" ||
+      trade.aggressor === false
+    )
+      return undefined;
+    ids.add(tradeId);
+    quantity = quantity.plus(size);
+    yesNotional = yesNotional.plus(size.mul(price));
+    if (createdAtMilliseconds < firstFilledAtMilliseconds) {
+      firstFilledAt = trade.createdAt;
+      firstFilledAtMilliseconds = createdAtMilliseconds;
+    }
+  }
+  if (!quantity.eq(filledQuantity) || firstFilledAt === undefined)
+    return undefined;
+  const yesAverage = yesNotional.div(quantity);
+  const sideAverage =
+    correlation.side === "YES" ? yesAverage : new Decimal(1).minus(yesAverage);
+  if (!sideAverage.toDecimalPlaces(6).eq(averageFillPrice)) return undefined;
+  // These rows are an attestation inside the exact verified resolution, rather
+  // than an independent account snapshot. Any supplied result identity must agree.
+  if (isRecord(data.result) && Array.isArray(data.result.tradeIds)) {
+    const resultIds = new Set(data.result.tradeIds as unknown[]);
+    if (
+      resultIds.size !== ids.size ||
+      [...ids].some((id) => !resultIds.has(id))
+    )
+      return undefined;
+  }
+  return { tradeIds: [...ids], firstFilledAt };
+}
+
+function verifiedResolution(
+  reference: JournalRecoveryReference & { readonly resolutionPath: string },
+  manifest: RunJournalManifest,
+  intent: RunArtifactEnvelope,
+  correlation: OrderCorrelation,
+  resolution: OrderResolution,
+  knownOrderId: string | undefined,
+): VerifiedOrderResolution | undefined {
+  if (
+    manifest.accountScope === undefined ||
+    !isRecord(intent.data) ||
+    !isRecord(intent.data.validated) ||
+    !isRecord(resolution.envelope.data) ||
+    !isRecord(resolution.envelope.data.result)
+  )
+    return undefined;
+  const data = resolution.envelope.data;
+  const result = data.result as Record<string, unknown>;
+  const filledQuantity = finiteDecimal(result.filledQuantity);
+  const fees = finiteDecimal(result.fees);
+  if (filledQuantity === undefined || fees === undefined) return undefined;
+  const averageFillPrice = finiteDecimal(result.averageFillPrice);
+  const orderId = nonemptyString(result.orderId) ?? knownOrderId;
+  const trades = resolutionTrades(
+    data,
+    correlation,
+    filledQuantity,
+    averageFillPrice,
+    orderId,
+  );
+  const rawIds = result.tradeIds;
+  const resultIds =
+    Array.isArray(rawIds) &&
+    rawIds.length <= 1_000 &&
+    rawIds.every((id: unknown) => nonemptyString(id) !== undefined)
+      ? [...new Set(rawIds as string[])]
+      : undefined;
+  const tradeIds = trades?.tradeIds ?? resultIds;
+  const proposal = intent.data.validated.proposal;
+  const matchesProposal =
+    isRecord(proposal) &&
+    proposal.marketSlug === correlation.marketSlug &&
+    proposal.side === correlation.side &&
+    proposal.action === correlation.action;
+  const estimatedProbability = matchesProposal
+    ? probability(proposal.estimatedProbability)
+    : undefined;
+  const authorizationProbability = matchesProposal
+    ? probability(intent.data.validated.authorizationProbability)
+    : undefined;
+  const intentId = nonemptyString(intent.data.intentId);
+  return {
+    ...reference,
+    exchangeId: manifest.exchangeId,
+    accountScope: manifest.accountScope,
+    marketSlug: correlation.marketSlug,
+    side: correlation.side,
+    action: correlation.action,
+    submittedAt: correlation.submittedAt,
+    filledQuantity,
+    fees,
+    ...(averageFillPrice === undefined ? {} : { averageFillPrice }),
+    ...(intentId === undefined ? {} : { intentId }),
+    ...(orderId === undefined ? {} : { orderId }),
+    ...(tradeIds === undefined ? {} : { tradeIds }),
+    ...(trades === undefined ? {} : { firstFilledAt: trades.firstFilledAt }),
+    ...(estimatedProbability === undefined ? {} : { estimatedProbability }),
+    ...(authorizationProbability === undefined
+      ? {}
+      : { authorizationProbability }),
+  };
+}
+
 async function inspectLiveJournal(
   manifest: RunJournalManifest,
   journalDirectory: string,
   resolutions: ReadonlyMap<string, readonly OrderResolution[]>,
+  verifiedResolutions?: VerifiedOrderResolution[],
 ): Promise<{
   readonly noIntent: boolean;
   readonly resolved: readonly JournalRecoveryReference[];
@@ -858,6 +1049,7 @@ async function inspectLiveJournal(
     }
 
     let durableResult: DurableResult = "UNRESOLVED";
+    let knownOrderId: string | undefined;
     if (paths.submissionPath !== undefined) {
       const submission = await readOrderArtifact(
         paths.submissionPath,
@@ -896,6 +1088,13 @@ async function inspectLiveJournal(
         continue;
       }
       durableResult = submissionResult(submission, intentCorrelation);
+      if (isRecord(submission.data)) {
+        knownOrderId =
+          nonemptyString(submission.data.orderId) ??
+          (isRecord(submission.data.result)
+            ? nonemptyString(submission.data.result.orderId)
+            : undefined);
+      }
       if (durableResult === "INVALID") {
         issues.push(
           issue(
@@ -1005,6 +1204,32 @@ async function inspectLiveJournal(
         }
         durableResult = "TERMINAL";
         resolutionPath = resolution.path;
+        if (
+          verifiedResolutions !== undefined &&
+          !issues.some(
+            (item) =>
+              item.attemptId === undefined || item.attemptId === attemptId,
+          )
+        ) {
+          const projected = verifiedResolution(
+            {
+              runId: manifest.runId,
+              cycleId: manifest.cycleId,
+              stage: manifest.stage,
+              journalDirectory,
+              manifestPath: resolve(journalDirectory, "manifest.json"),
+              attemptId,
+              intentPath: paths.intentPath,
+              resolutionPath,
+            },
+            manifest,
+            intent,
+            intentCorrelation,
+            resolution,
+            knownOrderId,
+          );
+          if (projected !== undefined) verifiedResolutions.push(projected);
+        }
       }
     }
 
@@ -1052,8 +1277,10 @@ async function inspectLiveJournal(
   return { noIntent: intentCount === 0, resolved, issues };
 }
 
-export async function inspectLiveJournalRecovery(
+async function inspectJournalRecovery(
   input: InspectLiveJournalRecoveryInput,
+  verifiedResolutions?: VerifiedOrderResolution[],
+  accountScope?: string,
 ): Promise<JournalRecoveryInspection> {
   if (input.exchangeId !== undefined && !isKnownExchangeId(input.exchangeId)) {
     throw new TypeError("Unknown recovery exchange ID");
@@ -1139,8 +1366,9 @@ export async function inspectLiveJournalRecovery(
         continue;
       }
       if (
-        input.exchangeId !== undefined &&
-        manifest.exchangeId !== input.exchangeId
+        (input.exchangeId !== undefined &&
+          manifest.exchangeId !== input.exchangeId) ||
+        (accountScope !== undefined && manifest.accountScope !== accountScope)
       ) {
         continue;
       }
@@ -1176,6 +1404,7 @@ export async function inspectLiveJournalRecovery(
       manifest,
       journalDirectory,
       resolutionDiscovery.resolutions,
+      verifiedResolutions,
     );
     if (inspection.noIntent && inspection.issues.length === 0) {
       safeNoIntentJournalCount += 1;
@@ -1190,6 +1419,29 @@ export async function inspectLiveJournalRecovery(
     resolvedAttempts,
     issues,
   };
+}
+
+export async function inspectLiveJournalRecovery(
+  input: InspectLiveJournalRecoveryInput,
+): Promise<JournalRecoveryInspection> {
+  return inspectJournalRecovery(input);
+}
+
+/** Uses the recovery verifier without querying an account or changing any journal. */
+export async function readVerifiedOrderResolutions(
+  input: InspectLiveJournalRecoveryInput & {
+    readonly exchangeId: ExchangeId;
+    readonly accountScope: string;
+  },
+): Promise<{
+  readonly resolutions: readonly VerifiedOrderResolution[];
+  readonly issues: readonly JournalRecoveryIssue[];
+}> {
+  const scope = assertSafeMemoryScope(input.accountScope);
+  if (scope === UNSCOPED_MEMORY_SCOPE) return { resolutions: [], issues: [] };
+  const resolutions: VerifiedOrderResolution[] = [];
+  const inspection = await inspectJournalRecovery(input, resolutions, scope);
+  return { resolutions, issues: inspection.issues };
 }
 
 export async function assertNoUnresolvedLiveJournals(

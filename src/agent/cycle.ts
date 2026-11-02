@@ -46,6 +46,11 @@ import {
   type PortfolioValuation,
 } from "../portfolio/valuation.js";
 import { buildCycleReport } from "../reporting/build-report.js";
+import { writeJsonArtifact } from "../reporting/artifact.js";
+import {
+  createReviewDiagnostics,
+  deriveEvidenceReceipts,
+} from "../reporting/review-diagnostics.js";
 import { persistCrossCycleHistory } from "../reporting/cross-cycle-history.js";
 import {
   loadEntryFills,
@@ -182,6 +187,8 @@ export interface CycleDependencies {
   readonly cycleId?: string;
   readonly now?: () => Date;
   readonly writeReports?: boolean;
+  /** Independent review files only; never a decision or journal input. */
+  readonly reviewDiagnostics?: boolean;
   readonly journal?: RunJournal;
   readonly memory?: AgentMemory;
   readonly agentState?: AgentState;
@@ -809,6 +816,13 @@ export async function runCycle(
   const provenanceIdentity =
     dependencies.provenanceIdentity ??
     provenanceIdentityFromEnvironment(process.env);
+  const reviewDiagnostics =
+    dependencies.reviewDiagnostics === false ||
+    dependencies.writeReports === false
+      ? undefined
+      : createReviewDiagnostics({
+          secretValues: provenanceIdentity.secretValues,
+        });
   let journal =
     dependencies.writeReports === false ? undefined : dependencies.journal;
   const transcriptRounds: DecisionTranscriptRound[] = [];
@@ -1473,7 +1487,10 @@ export async function runCycle(
               exchangeId: dependencies.exchange.id,
               accountScope,
               restingOrderOutcomes,
+              onDiagnostic: (event) =>
+                reviewDiagnostics?.append("history-attribution", event),
             }),
+            (event) => reviewDiagnostics?.append("history-attribution", event),
           );
     const contextInput: BuildAgentContextInput = {
       ...(criticalLearningPolicy === undefined
@@ -2715,6 +2732,8 @@ export async function runCycle(
         }
         const execution = await executeValidatedOrders({
           intentIdPrefix: cycleId,
+          onDiagnostic: (event) =>
+            reviewDiagnostics?.append("execution-diagnostics", event),
           ...(executionHealth === undefined ? {} : { executionHealth }),
           exchange: dependencies.exchange,
           mode: dependencies.mode,
@@ -3016,6 +3035,37 @@ export async function runCycle(
           { error: safeErrorMessage(error) },
           "Could not release the live-cycle lock",
         );
+      }
+    }
+    // Independent byproducts: do not enqueue manifest changes or include these
+    // files in reports, advisory state, memory, or any model request. A failure
+    // here must preserve both the original result and mandatory journal state.
+    if (journal !== undefined && reviewDiagnostics !== undefined) {
+      const diagnosticDirectory = journal.runDirectory;
+      try {
+        for (const receipt of deriveEvidenceReceipts({
+          rounds: transcriptRounds,
+        })) {
+          reviewDiagnostics.append("evidence-receipts", receipt);
+        }
+        await reviewDiagnostics.flush((kind, data) =>
+          writeJsonArtifact(
+            diagnosticDirectory,
+            `${kind}.json`,
+            {
+              schemaVersion: 1,
+              runId,
+              cycleId,
+              accountScope,
+              recordedAt: safeTimestamp(now),
+              kind,
+              data,
+            },
+            { overwrite: false },
+          ),
+        );
+      } catch {
+        // Optional review cannot turn success into failure or mask an error.
       }
     }
   }

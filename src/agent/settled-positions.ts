@@ -18,6 +18,7 @@ import {
   readCrossCycleHistory,
   type CrossCycleHistoryEntry,
 } from "../reporting/cross-cycle-history.js";
+import { readVerifiedOrderResolutions } from "../reporting/journal-recovery.js";
 import type {
   CycleReport,
   RestingOrderOutcomeReport,
@@ -53,7 +54,7 @@ export interface EntryFill {
   readonly quantity: Decimal;
   readonly averagePrice: Decimal;
   readonly fees: Decimal;
-  /** Completion time of the cycle that placed the order. */
+  /** Original cycle completion, or a recovered fill/submission time. */
   readonly enteredAt: Date;
   readonly estimatedProbability?: Decimal;
   readonly authorizationProbability?: Decimal;
@@ -94,7 +95,7 @@ export interface SettledPosition {
 
 export interface SettledPositionEntry {
   readonly side: OutcomeSide;
-  /** Completion time of the cycle that placed the order. */
+  /** Original cycle completion, or a recovered fill/submission time. */
   readonly enteredAt: Date;
   /** Filled quantity, including fills a later lookup confirmed. */
   readonly quantity: Decimal;
@@ -124,6 +125,7 @@ const ExecutionSchema = z
     filledQuantity: DecimalInputSchema,
     averageFillPrice: DecimalInputSchema.optional(),
     fees: DecimalInputSchema,
+    intentId: z.string().min(1).optional(),
     orderId: z.string().min(1).optional(),
     tradeIds: z.array(z.string().min(1)).max(1_000).optional(),
     restUntil: z.iso.datetime({ offset: true }).optional(),
@@ -278,35 +280,174 @@ export interface LoadEntryFillsInput {
   readonly accountScope: string;
   /** Lookups made by the current cycle, which the history does not hold yet. */
   readonly restingOrderOutcomes?: readonly RestingOrderOutcomeReport[];
+  /** Review-only synchronous observer. Observer failures never change history. */
+  readonly onDiagnostic?: (event: EntryHistoryDiagnostic) => void;
+}
+
+export interface EntryHistoryDiagnostic {
+  readonly stage: "ENTRY_HISTORY" | "SETTLEMENT_ATTRIBUTION";
+  readonly reason:
+    | "HISTORY_UNAVAILABLE"
+    | "INVALID_EXECUTION"
+    | "ZERO_FILL"
+    | "MISSING_FILL_PRICE"
+    | "RECOVERY_UNAVAILABLE"
+    | "RECOVERY_ISSUE"
+    | "DUPLICATE_ENTRY"
+    | "CONFLICTING_ENTRY"
+    | "ENTRY_INCLUDED"
+    | "PROBABILITY_UNAVAILABLE"
+    | "NO_RECORDED_BUY_ENTRY"
+    | "ENTRY_AFTER_SETTLEMENT"
+    | "SELL_IS_NOT_ENTRY"
+    | "SETTLEMENT_INCLUDED";
+  readonly source?: "CYCLE_EXECUTION" | "VERIFIED_ORDER_RESOLUTION";
+  readonly runId?: string;
+  readonly cycleId?: string;
+  readonly attemptId?: string;
+  readonly marketSlug?: string;
+  readonly side?: OutcomeSide;
+  readonly action?: TradeAction;
+  readonly orderId?: string;
+  readonly tradeIds?: readonly string[];
+  readonly enteredAt?: string;
+  readonly quantity?: string;
+  readonly probabilitySource?:
+    "ORIGINAL_CYCLE_REPORT" | "ORIGINAL_DURABLE_INTENT" | "UNAVAILABLE";
+  readonly recoveryIssue?: string;
+}
+
+function diagnose(
+  observer: LoadEntryFillsInput["onDiagnostic"],
+  event: EntryHistoryDiagnostic,
+): void {
+  try {
+    if (observer !== undefined) {
+      // Copy the only nested value so an observer cannot mutate an entry's IDs.
+      void Promise.resolve(
+        observer({
+          ...event,
+          ...(event.tradeIds === undefined
+            ? {}
+            : { tradeIds: [...event.tradeIds] }),
+        }),
+      ).catch(() => undefined);
+    }
+  } catch {
+    /* Review-only observers cannot affect the result. */
+  }
+}
+
+interface AttributedFill {
+  readonly fill: EntryFill;
+  readonly runId: string;
+  readonly cycleId: string;
+  readonly intentId?: string;
+  readonly diagnostic: EntryHistoryDiagnostic;
+}
+
+function sameFill(left: EntryFill, right: EntryFill): boolean {
+  return (
+    left.marketSlug === right.marketSlug &&
+    left.side === right.side &&
+    left.action === right.action &&
+    left.quantity.eq(right.quantity) &&
+    left.averagePrice.eq(right.averagePrice) &&
+    left.fees.eq(right.fees)
+  );
+}
+
+function addEntry(
+  entries: AttributedFill[],
+  candidate: AttributedFill,
+  observer: LoadEntryFillsInput["onDiagnostic"],
+): void {
+  const ids = new Set(candidate.fill.tradeIds ?? []);
+  const duplicate = entries.find(
+    (existing) =>
+      (candidate.fill.orderId !== undefined &&
+        existing.fill.orderId === candidate.fill.orderId) ||
+      existing.fill.tradeIds?.some((id) => ids.has(id)) === true ||
+      (candidate.intentId !== undefined &&
+        existing.runId === candidate.runId &&
+        existing.cycleId === candidate.cycleId &&
+        existing.intentId === candidate.intentId),
+  );
+  if (duplicate !== undefined) {
+    diagnose(observer, {
+      ...candidate.diagnostic,
+      reason: sameFill(duplicate.fill, candidate.fill)
+        ? "DUPLICATE_ENTRY"
+        : "CONFLICTING_ENTRY",
+    });
+    return;
+  }
+  entries.push(candidate);
+  diagnose(observer, { ...candidate.diagnostic, reason: "ENTRY_INCLUDED" });
+  if (candidate.fill.estimatedProbability === undefined) {
+    diagnose(observer, {
+      ...candidate.diagnostic,
+      reason: "PROBABILITY_UNAVAILABLE",
+    });
+  }
 }
 
 /**
- * Collects filled orders from the cross-cycle history. Each entry's own cycle
- * report supplies the probability that authorized the order. Unreadable
- * history or reports yield fewer fills, never a failure.
+ * Collects ordinary history entries and verified later resolutions of original
+ * attempts. Probabilities come only from the original report or durable intent.
+ * Unreadable history or proofs yield fewer fills, never a failure.
  */
 export async function loadEntryFills(
   input: LoadEntryFillsInput,
 ): Promise<readonly EntryFill[]> {
   const history = await readCrossCycleHistory(input);
-  if (history === undefined) return [];
+  if (history === undefined)
+    diagnose(input.onDiagnostic, {
+      stage: "ENTRY_HISTORY",
+      reason: "HISTORY_UNAVAILABLE",
+    });
   const outcomes = restingOutcomes([
-    ...history.entries.flatMap((entry) => entry.restingOrderOutcomes ?? []),
+    ...(history?.entries ?? []).flatMap(
+      (entry) => entry.restingOrderOutcomes ?? [],
+    ),
     ...(input.restingOrderOutcomes ?? []),
   ]);
-  const ordered = chronological(history.entries);
+  const ordered = chronological(history?.entries ?? []);
   const previousCompletion = new Map(
     ordered.map((entry, index) => [entry, ordered[index - 1]?.completedAt]),
   );
-  const fills: EntryFill[] = [];
-  for (const entry of history.entries) {
+  const entries: AttributedFill[] = [];
+  for (const entry of history?.entries ?? []) {
     const priorCompletedAt = previousCompletion.get(entry);
     const priorCycle =
       priorCompletedAt === undefined ? undefined : new Date(priorCompletedAt);
     const executions = entry.currentCycleExecutions.flatMap((item) => {
       const execution = ExecutionSchema.safeParse(item);
-      if (!execution.success) return [];
+      const diagnostic = {
+        stage: "ENTRY_HISTORY" as const,
+        source: "CYCLE_EXECUTION" as const,
+        runId: entry.runId,
+        cycleId: entry.cycleId,
+      };
+      if (!execution.success) {
+        diagnose(input.onDiagnostic, {
+          ...diagnostic,
+          reason: "INVALID_EXECUTION",
+        });
+        return [];
+      }
       const { averageFillPrice, filledQuantity } = execution.data;
+      if (!filledQuantity.gt(0) || averageFillPrice === undefined) {
+        diagnose(input.onDiagnostic, {
+          ...diagnostic,
+          marketSlug: execution.data.marketSlug,
+          reason: filledQuantity.eq(0)
+            ? "ZERO_FILL"
+            : averageFillPrice === undefined
+              ? "MISSING_FILL_PRICE"
+              : "INVALID_EXECUTION",
+        });
+      }
       return filledQuantity.gt(0) && averageFillPrice !== undefined
         ? [{ ...execution.data, averageFillPrice }]
         : [];
@@ -325,7 +466,7 @@ export async function loadEntryFills(
         execution.orderId === undefined
           ? undefined
           : outcomes.get(execution.orderId);
-      fills.push({
+      const fill: EntryFill = {
         marketSlug: execution.marketSlug,
         side: execution.side,
         action: execution.action,
@@ -352,10 +493,163 @@ export async function loadEntryFills(
           ? {}
           : { previousCycleCompletedAt: priorCycle }),
         ...(outcome === undefined ? {} : { restingOutcome: outcome }),
-      });
+      };
+      addEntry(
+        entries,
+        {
+          fill,
+          runId: entry.runId,
+          cycleId: entry.cycleId,
+          ...(execution.intentId === undefined
+            ? {}
+            : { intentId: execution.intentId }),
+          diagnostic: {
+            stage: "ENTRY_HISTORY",
+            reason: "ENTRY_INCLUDED",
+            source: "CYCLE_EXECUTION",
+            runId: entry.runId,
+            cycleId: entry.cycleId,
+            marketSlug: fill.marketSlug,
+            side: fill.side,
+            action: fill.action,
+            enteredAt: fill.enteredAt.toISOString(),
+            quantity: fill.quantity.toFixed(),
+            ...(fill.orderId === undefined ? {} : { orderId: fill.orderId }),
+            ...(fill.tradeIds === undefined ? {} : { tradeIds: fill.tradeIds }),
+            probabilitySource:
+              accepted === undefined ? "UNAVAILABLE" : "ORIGINAL_CYCLE_REPORT",
+          },
+        },
+        input.onDiagnostic,
+      );
     }
   }
-  return fills;
+  try {
+    const recovery = await readVerifiedOrderResolutions(input);
+    for (const issue of recovery.issues) {
+      diagnose(input.onDiagnostic, {
+        stage: "ENTRY_HISTORY",
+        reason: "RECOVERY_ISSUE",
+        source: "VERIFIED_ORDER_RESOLUTION",
+        runId: issue.runId,
+        cycleId: issue.cycleId,
+        recoveryIssue: issue.reason,
+        ...(issue.attemptId === undefined
+          ? {}
+          : { attemptId: issue.attemptId }),
+      });
+    }
+    for (const recovered of recovery.resolutions) {
+      const enteredAt = new Date(
+        recovered.firstFilledAt ?? recovered.submittedAt,
+      );
+      const diagnostic: EntryHistoryDiagnostic = {
+        stage: "ENTRY_HISTORY",
+        reason: "ENTRY_INCLUDED",
+        source: "VERIFIED_ORDER_RESOLUTION",
+        runId: recovered.runId,
+        cycleId: recovered.cycleId,
+        attemptId: recovered.attemptId,
+        marketSlug: recovered.marketSlug,
+        side: recovered.side,
+        action: recovered.action,
+        enteredAt: enteredAt.toISOString(),
+        quantity: recovered.filledQuantity.toFixed(),
+        ...(recovered.orderId === undefined
+          ? {}
+          : { orderId: recovered.orderId }),
+        ...(recovered.tradeIds === undefined
+          ? {}
+          : { tradeIds: recovered.tradeIds }),
+        probabilitySource:
+          recovered.estimatedProbability === undefined
+            ? "UNAVAILABLE"
+            : "ORIGINAL_DURABLE_INTENT",
+      };
+      if (
+        !recovered.filledQuantity.gt(0) ||
+        recovered.averageFillPrice === undefined
+      ) {
+        diagnose(input.onDiagnostic, {
+          ...diagnostic,
+          reason: recovered.filledQuantity.eq(0)
+            ? "ZERO_FILL"
+            : "MISSING_FILL_PRICE",
+        });
+        continue;
+      }
+      // Without an exchange/intent identity, an existing entry in the original
+      // cycle could already cover this attempt. Do not risk counting it twice.
+      if (
+        recovered.orderId === undefined &&
+        (recovered.tradeIds?.length ?? 0) === 0 &&
+        recovered.intentId === undefined &&
+        entries.some(
+          (entry) =>
+            entry.runId === recovered.runId &&
+            entry.cycleId === recovered.cycleId &&
+            entry.fill.marketSlug === recovered.marketSlug &&
+            entry.fill.side === recovered.side &&
+            entry.fill.action === recovered.action,
+        )
+      ) {
+        diagnose(input.onDiagnostic, {
+          ...diagnostic,
+          reason: "CONFLICTING_ENTRY",
+        });
+        continue;
+      }
+      const prior = ordered
+        .filter(
+          (entry) =>
+            Date.parse(entry.completedAt) < Date.parse(recovered.submittedAt),
+        )
+        .at(-1);
+      const fill: EntryFill = {
+        marketSlug: recovered.marketSlug,
+        side: recovered.side,
+        action: recovered.action,
+        quantity: recovered.filledQuantity,
+        averagePrice: recovered.averageFillPrice,
+        fees: recovered.fees,
+        enteredAt,
+        ...(recovered.estimatedProbability === undefined
+          ? {}
+          : { estimatedProbability: recovered.estimatedProbability }),
+        ...(recovered.authorizationProbability === undefined
+          ? {}
+          : { authorizationProbability: recovered.authorizationProbability }),
+        ...(recovered.orderId === undefined
+          ? {}
+          : { orderId: recovered.orderId }),
+        ...(recovered.tradeIds === undefined
+          ? {}
+          : { tradeIds: recovered.tradeIds }),
+        ...(prior === undefined
+          ? {}
+          : { previousCycleCompletedAt: new Date(prior.completedAt) }),
+      };
+      addEntry(
+        entries,
+        {
+          fill,
+          runId: recovered.runId,
+          cycleId: recovered.cycleId,
+          diagnostic,
+          ...(recovered.intentId === undefined
+            ? {}
+            : { intentId: recovered.intentId }),
+        },
+        input.onDiagnostic,
+      );
+    }
+  } catch {
+    diagnose(input.onDiagnostic, {
+      stage: "ENTRY_HISTORY",
+      reason: "RECOVERY_UNAVAILABLE",
+    });
+  }
+  return entries.map((entry) => entry.fill);
 }
 
 export interface LookUpRestingOrdersInput {
@@ -506,6 +800,7 @@ function orderFills(
 export function summarizeSettledPositions(
   activities: readonly AccountActivity[],
   fills: readonly EntryFill[],
+  onDiagnostic?: (event: EntryHistoryDiagnostic) => void,
 ): readonly SettledPosition[] {
   const settlements = new Map<string, ResolutionActivity>();
   for (const activity of activities) {
@@ -520,6 +815,26 @@ export function summarizeSettledPositions(
   }
   const positions: SettledPosition[] = [];
   for (const settlement of settlements.values()) {
+    for (const fill of fills.filter(
+      (item) => item.marketSlug === settlement.marketSlug,
+    )) {
+      if (
+        fill.action === "SELL" ||
+        fill.enteredAt.getTime() > settlement.resolvedAt.getTime()
+      ) {
+        diagnose(onDiagnostic, {
+          stage: "SETTLEMENT_ATTRIBUTION",
+          reason:
+            fill.action === "SELL"
+              ? "SELL_IS_NOT_ENTRY"
+              : "ENTRY_AFTER_SETTLEMENT",
+          marketSlug: fill.marketSlug,
+          side: fill.side,
+          action: fill.action,
+          enteredAt: fill.enteredAt.toISOString(),
+        });
+      }
+    }
     const buys = fills
       .filter(
         (fill) =>
@@ -531,7 +846,14 @@ export function summarizeSettledPositions(
         (left, right) => left.enteredAt.getTime() - right.enteredAt.getTime(),
       );
     const first = buys[0];
-    if (first === undefined) continue;
+    if (first === undefined) {
+      diagnose(onDiagnostic, {
+        stage: "SETTLEMENT_ATTRIBUTION",
+        reason: "NO_RECORDED_BUY_ENTRY",
+        marketSlug: settlement.marketSlug,
+      });
+      continue;
+    }
     const trades = activities.filter(
       (activity): activity is TradeActivity =>
         isEffectiveTrade(activity) &&
@@ -612,6 +934,16 @@ export function summarizeSettledPositions(
         ? {}
         : { authorizationProbability: forecast.authorizationProbability }),
       entries,
+    });
+    diagnose(onDiagnostic, {
+      stage: "SETTLEMENT_ATTRIBUTION",
+      reason: "SETTLEMENT_INCLUDED",
+      marketSlug: settlement.marketSlug,
+      enteredAt: first.enteredAt.toISOString(),
+      quantity: quantity.toFixed(),
+      ...(forecast === undefined
+        ? { probabilitySource: "UNAVAILABLE" as const }
+        : {}),
     });
   }
   return positions

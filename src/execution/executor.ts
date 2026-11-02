@@ -31,6 +31,7 @@ import {
   ManagedBuyBatch,
   ManagedBuyStateError,
   isManagedBuyOrder,
+  isReconcilableBuyOrder,
   managedBuyResult,
   type ManagedBuyCheck,
 } from "./managed-buy-batch.js";
@@ -41,6 +42,17 @@ import {
   type ExecutionFailurePhase,
   type ExecutionHealth,
 } from "./execution-health.js";
+import {
+  diagnosticAccount,
+  diagnosticDifferences,
+  diagnosticPositions,
+  emitExecutionDiagnostic,
+  type ExecutionDiagnosticObserver,
+} from "./diagnostics.js";
+export type {
+  ExecutionDiagnostic,
+  ExecutionDiagnosticObserver,
+} from "./diagnostics.js";
 
 const MARKET_CLOSE_RESTING_SAFETY_MILLISECONDS = 60_000;
 
@@ -192,6 +204,7 @@ export interface ExecuteOrdersInput {
   readonly signal?: AbortSignal;
   readonly now?: () => Date;
   readonly journal?: ExecutionJournalHooks;
+  readonly onDiagnostic?: ExecutionDiagnosticObserver;
 }
 
 function assertManagedRestingOrderSafe(
@@ -782,11 +795,14 @@ export async function executeValidatedOrders(
         });
         continue;
       }
-      if (
+      const independentBuyRequired =
         managedBatch !== undefined &&
         (validated.order.action !== "BUY" ||
-          managedBatch.hasMarket(validated.order.marketSlug))
-      ) {
+          managedBatch.hasMarket(validated.order.marketSlug));
+      const retireIocBatch =
+        independentBuyRequired &&
+        managedBatch?.hasOnlyTerminalIocBuys() === true;
+      if (independentBuyRequired && !retireIocBatch) {
         attempts.push({
           ...identity,
           validated,
@@ -828,6 +844,14 @@ export async function executeValidatedOrders(
         const check = await managedBatch.reconcile(
           input.exchange,
           input.signal,
+          input.onDiagnostic === undefined
+            ? undefined
+            : (event) =>
+                input.onDiagnostic?.({
+                  ...event,
+                  ...identity,
+                  marketSlug: validated.order.marketSlug,
+                }),
         );
         managedOrderChecks.push(check);
         // This rebasing is permitted only after exact-order reconciliation
@@ -841,9 +865,63 @@ export async function executeValidatedOrders(
             (item) => item.id === attempt.result?.orderId,
           );
           if (order !== undefined)
-            attempts[index] = { ...attempt, result: managedBuyResult(order) };
+            attempts[index] = {
+              ...attempt,
+              result: { ...attempt.result, ...managedBuyResult(order) },
+            };
         }
+        // With only terminal IOC fills, exact reconciliation establishes the
+        // next baseline without any resting order to manage. Retire before a
+        // SELL or repeated-market proposal; its normal guards still apply.
+        if (retireIocBatch) managedBatch = undefined;
       }
+      const staleTargetReason = stalePortfolioTargetReason(
+        validated,
+        positions,
+        freshAccount,
+        currentSnapshot,
+      );
+      const precheckReason =
+        managedBatch === undefined && openOrders.length > 0
+          ? "Fresh open orders appeared after cycle reconstruction"
+          : staleTargetReason;
+      const targetPlan = validated.proposal.portfolioTargetPlan;
+      if (targetPlan !== undefined)
+        await emitExecutionDiagnostic(input.onDiagnostic, () => ({
+          kind: "PORTFOLIO_PRECHECK",
+          ...identity,
+          marketSlug: validated.order.marketSlug,
+          observedAt: safeJournalTimestamp(now, checkedAt).toISOString(),
+          verdict: precheckReason === undefined ? "PASSED" : "SKIPPED",
+          ...(precheckReason === undefined ? {} : { reason: precheckReason }),
+          data: {
+            checkedAt: checkedAt.toISOString(),
+            expectedAccount: diagnosticAccount(currentSnapshot),
+            observedAccount:
+              freshAccount === undefined
+                ? null
+                : diagnosticAccount(freshAccount),
+            positions: diagnosticPositions(positions),
+            differences: diagnosticDifferences(
+              currentSnapshot,
+              freshAccount,
+              positions,
+            ),
+            targetPlan: Object.fromEntries(
+              (
+                [
+                  "targetCostBasisUsd",
+                  "baselineCostBasisUsd",
+                  "baselineQuantity",
+                  "baselineAvailableQuantity",
+                  "baselineOppositeCostBasisUsd",
+                  "baselineOppositeQuantity",
+                ] as const
+              ).map((field) => [field, targetPlan[field].toFixed()]),
+            ),
+          },
+        }));
+      input.signal?.throwIfAborted();
       if (managedBatch === undefined && openOrders.length > 0) {
         attempts.push({
           ...identity,
@@ -855,12 +933,6 @@ export async function executeValidatedOrders(
           "Unexpected open orders appeared after cycle reconstruction",
         );
       }
-      const staleTargetReason = stalePortfolioTargetReason(
-        validated,
-        positions,
-        freshAccount,
-        currentSnapshot,
-      );
       if (staleTargetReason !== undefined) {
         attempts.push({
           ...identity,
@@ -1141,15 +1213,16 @@ export async function executeValidatedOrders(
           }
         }
       }
-      // A filled managed BUY joins the batch like a resting one, so later
+      // A terminal IOC BUY joins the batch like a managed resting one, so later
       // reads are explained by its order ID, fill and fee rather than
       // compared with a post-order read the venue may still be updating.
       let explainedByOrderId = false;
       if (
         result.status !== "AMBIGUOUS" &&
+        isReconcilableBuyOrder(validated.order) &&
         (result.status === "WORKING" ||
-          managedBatch !== undefined ||
-          (result.filledQuantity.gt(0) && isManagedBuyOrder(validated.order)))
+          (managedBatch !== undefined && isManagedBuyOrder(validated.order)) ||
+          result.filledQuantity.gt(0))
       ) {
         try {
           managedBatch ??= new ManagedBuyBatch(currentSnapshot);
@@ -1158,7 +1231,7 @@ export async function executeValidatedOrders(
             result.orderId,
             previewSpend,
             validated.market.priceTick,
-            result.filledQuantity,
+            result,
           );
           explainedByOrderId = true;
         } catch (error) {
@@ -1200,15 +1273,59 @@ export async function executeValidatedOrders(
         // and may briefly observe an exchange consistency gap immediately after
         // a confirmed fill, so retry that read before declaring the otherwise
         // known order outcome ambiguous.
+        const previousSnapshot = currentSnapshot;
         currentSnapshot = await reconstructAccountAfterMutation(
           input.exchange,
           input.signal,
         );
+        await emitExecutionDiagnostic(input.onDiagnostic, () => ({
+          kind: "POST_FILL_ACCOUNT",
+          ...identity,
+          marketSlug: validated.order.marketSlug,
+          observedAt: safeJournalTimestamp(
+            now,
+            submissionObservedAt,
+          ).toISOString(),
+          verdict: "OBSERVED",
+          data: {
+            previousAccount: diagnosticAccount(previousSnapshot),
+            account: diagnosticAccount(currentSnapshot),
+            differences: diagnosticDifferences(
+              previousSnapshot,
+              currentSnapshot,
+              currentSnapshot.positions,
+            ),
+            trackedForExactOrderReconciliation: explainedByOrderId,
+            orderId: result.orderId ?? null,
+            executionPolicy: validated.order.executionPolicy ?? "IOC",
+            status: result.status,
+            filledQuantity: result.filledQuantity.toFixed(),
+            averageFillPrice: result.averageFillPrice?.toFixed() ?? null,
+            fees: result.fees.toFixed(),
+            finalState: result.finalState,
+          },
+        }));
       } catch (reconstructionError) {
         const reason =
           reconstructionError instanceof Error
             ? `Post-order account reconciliation failed: ${safeErrorMessage(reconstructionError)}`
             : "Post-order account reconciliation failed";
+        await emitExecutionDiagnostic(input.onDiagnostic, () => ({
+          kind: "POST_FILL_ACCOUNT",
+          ...identity,
+          marketSlug: validated.order.marketSlug,
+          observedAt: safeJournalTimestamp(
+            now,
+            submissionObservedAt,
+          ).toISOString(),
+          verdict: "FAILED",
+          reason,
+          data: {
+            expectedAccount: diagnosticAccount(currentSnapshot),
+            orderId: result.orderId ?? null,
+            trackedForExactOrderReconciliation: explainedByOrderId,
+          },
+        }));
         if (explainedByOrderId) {
           // The batch already knows this order by its ID, fill and fee, and
           // reconciles the account by order ID before any later BUY.

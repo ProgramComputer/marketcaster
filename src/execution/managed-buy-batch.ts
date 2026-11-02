@@ -6,6 +6,15 @@ import type { Position } from "../domain/position.js";
 import type { PredictionExchange } from "../exchanges/exchange.js";
 import { reconstructAccount } from "../portfolio/reconstruct.js";
 import { matchesSubmittedOrder } from "./reconcile.js";
+import { safeErrorMessage } from "../utilities/redaction.js";
+import {
+  diagnosticAccount,
+  diagnosticDifferences,
+  diagnosticOrder,
+  emitExecutionDiagnostic,
+  type DiagnosticValue,
+  type ExecutionDiagnosticObserver,
+} from "./diagnostics.js";
 
 const ACTIVE = new Set(["NEW", "OPEN", "INFLIGHT", "PARTIALLY_FILLED"]);
 const TERMINAL = new Set([
@@ -36,6 +45,7 @@ interface SubmittedBuy {
   readonly orderId: string;
   readonly reservedSpend: Decimal;
   readonly priceTick: Decimal;
+  readonly terminalResult?: ExecutionResult;
 }
 
 export interface ManagedBuyCheck {
@@ -87,15 +97,24 @@ export function isManagedBuyOrder(order: ImmediateOrder): boolean {
   );
 }
 
+/** IOC fills use the same venue accounting, but must remain terminal. */
+export function isReconcilableBuyOrder(order: ImmediateOrder): boolean {
+  return order.action === "BUY" && order.marketId.exchange === "polymarket-us";
+}
+
+function unfilledReservation(buy: SubmittedBuy, filled: Decimal): Decimal {
+  return buy.terminalResult === undefined
+    ? buy.order.quantity.minus(filled).mul(buy.order.canonicalLimitPrice)
+    : new Decimal(0);
+}
+
 /** Whether a principal choice fits this order's fill and reservation. */
 function fitsFill(
   { principal, slack }: PrincipalChoice,
   order: ExchangeOrder,
   buy: SubmittedBuy,
 ): boolean {
-  const unfilled = buy.order.quantity
-    .minus(order.filledQuantity)
-    .mul(buy.order.canonicalLimitPrice);
+  const unfilled = unfilledReservation(buy, order.filledQuantity);
   return (
     principal.isFinite() &&
     principal.gte(0) &&
@@ -168,7 +187,7 @@ export function managedBuyResult(order: ExchangeOrder): ExecutionResult {
   };
 }
 
-/** Current-cycle Polymarket US GTD buys only; never adopts existing orders. */
+/** Current-cycle Polymarket US GTD buys and terminal IOC fills; never adopts orders. */
 export class ManagedBuyBatch {
   private readonly buys: SubmittedBuy[] = [];
   private readonly lastFilled = new Map<string, Decimal>();
@@ -179,12 +198,48 @@ export class ManagedBuyBatch {
     return this.buys.some((buy) => buy.order.marketSlug === marketSlug);
   }
 
+  public hasOnlyTerminalIocBuys(): boolean {
+    return (
+      this.buys.length > 0 &&
+      this.buys.every((buy) => buy.terminalResult !== undefined)
+    );
+  }
+
+  private diagnosticSubmissions(): readonly DiagnosticValue[] {
+    return this.buys.map((buy) => ({
+      orderId: buy.orderId,
+      exchange: buy.order.marketId.exchange,
+      marketId: buy.order.marketId.value,
+      marketSlug: buy.order.marketSlug,
+      side: buy.order.side,
+      action: buy.order.action,
+      quantity: buy.order.quantity.toFixed(),
+      canonicalLimitPrice: buy.order.canonicalLimitPrice.toFixed(),
+      executionPolicy: buy.order.executionPolicy ?? "IOC",
+      restUntil: buy.order.restUntil?.toISOString() ?? null,
+      reservedSpend: buy.reservedSpend.toFixed(),
+      priceTick: buy.priceTick.toFixed(),
+      minimumVerifiedFilledQuantity:
+        this.lastFilled.get(buy.orderId)?.toFixed() ?? null,
+      terminalFill:
+        buy.terminalResult === undefined
+          ? null
+          : {
+              filledQuantity: buy.terminalResult.filledQuantity.toFixed(),
+              fees: buy.terminalResult.fees.toFixed(),
+              averageFillPrice:
+                buy.terminalResult.averageFillPrice?.toFixed() ?? null,
+              finalState: buy.terminalResult.finalState,
+            },
+    }));
+  }
+
   public register(
     order: ImmediateOrder,
     orderId: string | undefined,
     reservedSpend: Decimal,
     priceTick: Decimal,
-    filledQuantity: Decimal,
+    result: ExecutionResult,
   ): void {
     if (
       orderId === undefined ||
@@ -192,10 +247,29 @@ export class ManagedBuyBatch {
     ) {
       fail("Managed BUY submission has a missing or duplicate order ID");
     }
-    if (!isManagedBuyOrder(order) || this.hasMarket(order.marketSlug)) {
+    if (!isReconcilableBuyOrder(order) || this.hasMarket(order.marketSlug)) {
       fail(
         "Managed BUY continuation requires independent current-cycle markets",
       );
+    }
+    // Deployment policy enables GTD for every BUY or disables it for every
+    // BUY. Do not silently mix collateral models through this lower-level API.
+    if (
+      this.buys.some(
+        (buy) => isManagedBuyOrder(buy.order) !== isManagedBuyOrder(order),
+      )
+    )
+      fail("A BUY batch cannot mix IOC fills and managed GTD orders");
+    const filledQuantity = result.filledQuantity;
+    const terminal = !isManagedBuyOrder(order);
+    if (
+      terminal &&
+      (!TERMINAL.has(result.finalState) ||
+        !["FILLED", "PARTIAL"].includes(result.status) ||
+        filledQuantity.lte(0) ||
+        result.remainingQuantity?.eq(0) === false)
+    ) {
+      fail("IOC BUY fill is not a verified terminal submission");
     }
     if (
       !priceTick.isFinite() ||
@@ -206,16 +280,30 @@ export class ManagedBuyBatch {
     ) {
       fail("Managed BUY has invalid price precision or fill quantity");
     }
-    this.buys.push({ order: { ...order }, orderId, reservedSpend, priceTick });
+    this.buys.push({
+      order: { ...order },
+      orderId,
+      reservedSpend,
+      priceTick,
+      ...(terminal ? { terminalResult: { ...result } } : {}),
+    });
     this.lastFilled.set(orderId, filledQuantity);
   }
 
   public availableBuyingPower(snapshot: AccountSnapshot): Decimal {
-    // Do not add back NO sale proceeds or release the unfilled reservation.
+    // Never add back NO sale proceeds. Resting BUYs retain their full
+    // reservation; a verified terminal IOC retains only its filled cost cap.
     // Exchange buying power may already lock resting collateral: use min,
     // rather than subtracting our reservation from that value a second time.
     const reserved = this.buys.reduce(
-      (sum, buy) => sum.plus(buy.reservedSpend),
+      (sum, buy) =>
+        sum.plus(
+          buy.terminalResult === undefined
+            ? buy.reservedSpend
+            : buy.terminalResult.filledQuantity
+                .mul(buy.order.canonicalLimitPrice)
+                .plus(buy.terminalResult.fees),
+        ),
       new Decimal(0),
     );
     return Decimal.max(
@@ -231,9 +319,17 @@ export class ManagedBuyBatch {
     const filled = reported.filledQuantity;
     const remaining = reported.remainingQuantity;
     const active = ACTIVE.has(reported.state);
+    const terminal = buy.terminalResult;
     if (
       reported.id !== buy.orderId ||
       !matchesSubmittedOrder(reported, buy.order) ||
+      (terminal !== undefined &&
+        (active ||
+          !filled.eq(terminal.filledQuantity) ||
+          reported.remainingQuantity?.eq(0) !== true ||
+          reported.fees?.eq(terminal.fees) !== true ||
+          reported.averageFillPrice?.eq(terminal.averageFillPrice ?? -1) !==
+            true)) ||
       (!active && !TERMINAL.has(reported.state)) ||
       !filled.isFinite() ||
       filled.lt(this.lastFilled.get(buy.orderId) ?? 0) ||
@@ -266,9 +362,7 @@ export class ManagedBuyBatch {
       filled
         .mul(price)
         .plus(fees)
-        .plus(
-          buy.order.quantity.minus(filled).mul(buy.order.canonicalLimitPrice),
-        )
+        .plus(unfilledReservation(buy, filled))
         .gt(buy.reservedSpend)
     ) {
       fail("Managed BUY fill exceeds its reserved cost or limit");
@@ -354,6 +448,34 @@ export class ManagedBuyBatch {
       )
     )
       fail("Account capital changed beyond verified current-cycle BUY fills");
+    // Terminal IOC fills have no resting collateral to explain. Preserve the
+    // capital guard when rebasing: NO sale proceeds are collateral, not buying
+    // power, and neither a capital adjustment nor a new lock may be adopted.
+    if (this.hasOnlyTerminalIocBuys()) {
+      const fees = orders.reduce(
+        (sum, order) => sum.plus(order.fees ?? 0),
+        new Decimal(0),
+      );
+      const noCollateral = orders.reduce(
+        (sum, order) =>
+          sum.plus(order.side === "NO" ? order.filledQuantity : 0),
+        new Decimal(0),
+      );
+      if (
+        !equal(
+          account.buyingPower,
+          this.baseline.buyingPower.minus(cashSpentOnPrincipal).minus(fees),
+        ) ||
+        !equal(
+          account.marginRequirement,
+          this.baseline.marginRequirement.plus(noCollateral),
+        ) ||
+        !equal(account.openOrderValue, this.baseline.openOrderValue)
+      )
+        fail(
+          "IOC BUY buying power or collateral changed beyond verified fills",
+        );
+    }
     if (account.positions.length !== expected.size)
       fail("Account positions changed beyond verified current-cycle BUY fills");
     const seen = new Set<string>();
@@ -394,23 +516,33 @@ export class ManagedBuyBatch {
   public async reconcile(
     exchange: PredictionExchange,
     signal?: AbortSignal,
+    onDiagnostic?: ExecutionDiagnosticObserver,
   ): Promise<ManagedBuyCheck> {
     let lastError: unknown;
-    for (const delay of [0, 150, 350]) {
+    const delays = [0, 150, 350];
+    for (const [attempt, delay] of delays.entries()) {
       signal?.throwIfAborted();
       if (delay > 0)
         await new Promise<void>((resolve) => setTimeout(resolve, delay));
       signal?.throwIfAborted();
+      let accountRead: AccountSnapshot | undefined;
+      let beforeRead: readonly ExchangeOrder[] = [];
+      let afterRead: readonly ExchangeOrder[] = [];
       try {
         // Sandwich the non-atomic account read with exact-order reads. If a
         // fill races any read, retry reads only; never resubmit a mutation.
         const before = await Promise.all(
           this.buys.map((buy) => exchange.getOrder(buy.orderId)),
         );
+        beforeRead = before;
+        signal?.throwIfAborted();
         const account = await reconstructAccount(exchange);
+        accountRead = account;
+        signal?.throwIfAborted();
         const orders = await Promise.all(
           this.buys.map((buy) => exchange.getOrder(buy.orderId)),
         );
+        afterRead = orders;
         signal?.throwIfAborted();
         for (const [index, buy] of this.buys.entries()) {
           const first = before[index];
@@ -424,9 +556,66 @@ export class ManagedBuyBatch {
         this.verifyAccount(account, orders);
         for (const order of orders)
           this.lastFilled.set(order.id, order.filledQuantity);
+        await emitExecutionDiagnostic(onDiagnostic, () => ({
+          kind: "BUY_RECONCILIATION",
+          observedAt: new Date().toISOString(),
+          verdict: "PASSED",
+          data: {
+            attempt: attempt + 1,
+            submissions: this.diagnosticSubmissions(),
+            baseline: diagnosticAccount(this.baseline),
+            account: diagnosticAccount(account),
+            differences: diagnosticDifferences(
+              this.baseline,
+              account,
+              account.positions,
+            ),
+            ordersBefore: before.map(diagnosticOrder),
+            ordersAfter: orders.map(diagnosticOrder),
+            controls: {
+              exactOrderIdentity: true,
+              stableOrderReads: true,
+              terminalIocUnchanged: true,
+              fillAndFeeWithinReservation: true,
+              cashExplainedByFills: true,
+              terminalIocCapitalAndCollateral: this.hasOnlyTerminalIocBuys()
+                ? "PASSED"
+                : "NOT_APPLICABLE",
+              positionsExplainedByFills: true,
+              openOrdersExactlyTracked: true,
+            },
+          },
+        }));
+        signal?.throwIfAborted();
         return { account, orders };
       } catch (error) {
         lastError = error;
+        await emitExecutionDiagnostic(onDiagnostic, () => ({
+          kind: "BUY_RECONCILIATION",
+          observedAt: new Date().toISOString(),
+          verdict: attempt === delays.length - 1 ? "FAILED" : "RETRY",
+          reason:
+            error instanceof Error
+              ? safeErrorMessage(error)
+              : "BUY reconciliation failed",
+          data: {
+            attempt: attempt + 1,
+            submissions: this.diagnosticSubmissions(),
+            baseline: diagnosticAccount(this.baseline),
+            account:
+              accountRead === undefined ? null : diagnosticAccount(accountRead),
+            differences:
+              accountRead === undefined
+                ? []
+                : diagnosticDifferences(
+                    this.baseline,
+                    accountRead,
+                    accountRead.positions,
+                  ),
+            ordersBefore: beforeRead.map(diagnosticOrder),
+            ordersAfter: afterRead.map(diagnosticOrder),
+          },
+        }));
       }
     }
     signal?.throwIfAborted();
