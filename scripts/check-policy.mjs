@@ -192,6 +192,20 @@ await (async () => {
       { ...strategy, executionCooldownMilliseconds: { NO_FILL: -1 } },
       { ...strategy, reconciliationTolerance: 7 },
       { ...strategy, selectMemoryContext: 7 },
+      { ...strategy, executionReassessment: null },
+      { ...strategy, executionReassessment: [] },
+      ...[
+        undefined,
+        "0.4",
+        new Decimal(0),
+        new Decimal(1),
+        new Decimal(-1),
+        new Decimal("NaN"),
+        new Decimal("Infinity"),
+      ].map((fraction) => ({
+        ...strategy,
+        executionReassessment: { maximumRetainedLiquidityFraction: fraction },
+      })),
       { ...strategy, resolutionReview: {} },
       {
         ...strategy,
@@ -201,6 +215,9 @@ await (async () => {
       assert.throws(() => assertStrategyPolicy(invalid));
     assertStrategyPolicy({
       ...strategy,
+      executionReassessment: {
+        maximumRetainedLiquidityFraction: new Decimal("0.4"),
+      },
       allocation: Object.assign(() => [], { omissionReason: () => undefined }),
     });
     const requests = [{ marketSlug: "synthetic", side: "YES" }];

@@ -2404,6 +2404,16 @@ export class DecisionResearchTools {
     this.providerDecisionReturned = true;
   }
 
+  /** Read the existing submission contract without changing research state. */
+  public get terminalSubmissionDefinition(): DecisionToolDefinition {
+    const definition = this.definitions.find(
+      (candidate) => candidate.name === "submit_trade_plan",
+    );
+    if (definition === undefined)
+      throw new Error("The terminal submission tool is unavailable");
+    return definition;
+  }
+
   public definitionsForRound(
     finalRound: boolean,
   ): readonly DecisionToolDefinition[] {

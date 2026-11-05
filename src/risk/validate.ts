@@ -120,12 +120,22 @@ export interface ProposalValidationResult {
   readonly committedCycleSpend: Decimal;
 }
 
+/** The exact fresh inputs inspected by risk validation, before sizing. */
+export interface ValidationMarketSnapshot {
+  readonly proposal: RiskProposal;
+  readonly market: Market;
+  readonly bbo: MarketBbo;
+  readonly book: OrderBook;
+}
+
 export interface ManagedRestingBuyOrdersPolicy {
   readonly enabled: boolean;
   readonly maximumLifetimeMinutes: number;
 }
 
 export interface ValidateProposalsInput {
+  /** Internal execution planning; this callback never authorizes an order. */
+  readonly onMarketSnapshot?: (snapshot: ValidationMarketSnapshot) => void;
   readonly minimumNearTouchBuyNotionalUsd?: Decimal | undefined;
   readonly depthPriceBand?: Decimal | undefined;
   readonly allocationPolicy?: BatchAllocationPolicy | undefined;
@@ -638,6 +648,7 @@ async function assessOne(
     input.knownMarkets?.get(proposal.marketSlug),
     validatedAt,
   );
+  input.onMarketSnapshot?.({ proposal, market, bbo, book });
   const spread = canonicalSpread(bbo, proposal.side);
   if (
     spread.gt(input.policy.maximumExecutionSpread) &&
