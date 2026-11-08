@@ -86,14 +86,9 @@ import {
   loadPreviousCycleAdvisory,
   persistCompletedCycleAdvisoryWithResult,
 } from "../reporting/previous-cycle-advisory.js";
-import {
-  validateProposals,
-  type RiskProposal,
-  type ProposalValidationResult,
-  type ValidationMarketSnapshot,
-} from "../risk/validate.js";
+import { validateProposals, type RiskProposal } from "../risk/validate.js";
 import { safeErrorMessage } from "../utilities/redaction.js";
-import { StageTimeoutError, withStageTimeout } from "../utilities/time.js";
+import { withStageTimeout } from "../utilities/time.js";
 import {
   buildAgentContext,
   buildMarketDetailContext,
@@ -125,18 +120,7 @@ import {
   type EvidenceValidationReport,
 } from "./evidence-provenance.js";
 import { buildDecisionPrompt } from "./prompt-builder.js";
-import { modelJson, toModelSide } from "./model-view.js";
-import {
-  buildBuyLiquidityReassessmentFeedback,
-  buildReviewedLiquidityBaselines,
-  buyLiquidityKey,
-  collectBuyLiquidityBaselines,
-  detectBuyLiquidityDeterioration,
-  mergeBuyLiquidityReassessment,
-  stripAffectedBuys,
-  type AdvisoryLiquidityPreview,
-  type BuyLiquidityBaseline,
-} from "./liquidity-reassessment.js";
+import { toModelSide } from "./model-view.js";
 import {
   provenanceIdentityFromEnvironment,
   renderedInputProvenance,
@@ -1588,8 +1572,6 @@ export async function runCycle(
       discovery.catalog.bySlug,
       dependencies.config.risk.allowPositionReductions,
     );
-    const advisoryLiquidityPreviews: AdvisoryLiquidityPreview[] = [];
-    let frozenLiquidityBaselines: readonly BuyLiquidityBaseline[] | undefined;
     const currentMutationProvenanceContext = (): MutationProvenanceContext => ({
       // Advisory memory may cite an observed source; trade authorization retains
       // its stricter excerpt, freshness, and source-independence validation.
@@ -1666,18 +1648,8 @@ export async function runCycle(
       marketFamilyDetailsHandler: resolveMarketFamilyDetails,
       marketAnalysisHandler: (request, signal) =>
         marketAnalysisResolver.analyze(request, signal),
-      tradePreviewHandler: async (request, signal) => {
-        const preview = await tradePreviewResolver.preview(request, signal);
-        const market = discovery.catalog.bySlug.get(request.marketSlug);
-        if (
-          strategy.executionReassessment !== undefined &&
-          frozenLiquidityBaselines === undefined &&
-          market !== undefined
-        ) {
-          advisoryLiquidityPreviews.push({ marketId: market.id, preview });
-        }
-        return preview;
-      },
+      tradePreviewHandler: (request, signal) =>
+        tradePreviewResolver.preview(request, signal),
       ...(memory.persistent
         ? {
             agentNotesHandler: async (
@@ -1750,7 +1722,6 @@ export async function runCycle(
     const validateDecisionProposals = async (
       proposals: readonly RiskProposal[],
       signal: AbortSignal,
-      snapshots?: ValidationMarketSnapshot[],
     ) => {
       const freshLive = await refreshForecasts(
         proposals,
@@ -1762,13 +1733,6 @@ export async function runCycle(
       const allocationOmissions: { id: string; reason: string }[] = [];
       const omissionReason = strategy.allocation.omissionReason;
       const result = await validateProposals({
-        ...(snapshots === undefined
-          ? {}
-          : {
-              onMarketSnapshot: (snapshot: ValidationMarketSnapshot) => {
-                snapshots.push(snapshot);
-              },
-            }),
         allocationPolicy: Object.assign(
           (input: Parameters<StrategyPolicy["allocation"]>[0]) => {
             const assessedInput: unknown = JSON.parse(JSON.stringify(input));
@@ -1834,32 +1798,6 @@ export async function runCycle(
         },
       );
       return result;
-    };
-    const executionValidationBudgetMilliseconds =
-      dependencies.config.cycle.stageBudgetsSeconds.validationExecution * 1000;
-    let executionValidationElapsedMilliseconds = 0;
-    const validateForExecution = async (
-      proposals: readonly RiskProposal[],
-      snapshots: ValidationMarketSnapshot[],
-    ): Promise<ProposalValidationResult> => {
-      const remainingMilliseconds =
-        executionValidationBudgetMilliseconds -
-        executionValidationElapsedMilliseconds;
-      if (remainingMilliseconds <= 0) {
-        throw new StageTimeoutError("validation-execution");
-      }
-      const startedValidationAt = Date.now();
-      try {
-        return await withStageTimeout(
-          "validation-execution",
-          remainingMilliseconds,
-          (signal) => validateDecisionProposals(proposals, signal, snapshots),
-          overallController.signal,
-        );
-      } finally {
-        executionValidationElapsedMilliseconds +=
-          Date.now() - startedValidationAt;
-      }
     };
     let evidenceValidation: EvidenceValidationReport | undefined;
     const decisionSubmissions: DecisionSubmissionAudit[] = [];
@@ -2039,13 +1977,6 @@ export async function runCycle(
       "decision-input",
       renderedInputProvenance(decisionPrompt, provenanceIdentity.secretValues),
     );
-    // A later execution-only response shares this original absolute deadline.
-    const decisionDeadlineAt =
-      Date.now() +
-      Math.min(
-        dependencies.config.cycle.stageBudgetsSeconds.agentResearch * 1000,
-        liveDecisionLimits.timeoutMilliseconds,
-      );
     const submittedDecision = await withStageTimeout(
       "agent-research",
       dependencies.config.cycle.stageBudgetsSeconds.agentResearch * 1000,
@@ -2236,312 +2167,11 @@ export async function runCycle(
         }),
       overallController.signal,
     );
-    let rawDecision = retainPositionReductionRequests(
+    const rawDecision = retainPositionReductionRequests(
       submittedDecision,
       retainedReductionDecision,
       blockedReductionMarketSlugs,
     );
-    let preparedExecutionValidation: ProposalValidationResult | undefined;
-    if (strategy.executionReassessment !== undefined) {
-      // Ordinary terminal repair may inspect and consciously accept a newly
-      // thin book. Freeze its latest successful preview only when that original
-      // decision session finishes; the submit-only reassessment cannot reset it.
-      frozenLiquidityBaselines ??= collectBuyLiquidityBaselines(
-        advisoryLiquidityPreviews,
-      );
-      const marketsBySlug = new Map(
-        [
-          ...discovery.catalog.markets,
-          ...discovery.detailResolver.resolvedMarkets,
-          ...familyResolvedMarkets.values(),
-        ].map((market) => [market.slug, market] as const),
-      );
-      const stripInput = {
-        snapshot: initialSnapshot,
-        marketsBySlug,
-        riskEquity: initialValuation.riskEquity,
-      };
-      const preflightSnapshots: ValidationMarketSnapshot[] = [];
-      const preflightPlan = materializeTargetDecision(
-        rawDecision,
-        initialSnapshot,
-        initialValuation,
-        strategy,
-      );
-      preparedExecutionValidation = await validateForExecution(
-        preflightPlan.riskProposals,
-        preflightSnapshots,
-      );
-      const affected = detectBuyLiquidityDeterioration({
-        baselines: frozenLiquidityBaselines,
-        snapshots: preflightSnapshots,
-        validation: preparedExecutionValidation,
-        maximumRetainedLiquidityFraction:
-          strategy.executionReassessment.maximumRetainedLiquidityFraction,
-      });
-      if (affected.length > 0) {
-        // All currently affected identities share one bounded response. No
-        // subsequent book change can reopen research or offer another response.
-        const affectedKeys = new Set(affected.map((item) => item.key));
-        const feedback = buildBuyLiquidityReassessmentFeedback(affected);
-        await journal?.recordArtifact("execution-reassessment-input", {
-          originalDecision: rawDecision,
-          baselines: frozenLiquidityBaselines,
-          snapshots: preflightSnapshots,
-          validation: preparedExecutionValidation,
-          feedback,
-        });
-        const originalDecision = rawDecision;
-        const remainingMilliseconds = decisionDeadlineAt - Date.now();
-        const transcriptOffset = transcriptRounds.length;
-        const remainingRounds =
-          liveDecisionLimits.maximumRounds -
-          Math.max(transcriptOffset, decisionSubmissions.length);
-        let replacement: AgentDecision | undefined;
-        let failure: string | undefined;
-        let mergeIssues: readonly string[] = [];
-        if (remainingMilliseconds > 0 && remainingRounds > 0) {
-          try {
-            replacement = await dependencies.decisionProvider.decide({
-              mode: "EXECUTION_REASSESSMENT",
-              prompt: {
-                system: decisionPrompt.system,
-                user: `${decisionPrompt.user}\n\n${modelJson({
-                  executionReassessment: {
-                    instructions: [
-                      "Submit exactly one complete replacement target plan using only submit_trade_plan. No additional research, previews, or memory changes are available.",
-                      "Only the listed affected BUY targets may change. Retain every unrelated target, SELL, evidence bundle, and disposition unchanged.",
-                      "For each affected BUY, explicitly accept the currently executable smaller BUY (the same target is allowed), reduce its target, revise its maximum entry price, or submit a MARKET_STRUCTURE PASS/unchanged hold. Do not increase its target budget or turn a BUY revision into a SELL.",
-                      "Keep the original estimated probability, probability bounds, confidence, evidence, settlement verification, and invalidation conditions exactly unchanged. Liquidity movement supplies no new forecasting evidence.",
-                      "Every revised BUY must still pass ordinary evidence, price, fee, Kelly, concentration, cash, and account-state guards. Further material deterioration skips only the affected BUY; another reassessment is unavailable this cycle.",
-                    ],
-                    currentDecision: originalDecision,
-                    executionFeedback: feedback,
-                  },
-                })}`,
-              },
-              researchTools,
-              limits: {
-                ...liveDecisionLimits,
-                maximumRounds: 1,
-                timeoutMilliseconds: remainingMilliseconds,
-              },
-              signal: overallController.signal,
-              provenanceSecretValues: provenanceIdentity.secretValues,
-              ...(journal === undefined
-                ? {}
-                : {
-                    recordModelRequest: async (request) => {
-                      const recorded = {
-                        ...request,
-                        round: request.round + transcriptOffset,
-                      };
-                      const pending = transcriptJournalQueue.then(async () => {
-                        await journal?.recordArtifact(
-                          decisionRequestRoundArtifactKind(recorded.round),
-                          recorded,
-                        );
-                      });
-                      transcriptJournalQueue = pending;
-                      await pending;
-                    },
-                  }),
-              recordTranscriptRound: (round) =>
-                recordTranscriptRound({
-                  ...round,
-                  round: round.round + transcriptOffset,
-                }),
-            });
-            const merged = mergeBuyLiquidityReassessment({
-              ...stripInput,
-              original: originalDecision,
-              replacement,
-              affectedKeys,
-              currentExecutionLimitByKey: new Map(
-                affected.map((item) => [item.key, item.currentLimitPrice]),
-              ),
-            });
-            rawDecision = merged.decision;
-            mergeIssues = merged.issues;
-          } catch (error) {
-            overallController.signal.throwIfAborted();
-            failure = safeErrorMessage(error);
-            rawDecision = stripAffectedBuys({
-              ...stripInput,
-              decision: originalDecision,
-              affectedKeys,
-            });
-          }
-        } else {
-          failure = "The original decision time or round budget was exhausted";
-          rawDecision = stripAffectedBuys({
-            ...stripInput,
-            decision: originalDecision,
-            affectedKeys,
-          });
-        }
-        const reviewedBaselines = buildReviewedLiquidityBaselines(
-          affected,
-          rawDecision,
-          marketsBySlug,
-        );
-        const reviewedKeys = new Set(
-          reviewedBaselines.map((baseline) => baseline.key),
-        );
-        const unreviewedBuys = materializeTargetDecision(
-          rawDecision,
-          initialSnapshot,
-          initialValuation,
-          strategy,
-        ).riskProposals.filter((proposal) => {
-          if (proposal.action !== "BUY") return false;
-          const market = marketsBySlug.get(proposal.marketSlug);
-          if (market === undefined) return false;
-          const key = buyLiquidityKey({
-            marketId: market.id,
-            marketSlug: market.slug,
-            side: proposal.side,
-          });
-          return affectedKeys.has(key) && !reviewedKeys.has(key);
-        });
-        const missingReviewedKeys = new Set(
-          unreviewedBuys.flatMap((proposal) => {
-            const market = marketsBySlug.get(proposal.marketSlug);
-            return market === undefined
-              ? []
-              : [
-                  buyLiquidityKey({
-                    marketId: market.id,
-                    marketSlug: market.slug,
-                    side: proposal.side,
-                  }),
-                ];
-          }),
-        );
-        rawDecision = stripAffectedBuys({
-          ...stripInput,
-          decision: rawDecision,
-          affectedKeys: missingReviewedKeys,
-        });
-        const postReviewSnapshots: ValidationMarketSnapshot[] = [];
-        const reviewedPlan = materializeTargetDecision(
-          rawDecision,
-          initialSnapshot,
-          initialValuation,
-          strategy,
-        );
-        preparedExecutionValidation = await validateForExecution(
-          reviewedPlan.riskProposals,
-          postReviewSnapshots,
-        );
-        const repeated = detectBuyLiquidityDeterioration({
-          baselines: [
-            ...frozenLiquidityBaselines.filter(
-              (baseline) => !affectedKeys.has(baseline.key),
-            ),
-            ...reviewedBaselines,
-          ],
-          snapshots: postReviewSnapshots,
-          validation: preparedExecutionValidation,
-          maximumRetainedLiquidityFraction:
-            strategy.executionReassessment.maximumRetainedLiquidityFraction,
-        });
-        const repeatedKeys = new Set(repeated.map((item) => item.key));
-        rawDecision = stripAffectedBuys({
-          ...stripInput,
-          decision: rawDecision,
-          affectedKeys: repeatedKeys,
-        });
-        const skippedKeys = new Set([
-          ...missingReviewedKeys,
-          ...repeatedKeys,
-          ...affected
-            .filter((item) => {
-              const active = reviewedPlan.riskProposals.some(
-                (proposal) =>
-                  proposal.action === "BUY" &&
-                  proposal.marketSlug === item.snapshot.market.slug &&
-                  proposal.side === item.snapshot.proposal.side,
-              );
-              return !active;
-            })
-            .map((item) => item.key),
-        ]);
-        const skippedAccepted = preparedExecutionValidation.accepted.filter(
-          (item) =>
-            item.proposal.action === "BUY" &&
-            skippedKeys.has(
-              buyLiquidityKey({
-                marketId: item.market.id,
-                marketSlug: item.market.slug,
-                side: item.proposal.side,
-              }),
-            ),
-        );
-        const accepted = preparedExecutionValidation.accepted.filter(
-          (item) => !skippedAccepted.includes(item),
-        );
-        const retainedRejections = preparedExecutionValidation.rejected;
-        const auditedSkipped = affected.filter((item) =>
-          skippedKeys.has(item.key),
-        );
-        preparedExecutionValidation = {
-          accepted,
-          rejected: [
-            ...retainedRejections,
-            ...auditedSkipped
-              .map((item) => item.snapshot.proposal)
-              .concat(
-                skippedAccepted
-                  .filter(
-                    (item) =>
-                      !auditedSkipped.some(
-                        (skipped) =>
-                          skipped.snapshot.market.slug === item.market.slug &&
-                          skipped.snapshot.proposal.side === item.proposal.side,
-                      ),
-                  )
-                  .map((item) => item.proposal),
-              )
-              .filter(
-                (proposal) =>
-                  !retainedRejections.some(
-                    (rejection) =>
-                      rejection.proposal.marketSlug === proposal.marketSlug &&
-                      rejection.proposal.side === proposal.side &&
-                      rejection.proposal.action === "BUY",
-                  ),
-              )
-              .map((proposal) => ({
-                proposal,
-                code: "NO_DEPTH" as const,
-                reason:
-                  "BUY skipped after materially deteriorated liquidity could not be safely confirmed within the single execution reassessment",
-              })),
-          ],
-          committedCycleSpend: accepted.reduce(
-            (total, item) => total.plus(item.maximumExecutionSpend),
-            new Decimal(0),
-          ),
-        };
-        await journal?.recordArtifact("execution-reassessment-outcome", {
-          ...(replacement === undefined ? {} : { replacement }),
-          ...(failure === undefined ? {} : { failure }),
-          mergeIssues,
-          reviewedBaselines,
-          postReviewSnapshots,
-          repeated,
-          skippedKeys: [...skippedKeys],
-          finalDecision: rawDecision,
-          validation: preparedExecutionValidation,
-        });
-        if (skippedKeys.size > 0) {
-          warnings.push(
-            `Skipped ${skippedKeys.size} BUY target(s) after the bounded execution-liquidity reassessment; independent validated orders remain eligible`,
-          );
-        }
-      }
-    }
     const decisionReturnedAt = safeTimestamp(now).toISOString();
     const finalGuards = await validateDecisionGuards(
       rawDecision,
@@ -2972,22 +2602,17 @@ export async function runCycle(
     }
     await journal?.transition("DECIDED");
 
-    const remainingValidationExecutionMilliseconds =
-      executionValidationBudgetMilliseconds -
-      executionValidationElapsedMilliseconds;
-    if (remainingValidationExecutionMilliseconds <= 0) {
-      throw new StageTimeoutError("validation-execution");
-    }
     const validationExecution = await withStageTimeout(
       "validation-execution",
-      remainingValidationExecutionMilliseconds,
+      dependencies.config.cycle.stageBudgetsSeconds.validationExecution * 1000,
       async (signal) => {
-        // Enabled reassessment retains its authoritative post-review sizing.
-        // The executor independently rechecks the full quantity before placing
-        // each order; another allocation pass must not silently resize it.
-        const validation =
-          preparedExecutionValidation ??
-          (await validateDecisionProposals(targetPlan.riskProposals, signal));
+        // This fresh validation remains authoritative. Any earlier terminal
+        // review was read-only feedback to the model and cannot approve an
+        // order or reserve exchange state.
+        const validation = await validateDecisionProposals(
+          targetPlan.riskProposals,
+          signal,
+        );
         await journal?.recordArtifact("validation", validation);
         const cycleSpendCapacity = initialValuation.riskEquity.mul(
           dependencies.config.risk.maximumCycleSpendFraction,

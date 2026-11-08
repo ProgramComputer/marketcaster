@@ -1,6 +1,4 @@
 // check-schema-correction.mjs
-await import("./check-execution-reassessment-provider.mjs");
-
 await (async () => {
   const { default: assert } = await import("node:assert/strict");
   const { loadPromptBundle } = await import("../dist/src/config/prompts.js");

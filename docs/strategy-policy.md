@@ -30,19 +30,6 @@ run as trusted local code, not in a sandbox.
   bounds.
 - Optional cooldown durations apply to typed execution failures. State is isolated
   by account, exchange, market, outcome side, and action; it contains no raw errors.
-- Optional `executionReassessment.maximumRetainedLiquidityFraction` enables a
-  single submit-only execution review when fresh BUY liquidity falls to or below
-  that fraction of a successful research preview and constrains the intended
-  risk-sized order. Supply a finite Decimal strictly between zero and one; there
-  is no implicit threshold. The comparison uses the original preview price limit.
-  The review shares the original decision deadline and round budget and permits
-  no new research or memory writes. It can accept the smaller buy, reduce its
-  target, revise its price limit, or pass. Probability, confidence, evidence,
-  unrelated targets, and SELL intent stay fixed. Revised orders still pass
-  ordinary risk and execution checks. Missing or invalid responses, exhausted
-  budget, and repeated material deterioration skip the affected BUY. Detailed
-  review records remain journal evidence, not persistent model context. An IOC
-  can still partially fill if liquidity changes after the final exchange check.
 - An optional version 1 `evidenceContentAdapter` can extract text from a fetched
   response. Its synchronous `extractText` method receives `source`, `requestedUrl`,
   `finalUrl`, and `contentType`, and returns text or `undefined`. The engine retains

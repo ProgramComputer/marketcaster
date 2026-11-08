@@ -34,10 +34,6 @@ export interface StrategyPolicy {
   readonly selectMemoryContext?: AgentBeliefContextSelector;
   readonly resolutionReview?: ResolutionReviewPolicy;
   readonly allocation: BatchAllocationPolicy;
-  /** Deployment-selected liquidity materiality; absent preserves normal flow. */
-  readonly executionReassessment?: {
-    readonly maximumRetainedLiquidityFraction: Decimal;
-  };
   readonly passAuditMinimumEdge: Decimal;
   readonly reconciliationTolerance?: (riskEquity: Decimal) => Decimal;
   readonly executionCooldownMilliseconds?: Readonly<
@@ -90,23 +86,6 @@ export function assertStrategyPolicy(
     typeof policy.selectMemoryContext !== "function"
   )
     throw new TypeError("Strategy memory context selector must be a function");
-  if (policy.executionReassessment !== undefined) {
-    if (!isRecord(policy.executionReassessment)) {
-      throw new TypeError("Execution reassessment policy must be an object");
-    }
-    const fraction =
-      policy.executionReassessment.maximumRetainedLiquidityFraction;
-    if (
-      !Decimal.isDecimal(fraction) ||
-      !fraction.isFinite() ||
-      fraction.lte(0) ||
-      fraction.gte(1)
-    ) {
-      throw new RangeError(
-        "Execution reassessment retained liquidity fraction must be strictly between zero and one",
-      );
-    }
-  }
   if (
     policy.resolutionReview !== undefined &&
     (typeof policy.resolutionReview.selectMarketSlugs !== "function" ||

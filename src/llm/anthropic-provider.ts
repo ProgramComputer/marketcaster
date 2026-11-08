@@ -4,7 +4,6 @@ import type { AgentDecision } from "../agent/decision-schema.js";
 import { extractAnthropicEvidenceSources } from "../agent/evidence-provenance.js";
 import {
   type AgentInput,
-  type DecisionLimits,
   type DecisionCacheDiagnostic,
   type DecisionProviderTokenUsage,
   decisionToolResultTranscript,
@@ -18,7 +17,6 @@ import {
   FREE_TRADE_PLAN_SCHEMA_CORRECTION_TURNS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS,
-  parseExecutionReassessmentSubmission,
   type ReasoningEffort,
   resolveDecisionLimits,
   reviewDecisionSubmission,
@@ -486,9 +484,6 @@ export class AnthropicDecisionProvider implements DecisionProvider {
       limits.timeoutMilliseconds,
       input.signal,
       async (signal) => {
-        if (input.mode === "EXECUTION_REASSESSMENT") {
-          return this.reassessExecution(input, limits, signal);
-        }
         const researchSession = input.researchTools.createSession(limits);
         let serverWebSearchCount = 0;
         const messages: unknown[] = [
@@ -1250,193 +1245,5 @@ export class AnthropicDecisionProvider implements DecisionProvider {
         );
       },
     );
-  }
-
-  private async reassessExecution(
-    input: AgentInput,
-    limits: DecisionLimits,
-    signal: AbortSignal,
-  ): Promise<AgentDecision> {
-    const definition = input.researchTools.terminalSubmissionDefinition;
-    const thinks =
-      this.#extendedThinking ||
-      requiresAppendOnlyAnthropicConversation(this.modelId);
-    const comparedMessageId = this.#previousMessageId;
-    const requestBody = {
-      model: this.modelId,
-      max_tokens: limits.maximumOutputTokens,
-      system: [
-        {
-          type: "text",
-          text: input.prompt.system,
-          cache_control: ANTHROPIC_STABLE_CACHE_CONTROL,
-        },
-      ],
-      messages: [{ role: "user", content: input.prompt.user }],
-      tools: [
-        {
-          name: definition.name,
-          description: definition.description,
-          input_schema: definition.inputSchema,
-          cache_control: ANTHROPIC_STABLE_CACHE_CONTROL,
-        },
-      ],
-      cache_control: { type: "ephemeral" },
-      diagnostics: { previous_message_id: comparedMessageId },
-      tool_choice: thinks
-        ? { type: "auto" }
-        : { type: "tool", name: definition.name },
-      ...(requiresAppendOnlyAnthropicConversation(this.modelId)
-        ? { thinking: { type: "adaptive", display: "summarized" } }
-        : this.#extendedThinking
-          ? { thinking: { type: "adaptive" } }
-          : {}),
-      ...(this.#reasoningEffort === undefined
-        ? {}
-        : { output_config: { effort: this.#reasoningEffort } }),
-    };
-    await input.recordModelRequest?.(
-      decisionRequestProvenance({
-        round: 1,
-        provider: this.providerId,
-        model: this.modelId,
-        endpoint: ANTHROPIC_MESSAGES_ENDPOINT,
-        body: requestBody,
-        limits,
-        secretValues: [...(input.provenanceSecretValues ?? []), this.#apiKey],
-      }),
-    );
-    let responseBody: unknown;
-    let providerRequestAttempts = 1;
-    let observedTokenUsage: DecisionProviderTokenUsage | undefined;
-    let observedCacheDiagnostic: DecisionCacheDiagnostic | undefined;
-    let providerWebSearchCount = 0;
-    const toolCalls: DecisionToolCallTranscript[] = [];
-    const toolResults: DecisionToolResultTranscript[] = [];
-    try {
-      signal.throwIfAborted();
-      const providerRequest = await fetchProviderResponse({
-        providerName: "Anthropic",
-        fetchImplementation: this.#fetch,
-        url: ANTHROPIC_MESSAGES_ENDPOINT,
-        init: {
-          method: "POST",
-          headers: {
-            "x-api-key": this.#apiKey,
-            "anthropic-version": ANTHROPIC_API_VERSION,
-            "anthropic-beta": ANTHROPIC_CACHE_DIAGNOSTICS_BETA,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(requestBody),
-          signal,
-        },
-      });
-      providerRequestAttempts = providerRequest.attempts;
-      const { response } = providerRequest;
-      if (!response.ok) {
-        responseBody = { httpStatus: response.status };
-        throw await providerHttpError(response, providerRequest.attempts);
-      }
-      responseBody = await parseResponseJson(response);
-      const parsed = AnthropicResponseSchema.safeParse(responseBody);
-      if (!parsed.success) {
-        throw new DecisionProviderError(
-          "Anthropic execution reassessment returned an invalid API shape",
-          "INVALID_RESPONSE",
-          { cause: parsed.error },
-        );
-      }
-      this.#previousMessageId = parsed.data.id;
-      observedCacheDiagnostic = cacheDiagnostic(parsed.data);
-      const calls = parsed.data.content.flatMap((item) => {
-        const call = AnthropicToolUseSchema.safeParse(item);
-        return call.success ? [call.data] : [];
-      });
-      toolCalls.push(
-        ...calls.map((call) => ({
-          callId: call.id,
-          name: call.name,
-          input: call.input,
-        })),
-      );
-      providerWebSearchCount = Math.max(
-        parsed.data.usage?.server_tool_use?.web_search_requests ?? 0,
-        parsed.data.content.filter(
-          (item) =>
-            isRecord(item) &&
-            item.type === "server_tool_use" &&
-            item.name === "web_search",
-        ).length,
-      );
-      observedTokenUsage =
-        parsed.data.usage === undefined
-          ? undefined
-          : tokenUsage(parsed.data.usage);
-      if (parsed.data.stop_reason === "refusal") {
-        throw new DecisionProviderError(
-          "Anthropic declined the execution reassessment",
-          "REFUSAL",
-        );
-      }
-      const unexpectedContent = parsed.data.content.some(
-        (item) =>
-          !isRecord(item) ||
-          !["text", "thinking", "redacted_thinking", "tool_use"].includes(
-            String(item.type),
-          ) ||
-          (item.type === "tool_use" &&
-            !AnthropicToolUseSchema.safeParse(item).success),
-      );
-      if (
-        parsed.data.stop_reason !== "tool_use" ||
-        providerWebSearchCount > 0 ||
-        unexpectedContent ||
-        calls.length !== 1 ||
-        calls[0]?.name !== "submit_trade_plan"
-      ) {
-        throw new DecisionProviderError(
-          "Anthropic execution reassessment requires exactly one submit_trade_plan call and no other tools",
-          "INVALID_RESPONSE",
-        );
-      }
-      const call = calls[0];
-      const decision = parseExecutionReassessmentSubmission(call.input);
-      toolResults.push(
-        decisionToolResultTranscript(call.id, call.name, {
-          kind: "DECISION",
-          decision,
-        }),
-      );
-      signal.throwIfAborted();
-      return decision;
-    } catch (error) {
-      responseBody ??= {
-        executionReassessmentFailed: true,
-        code:
-          error instanceof DecisionProviderError
-            ? error.code
-            : signal.aborted
-              ? "ABORTED"
-              : "UNKNOWN",
-      };
-      throw error;
-    } finally {
-      await input.recordTranscriptRound?.({
-        round: 1,
-        modelId: this.modelId,
-        response: responseBody,
-        toolCalls,
-        toolResults,
-        providerWebSearchCount,
-        providerRequestAttempts,
-        diagnosticsPreviousMessageId: comparedMessageId,
-        ...(observedCacheDiagnostic === undefined
-          ? {}
-          : { cacheDiagnostic: observedCacheDiagnostic }),
-        ...(observedTokenUsage === undefined
-          ? {}
-          : { tokenUsage: observedTokenUsage }),
-      });
-    }
   }
 }

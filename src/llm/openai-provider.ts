@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
   type AgentInput,
-  type DecisionLimits,
   type DecisionProviderTokenUsage,
   decisionToolResultTranscript,
   type DecisionProvider,
@@ -16,7 +15,6 @@ import {
   FREE_TRADE_PLAN_SCHEMA_CORRECTION_TURNS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS,
   MAXIMUM_TERMINAL_DECISION_REPAIR_ROUNDS,
-  parseExecutionReassessmentSubmission,
   resolveDecisionLimits,
   reviewDecisionSubmission,
   runWithDecisionDeadline,
@@ -268,9 +266,6 @@ export class OpenAIDecisionProvider implements DecisionProvider {
       limits.timeoutMilliseconds,
       input.signal,
       async (signal) => {
-        if (input.mode === "EXECUTION_REASSESSMENT") {
-          return this.reassessExecution(input, limits, signal);
-        }
         const researchSession = input.researchTools.createSession(limits);
         let serverWebSearchCount = 0;
         const conversationInput: unknown[] = [
@@ -671,168 +666,5 @@ export class OpenAIDecisionProvider implements DecisionProvider {
         );
       },
     );
-  }
-
-  private async reassessExecution(
-    input: AgentInput,
-    limits: DecisionLimits,
-    signal: AbortSignal,
-  ): Promise<AgentDecision> {
-    const definition = input.researchTools.terminalSubmissionDefinition;
-    const providerTools = [
-      {
-        type: "function",
-        name: definition.name,
-        description: definition.description,
-        parameters: definition.inputSchema,
-        strict: true,
-      },
-    ];
-    const promptCacheKey = fingerprint({
-      model: this.modelId,
-      tools: providerTools,
-      instructions: input.prompt.system,
-    });
-    const requestBody = {
-      model: this.modelId,
-      prompt_cache_key: promptCacheKey,
-      instructions: input.prompt.system,
-      input: [
-        {
-          role: "user",
-          content: [{ type: "input_text", text: input.prompt.user }],
-        },
-      ],
-      tools: providerTools,
-      tool_choice: { type: "function", name: definition.name },
-      parallel_tool_calls: false,
-      max_output_tokens: limits.maximumOutputTokens,
-      store: false,
-    };
-    await input.recordModelRequest?.(
-      decisionRequestProvenance({
-        round: 1,
-        provider: this.providerId,
-        model: this.modelId,
-        endpoint: this.#responsesEndpoint,
-        body: requestBody,
-        limits,
-        secretValues: [...(input.provenanceSecretValues ?? []), this.#apiKey],
-      }),
-    );
-    let responseBody: unknown;
-    let providerRequestAttempts = 1;
-    let observedTokenUsage: DecisionProviderTokenUsage | undefined;
-    let providerWebSearchCount = 0;
-    const toolCalls: DecisionToolCallTranscript[] = [];
-    const toolResults: DecisionToolResultTranscript[] = [];
-    try {
-      signal.throwIfAborted();
-      const providerRequest = await fetchProviderResponse({
-        providerName: "OpenAI",
-        fetchImplementation: this.#fetch,
-        url: this.#responsesEndpoint,
-        init: {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${this.#apiKey}`,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(requestBody),
-          signal,
-        },
-      });
-      providerRequestAttempts = providerRequest.attempts;
-      const { response } = providerRequest;
-      if (!response.ok) {
-        responseBody = { httpStatus: response.status };
-        throw providerHttpError(response, providerRequest.attempts);
-      }
-      responseBody = await parseResponseJson(response);
-      const parsed = OpenAIResponseSchema.safeParse(responseBody);
-      if (!parsed.success) {
-        throw new DecisionProviderError(
-          "OpenAI execution reassessment returned an invalid API shape",
-          "INVALID_RESPONSE",
-          { cause: parsed.error },
-        );
-      }
-      const calls = parsed.data.output.flatMap((item) => {
-        const call = OpenAIFunctionCallSchema.safeParse(item);
-        return call.success ? [call.data] : [];
-      });
-      toolCalls.push(
-        ...calls.map((call) => ({
-          callId: call.call_id,
-          name: call.name,
-          input: transcriptArguments(call.arguments),
-        })),
-      );
-      providerWebSearchCount = parsed.data.output.filter(
-        (item) => isRecord(item) && item.type === "web_search_call",
-      ).length;
-      observedTokenUsage =
-        parsed.data.usage === undefined
-          ? undefined
-          : tokenUsage(parsed.data.usage);
-      const unexpectedOutput = parsed.data.output.some(
-        (item) =>
-          !isRecord(item) ||
-          !["reasoning", "message", "function_call"].includes(
-            String(item.type),
-          ) ||
-          (item.type === "function_call" &&
-            !OpenAIFunctionCallSchema.safeParse(item).success),
-      );
-      if (
-        (parsed.data.status !== undefined &&
-          parsed.data.status !== "completed") ||
-        unexpectedOutput ||
-        calls.length !== 1 ||
-        calls[0]?.name !== "submit_trade_plan"
-      ) {
-        throw new DecisionProviderError(
-          "OpenAI execution reassessment requires exactly one submit_trade_plan call and no other tools",
-          "INVALID_RESPONSE",
-        );
-      }
-      const call = calls[0];
-      const decision = parseExecutionReassessmentSubmission(
-        parseArguments(call.arguments),
-      );
-      toolResults.push(
-        decisionToolResultTranscript(call.call_id, call.name, {
-          kind: "DECISION",
-          decision,
-        }),
-      );
-      signal.throwIfAborted();
-      return decision;
-    } catch (error) {
-      responseBody ??= {
-        executionReassessmentFailed: true,
-        code:
-          error instanceof DecisionProviderError
-            ? error.code
-            : signal.aborted
-              ? "ABORTED"
-              : "UNKNOWN",
-      };
-      throw error;
-    } finally {
-      await input.recordTranscriptRound?.({
-        round: 1,
-        modelId: this.modelId,
-        response: responseBody,
-        toolCalls,
-        toolResults,
-        providerWebSearchCount,
-        providerRequestAttempts,
-        promptCacheKey,
-        ...(observedTokenUsage === undefined
-          ? {}
-          : { tokenUsage: observedTokenUsage }),
-      });
-    }
   }
 }

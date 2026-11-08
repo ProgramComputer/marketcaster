@@ -1,9 +1,6 @@
 import { z } from "zod";
 import type { AgentConfig } from "../config/schema.js";
-import {
-  type AgentDecision,
-  parseModelAgentDecision,
-} from "../agent/decision-schema.js";
+import type { AgentDecision } from "../agent/decision-schema.js";
 import type { EvidenceValidationIssue } from "../agent/evidence-provenance.js";
 import { modelJson } from "../agent/model-view.js";
 import type { DecisionPrompt } from "../agent/prompt-builder.js";
@@ -93,8 +90,6 @@ const PartialDecisionLimitsSchema = z
   .strict();
 
 export interface AgentInput {
-  /** One submit-only response; never creates or reopens a research session. */
-  readonly mode?: "EXECUTION_REASSESSMENT";
   readonly prompt: DecisionPrompt;
   readonly researchTools: DecisionResearchTools;
   readonly limits?: Partial<DecisionLimits>;
@@ -243,22 +238,6 @@ export class DecisionProviderError extends Error {
   ) {
     super(message, options);
     this.name = "DecisionProviderError";
-  }
-}
-
-/** A malformed execution-only response cannot open a correction round. */
-export function parseExecutionReassessmentSubmission(
-  value: unknown,
-): AgentDecision {
-  try {
-    return parseModelAgentDecision(value);
-  } catch (error) {
-    if (!(error instanceof z.ZodError)) throw error;
-    throw new DecisionProviderError(
-      "Execution reassessment submitted an invalid complete trade plan",
-      "INVALID_DECISION",
-      { cause: error },
-    );
   }
 }
 
