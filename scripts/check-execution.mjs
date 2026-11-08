@@ -1234,7 +1234,7 @@ await (async () => {
                   ? "FILLED"
                   : "PARTIAL",
           filledQuantity: filled,
-          remainingQuantity: stored.remainingQuantity,
+          remainingQuantity: order.quantity.minus(filled),
           averageFillPrice: stored.averageFillPrice,
           fees: stored.fees,
           finalState: state,
