@@ -102,6 +102,15 @@ export function isReconcilableBuyOrder(order: ImmediateOrder): boolean {
   return order.action === "BUY" && order.marketId.exchange === "polymarket-us";
 }
 
+/** A finished IOC reports nothing left or exactly its expired remainder. */
+function isFinishedIocRemainder(
+  order: ImmediateOrder,
+  filled: Decimal,
+  remaining: Decimal,
+): boolean {
+  return remaining.eq(0) || remaining.eq(order.quantity.minus(filled));
+}
+
 function unfilledReservation(buy: SubmittedBuy, filled: Decimal): Decimal {
   return buy.terminalResult === undefined
     ? buy.order.quantity.minus(filled).mul(buy.order.canonicalLimitPrice)
@@ -267,7 +276,12 @@ export class ManagedBuyBatch {
       (!TERMINAL.has(result.finalState) ||
         !["FILLED", "PARTIAL"].includes(result.status) ||
         filledQuantity.lte(0) ||
-        result.remainingQuantity?.eq(0) === false)
+        (result.remainingQuantity !== undefined &&
+          !isFinishedIocRemainder(
+            order,
+            filledQuantity,
+            result.remainingQuantity,
+          )))
     ) {
       fail("IOC BUY fill is not a verified terminal submission");
     }
@@ -326,7 +340,8 @@ export class ManagedBuyBatch {
       (terminal !== undefined &&
         (active ||
           !filled.eq(terminal.filledQuantity) ||
-          reported.remainingQuantity?.eq(0) !== true ||
+          remaining === undefined ||
+          !isFinishedIocRemainder(buy.order, filled, remaining) ||
           reported.fees?.eq(terminal.fees) !== true ||
           reported.averageFillPrice?.eq(terminal.averageFillPrice ?? -1) !==
             true)) ||
@@ -337,7 +352,7 @@ export class ManagedBuyBatch {
       (active &&
         (filled.gte(buy.order.quantity) ||
           remaining?.eq(buy.order.quantity.minus(filled)) !== true)) ||
-      (!active && remaining?.eq(0) === false) ||
+      (!active && terminal === undefined && remaining?.eq(0) === false) ||
       (["FILLED", "CLEARED"].includes(reported.state) &&
         !filled.eq(buy.order.quantity))
     ) {
