@@ -10,6 +10,17 @@ evidence retrieval utilities. It receives no exchange mutation methods. Modules
 run as trusted local code, not in a sandbox.
 
 - Selection returns a bounded research board and optional required inspections.
+- Optional `selection.selectResearchContinuationMarketSlugs(board)` returns an
+  ordered list of supplied board slugs. With pass research enabled, a no-order
+  decision must continue inspecting these candidates when none inspected qualify
+  and the existing research budget permits it. Unknown slugs or invalid return
+  values fail closed; duplicates are removed. Successful family inspection covers
+  only the members actually returned. The hook adds no market preferences to the
+  reference policy and does not require an order. Request or round limits leave
+  explicit incomplete coverage in the existing pass-research report.
+  Continuation uses the original provider session and deadline; it does not open
+  substantive repair rounds. Existing evidence, risk, and execution guards still
+  apply. The hook is skipped when new entries are blocked by catalog policy.
 - Forecasting returns derived probabilities and an agreement tolerance. A forecast
   is distinct from an observed source fact and authoritative settlement.
 - Allocation receives scalar copies of already-assessed candidates and returns

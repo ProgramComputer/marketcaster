@@ -233,6 +233,67 @@ await (async () => {
       2,
       "Reserved submission shares the original decision deadline",
     );
+
+    // Continuing research cannot claim substantive-repair rounds or a new deadline.
+    const signals = [];
+    const continuation = harness([valid, valid, valid], {
+      inputOptions: {
+        limits: {
+          maximumRounds: 3,
+          maximumWebSearches: 0,
+          timeoutMilliseconds: 5000,
+        },
+        reviewTerminalDecision: async () => ({
+          repair: false,
+          continueResearch: true,
+          feedback,
+        }),
+      },
+      fetchHook: async (_count, signal) => {
+        signals.push(signal);
+      },
+    });
+    await continuation.decide();
+    assert.equal(continuation.requests.length, 3);
+    assert.ok(
+      signals.every((signal) => signal === signals[0]),
+      "Continuation shares the original deadline signal",
+    );
+    assert.equal(
+      continuation.transcript[0].toolResults[0].result.content.code,
+      "RESEARCH_CONTINUATION_REQUIRED",
+    );
+    assert.equal(
+      continuation.transcript[2].toolResults[0].result.kind,
+      "DECISION",
+    );
+    const continuationTimeout = harness([valid, valid], {
+      inputOptions: {
+        limits: {
+          maximumRounds: 3,
+          maximumWebSearches: 0,
+          timeoutMilliseconds: 50,
+        },
+        reviewTerminalDecision: async () => ({
+          repair: false,
+          continueResearch: true,
+          feedback,
+        }),
+      },
+      fetchHook: async (count, signal) => {
+        if (count === 2)
+          await new Promise((_resolve, reject) => {
+            const abort = () => reject(signal.reason);
+            signal.addEventListener("abort", abort, { once: true });
+            if (signal.aborted) abort();
+          });
+      },
+    });
+    await assert.rejects(
+      continuationTimeout.decide(),
+      (error) => error.code === "TIMEOUT",
+    );
+    assert.equal(continuationTimeout.requests.length, 2);
   }
 })();
 

@@ -128,7 +128,12 @@ export interface TerminalDecisionRepairFeedback {
 }
 
 export type TerminalDecisionReview =
-  | { readonly repair: false }
+  | { readonly repair: false; readonly continueResearch?: false }
+  | {
+      readonly repair: false;
+      readonly continueResearch: true;
+      readonly feedback: TerminalDecisionRepairFeedback;
+    }
   | {
       readonly repair: true;
       readonly feedback: TerminalDecisionRepairFeedback;
@@ -400,7 +405,7 @@ export function decisionToolResultTranscript(
 export type TerminalDecisionDisposition =
   | { readonly kind: "FINAL" }
   | {
-      readonly kind: "REPAIR";
+      readonly kind: "REPAIR" | "CONTINUE_RESEARCH";
       readonly toolResult: Extract<
         ToolExecutionResult,
         { kind: "TOOL_RESULT" }
@@ -412,8 +417,26 @@ export async function reviewDecisionSubmission(
   decision: AgentDecision,
   signal: AbortSignal,
   repairAttemptsOffered: number,
+  canContinueResearch = false,
 ): Promise<TerminalDecisionDisposition> {
   const review = await input.reviewTerminalDecision?.(decision, signal);
+  if (review?.repair === false && review.continueResearch === true) {
+    if (!canContinueResearch) return { kind: "FINAL" };
+    return {
+      kind: "CONTINUE_RESEARCH",
+      toolResult: {
+        kind: "TOOL_RESULT",
+        content: modelJson({
+          ok: false,
+          code: "RESEARCH_CONTINUATION_REQUIRED",
+          message:
+            "Continue research within the original remaining rounds, requests, and deadline, then submit a complete plan. No additional budget is granted. If coverage remains incomplete at the limit, state that limitation in the cycle summary.",
+          feedback: review.feedback,
+        }),
+        isError: true,
+      },
+    };
+  }
   if (review?.repair !== true) {
     return { kind: "FINAL" };
   }

@@ -714,6 +714,7 @@ export interface PassResearchReadiness {
   readonly allowed: boolean;
   readonly status: PassResearchGateStatus;
   readonly unmet: readonly string[];
+  readonly continuation?: ResearchContinuationReadiness;
   readonly successfulDiscoveryRequests: number;
   readonly distinctDiscoveryModes: number;
   readonly inspectedMarkets: number;
@@ -731,6 +732,15 @@ export interface PassResearchReadiness {
   readonly requiredPriorityEvidenceMarketSlugs: readonly string[];
   readonly priorityEvidenceAttemptedMarketSlugs: readonly string[];
   readonly priorityEvidenceAttemptCounts: Readonly<Record<string, number>>;
+}
+
+export interface ResearchContinuationReadiness {
+  readonly pendingMarketSlugs: readonly string[];
+  readonly remainingDetailRequests: number;
+  readonly canContinue: boolean;
+  readonly stopReason?:
+    "FINAL_ROUND" | "DETAIL_BUDGET_EXHAUSTED" | "DETAILS_UNAVAILABLE";
+  readonly requirement: string;
 }
 
 export interface ResearchGroupingDiagnostics {
@@ -782,6 +792,7 @@ export interface DecisionResearchToolsOptions {
   readonly agentNotesHandler?: AgentNotesHandler;
   readonly agentStateHandler?: AgentStateHandler;
   readonly candidateFamilies?: readonly CandidateFamilySeed[];
+  readonly researchContinuationMarketSlugs?: readonly string[];
   /** Discovery-only aliases for catalog siblings not present on the board. */
   readonly researchFamilyAliases?: ReadonlyMap<string, string>;
   /** Strategy-selected candidates that require inspection and source-linked follow-through. */
@@ -2125,6 +2136,7 @@ export class DecisionResearchTools {
   private readonly agentNotesHandler: AgentNotesHandler | undefined;
   private readonly agentStateHandler: AgentStateHandler | undefined;
   private readonly candidateFamilies: readonly CandidateFamilySeed[];
+  private readonly researchContinuationMarketSlugs: readonly string[];
   private readonly researchFamilyAliases: ReadonlyMap<string, string>;
   private readonly requiredPriorityEvidenceMarketSlugs: ReadonlySet<string>;
   private readonly passResearchRequirements:
@@ -2189,6 +2201,26 @@ export class DecisionResearchTools {
     this.agentStateHandler = options.agentStateHandler;
     this.candidateFamilies = Object.freeze([
       ...(options.candidateFamilies ?? []),
+    ]);
+    const configuredContinuationSlugs: unknown =
+      options.researchContinuationMarketSlugs;
+    const continuationSlugs = configuredContinuationSlugs ?? [];
+    const suppliedSlugs = new Set(
+      this.candidateFamilies.map((item) => item.marketSlug),
+    );
+    if (
+      configuredContinuationSlugs === null ||
+      !Array.isArray(continuationSlugs) ||
+      continuationSlugs.some(
+        (slug: unknown) => typeof slug !== "string" || !suppliedSlugs.has(slug),
+      )
+    ) {
+      throw new TypeError(
+        "Research continuation must select supplied candidate market slugs",
+      );
+    }
+    this.researchContinuationMarketSlugs = Object.freeze([
+      ...new Set(continuationSlugs as string[]),
     ]);
     const researchFamilyAliases = new Map<string, string>();
     for (const [marketSlug, familyKey] of options.researchFamilyAliases ?? []) {
@@ -2522,6 +2554,7 @@ export class DecisionResearchTools {
       (slug) => this.previewedSlugs.add(slug),
       this.forecastPolicy,
       this.requiredResearchGate,
+      this.researchContinuationMarketSlugs,
     );
     this.activeSession = session;
     return session;
@@ -2611,6 +2644,7 @@ export class DecisionResearchSession {
     private readonly recordPreviewed: (slug: string) => void,
     private readonly forecastPolicy?: ForecastPolicy,
     private readonly requiredResearchGate?: SelectionPolicy["shouldEnforceRequiredResearch"],
+    private readonly researchContinuationMarketSlugs: readonly string[] = [],
   ) {
     for (const candidate of candidateFamilies) {
       this.candidateFamilyBySlug.set(
@@ -2713,6 +2747,16 @@ export class DecisionResearchSession {
     return this.terminalDecisionSubmitted;
   }
 
+  /** Resume the same session without granting rounds, requests, or a new deadline. */
+  public continueResearch(): void {
+    if (!this.terminalDecisionSubmitted || this.forcedFinalRound) {
+      throw new Error(
+        "Research continuation requires a non-final submitted decision",
+      );
+    }
+    this.terminalDecisionSubmitted = false;
+  }
+
   public get evidenceReadBudgetExhausted(): boolean {
     return (
       this.evidenceSourceReadCount >=
@@ -2809,6 +2853,55 @@ export class DecisionResearchSession {
   }
 
   private resolvePassReadiness(allowWaivers: boolean): PassResearchReadiness {
+    const readiness = this.resolveMinimumPassReadiness(allowWaivers);
+    if (
+      this.passResearchRequirements === undefined ||
+      this.qualifiedSlugs.size > 0
+    )
+      return readiness;
+    const pendingMarketSlugs = this.researchContinuationMarketSlugs.filter(
+      (slug) => !this.inspectedSlugs.has(slug),
+    );
+    if (pendingMarketSlugs.length === 0) return readiness;
+    const remainingDetailRequests = Math.max(
+      0,
+      this.limits.maximumMarketDetailRequests - this.marketDetailRequestCount,
+    );
+    const stopReason = this.forcedFinalRound
+      ? ("FINAL_ROUND" as const)
+      : remainingDetailRequests === 0
+        ? ("DETAIL_BUDGET_EXHAUSTED" as const)
+        : this.marketDetailsHandler === undefined &&
+            this.marketFamilyDetailsHandler === undefined
+          ? ("DETAILS_UNAVAILABLE" as const)
+          : undefined;
+    const requirement = `Research coverage is incomplete: ${pendingMarketSlugs.length} selected candidate(s) remain uninspected (${pendingMarketSlugs.join(", ")}). ${
+      stopReason === undefined
+        ? `Check the executable book for ${pendingMarketSlugs[0]} next, using the existing research budget.`
+        : `Further inspection stopped: ${stopReason}. State this coverage limitation in the cycle summary.`
+    } No qualifying inspected candidate does not establish that the remaining candidates lack opportunity.`;
+    const continuation: ResearchContinuationReadiness = {
+      pendingMarketSlugs,
+      remainingDetailRequests,
+      canContinue: stopReason === undefined,
+      ...(stopReason === undefined ? {} : { stopReason }),
+      requirement,
+    };
+    return {
+      ...readiness,
+      allowed: readiness.allowed && allowWaivers && stopReason !== undefined,
+      status:
+        allowWaivers && stopReason !== undefined && readiness.allowed
+          ? "INCOMPLETE_NO_ORDERS"
+          : "REQUIRED",
+      unmet: [...readiness.unmet, requirement],
+      continuation,
+    };
+  }
+
+  private resolveMinimumPassReadiness(
+    allowWaivers: boolean,
+  ): PassResearchReadiness {
     const requirements = this.passResearchRequirements;
     const qualifiedCandidateReviews = [...this.qualifiedAnalysisSlugs].filter(
       (slug) => this.qualifiedPreviewSlugs.has(slug),

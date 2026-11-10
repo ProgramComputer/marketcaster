@@ -1152,6 +1152,10 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                     result.decision,
                     signal,
                     repairAttemptsOffered,
+                    !finalRound &&
+                      !schemaCorrectionRound &&
+                      !repairActive &&
+                      initialRounds < limits.maximumRounds,
                   );
                   if (disposition.kind === "FINAL") {
                     transcriptToolResults.push(
@@ -1159,12 +1163,16 @@ export class AnthropicDecisionProvider implements DecisionProvider {
                     );
                     return result.decision;
                   }
-                  repairAttemptsOffered += 1;
-                  repairActive = true;
-                  repairRounds = 0;
-                  researchSession.reopenForTerminalDecisionRepair(
-                    MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS,
-                  );
+                  if (disposition.kind === "CONTINUE_RESEARCH") {
+                    researchSession.continueResearch();
+                  } else {
+                    repairAttemptsOffered += 1;
+                    repairActive = true;
+                    repairRounds = 0;
+                    researchSession.reopenForTerminalDecisionRepair(
+                      MAXIMUM_TERMINAL_DECISION_REPAIR_ATTEMPTS,
+                    );
+                  }
                   transcriptToolResults.push(
                     decisionToolResultTranscript(
                       call.id,

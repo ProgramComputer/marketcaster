@@ -110,6 +110,7 @@ export function assertStrategyPolicy(
     "shouldFetchFamilyBook",
     "allowWebSearch",
     "shouldEnforceRequiredResearch",
+    "selectResearchContinuationMarketSlugs",
     "buildCriticalLearning",
   ] as const) {
     if (

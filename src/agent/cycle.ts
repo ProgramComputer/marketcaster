@@ -120,6 +120,7 @@ import {
   type EvidenceValidationReport,
 } from "./evidence-provenance.js";
 import { buildDecisionPrompt } from "./prompt-builder.js";
+import { selectResearchContinuationCandidates } from "./opportunity-board.js";
 import { toModelSide } from "./model-view.js";
 import {
   provenanceIdentityFromEnvironment,
@@ -1710,6 +1711,13 @@ export async function runCycle(
         })),
       ],
       researchFamilyAliases,
+      researchContinuationMarketSlugs:
+        newEntriesBlocked !== undefined
+          ? []
+          : selectResearchContinuationCandidates(
+              strategy.selection,
+              opportunityBoard,
+            ),
       requiredPriorityEvidenceMarketSlugs: [
         ...requiredPassedPriorityMarketSlugs,
       ],
@@ -2070,8 +2078,14 @@ export async function runCycle(
               dependencies.config.risk.minimumIndependentSources,
             );
             const passReadiness = researchTools.strictPassResearchReadiness;
+            const minimumPassUnmet = passReadiness.unmet.filter(
+              (requirement) =>
+                requirement !== passReadiness.continuation?.requirement,
+            );
             const passFeedback =
-              candidatePlan.riskProposals.length === 0 && !passReadiness.allowed
+              candidatePlan.riskProposals.length === 0 &&
+              !passReadiness.allowed &&
+              minimumPassUnmet.length > 0
                 ? ({
                     acceptedProposalIndexes: [],
                     rejectedProposals: candidateDecision.portfolioTargets.map(
@@ -2081,12 +2095,12 @@ export async function runCycle(
                         side: target.side,
                         action: "TARGET",
                         code: "PASS_RESEARCH_REQUIRED",
-                        reason: `The target produced no order delta and no-order research qualification remains incomplete: ${passReadiness.unmet.join("; ")}`,
+                        reason: `The target produced no order delta and no-order research qualification remains incomplete: ${minimumPassUnmet.join("; ")}`,
                         repairable: true,
                       }),
                     ),
                     instructions: [
-                      `No-order research qualification is incomplete: ${passReadiness.unmet.join("; ")}.`,
+                      `No-order research qualification is incomplete: ${minimumPassUnmet.join("; ")}.`,
                       "Complete every listed successful research action, then resubmit the complete target plan. A forced final round does not waive this requirement.",
                     ],
                   } satisfies TerminalDecisionRepairFeedback)
@@ -2154,6 +2168,21 @@ export async function runCycle(
             // obtain fresh live evidence. Authoritative final validation still
             // runs, so a quote that returns before execution remains eligible.
             if (quoteMovedOnly) return { repair: false };
+            if (
+              feedback === undefined &&
+              candidatePlan.riskProposals.length === 0 &&
+              passReadiness.continuation?.canContinue === true
+            ) {
+              return {
+                repair: false,
+                continueResearch: true,
+                feedback: {
+                  acceptedProposalIndexes: [],
+                  rejectedProposals: [],
+                  instructions: [passReadiness.continuation.requirement],
+                },
+              };
+            }
             return feedback === undefined ||
               (guardFeedback === undefined &&
                 passFeedback === undefined &&

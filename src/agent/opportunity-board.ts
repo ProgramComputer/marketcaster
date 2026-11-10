@@ -104,6 +104,10 @@ export interface SelectionPolicy {
     board: readonly OpportunityBoardItem[],
     maximum?: number,
   ) => readonly string[];
+  /** Ordered, supplied candidates to inspect before concluding none qualify. */
+  readonly selectResearchContinuationMarketSlugs?: (
+    board: readonly OpportunityBoardItem[],
+  ) => readonly string[];
   readonly experimentDefinition?: SelectionExperimentDefinition;
 }
 
@@ -114,6 +118,26 @@ export const selectionPolicyApi = Object.freeze({
   MAXIMUM_SCOUT_FAMILIES,
   isTradeableEnrichment,
 });
+
+export function selectResearchContinuationCandidates(
+  policy: SelectionPolicy,
+  board: readonly OpportunityBoardItem[],
+): readonly string[] {
+  if (policy.selectResearchContinuationMarketSlugs === undefined) return [];
+  const selected: unknown = policy.selectResearchContinuationMarketSlugs(board);
+  const supplied = new Set(board.map((item) => item.slug));
+  if (
+    !Array.isArray(selected) ||
+    selected.some(
+      (slug: unknown) => typeof slug !== "string" || !supplied.has(slug),
+    )
+  ) {
+    throw new TypeError(
+      "Research continuation selector must return supplied board market slugs",
+    );
+  }
+  return Object.freeze([...new Set(selected as string[])]);
+}
 
 export type SelectionPolicyApi = typeof selectionPolicyApi;
 

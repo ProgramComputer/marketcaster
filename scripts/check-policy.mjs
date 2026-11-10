@@ -183,6 +183,13 @@ await (async () => {
       { ...strategy, selection: { ...strategy.selection, allowWebSearch: 7 } },
       {
         ...strategy,
+        selection: {
+          ...strategy.selection,
+          selectResearchContinuationMarketSlugs: 7,
+        },
+      },
+      {
+        ...strategy,
         selection: { ...strategy.selection, depthPriceBand: new Decimal(-1) },
       },
       {
