@@ -25,7 +25,7 @@ await (async () => {
     "BUY",
   );
 
-  assert.equal(priceSpecificFee.toFixed(6), "0.001362");
+  assert.equal(priceSpecificFee.toFixed(6), "0.001862");
   assert.equal(cashReserve.toFixed(3), "0.020");
   assert.equal(
     feeForEdgeEvaluation(
@@ -33,11 +33,11 @@ await (async () => {
       priceSpecificFee,
       cashReserve,
     ).toFixed(6),
-    "0.001362",
+    "0.001862",
   );
   assert.equal(
     calculateNetEdge(probability, price, priceSpecificFee).toFixed(6),
-    "0.013638",
+    "0.013138",
   );
   assert.equal(
     feeForEdgeEvaluation("kalshi", priceSpecificFee, cashReserve).toFixed(3),
@@ -131,11 +131,11 @@ await (async () => {
     assert.equal(result.rejected.length, 0, JSON.stringify(result.rejected));
     assert.equal(result.accepted.length, 1);
     const accepted = result.accepted[0];
-    assert.equal(accepted.order.quantity.toString(), "10");
-    assert.equal(accepted.estimatedFees.toString(), "0.01");
-    assert.equal(accepted.conservativeFeeReserve.toString(), "0.17");
-    assert.equal(accepted.maximumExecutionSpend.toString(), "9.97");
-    assert.equal(accepted.netEdge.toString(), "0.014");
+    assert.equal(accepted.order.quantity.toString(), "9");
+    assert.equal(accepted.estimatedFees.toString(), "0.02");
+    assert.equal(accepted.conservativeFeeReserve.toString(), "0.21");
+    assert.equal(accepted.maximumExecutionSpend.toString(), "9.03");
+    assert.equal(accepted.netEdge.toFixed(6), "0.012778");
     assert.ok(accepted.maximumExecutionSpend.lte(accepted.riskBudget));
     assert.ok(
       accepted.maximumExecutionSpend.lte(
@@ -360,11 +360,11 @@ await (async () => {
   }
 
   for (const [point, edge, status, issueCount] of [
-    ["0.507375", "-0.01", "NON_POSITIVE", 0],
-    ["0.517375", "0", "NON_POSITIVE", 0],
-    ["0.522375", "0.005", "POSITIVE_NOT_MATERIAL", 0],
-    ["0.527375", "0.01", "POSITIVE_NOT_MATERIAL", 0],
-    ["0.537375", "0.02", "MATERIAL_POSITIVE", 1],
+    ["0.51375", "-0.01", "NON_POSITIVE", 0],
+    ["0.52375", "0", "NON_POSITIVE", 0],
+    ["0.52875", "0.005", "POSITIVE_NOT_MATERIAL", 0],
+    ["0.53375", "0.01", "POSITIVE_NOT_MATERIAL", 0],
+    ["0.54375", "0.02", "MATERIAL_POSITIVE", 1],
   ]) {
     const report = await audit(point);
     const check = report.checks.find((row) => row.evaluatedSide === "YES");
@@ -398,19 +398,21 @@ await (async () => {
     estimateExchangeTakerFeePerContract,
     estimatePolymarketUsFillFee,
     estimatePolymarketUsTakerFeeUpperBound,
+    POLYMARKET_US_TAKER_FEE_THETA,
   } = await import("../dist/src/risk/edge.js");
   const { PolymarketUsExchange } =
     await import("../dist/src/exchanges/polymarket-us/adapter.js");
   const d = (v) => new Decimal(v);
-  // Official schedule: https://docs.polymarket.us/fees (2026-09-17).
+  // Official schedule: https://docs.polymarket.us/fees (2026-11-11), highest
+  // taker coefficient and no maker rebate.
   for (const [price, taker, maker] of [
-    ["0.01", "0.07", "-0.01"],
-    ["0.10", "0.63", "-0.11"],
-    ["0.25", "1.30", "-0.23"],
-    ["0.50", "1.74", "-0.31"],
-    ["0.75", "1.30", "-0.23"],
-    ["0.90", "0.63", "-0.11"],
-    ["0.99", "0.07", "-0.01"],
+    ["0.01", "0.09", "0.00"],
+    ["0.10", "0.86", "0.00"],
+    ["0.25", "1.78", "0.00"],
+    ["0.50", "2.38", "0.00"],
+    ["0.75", "1.78", "0.00"],
+    ["0.90", "0.86", "0.00"],
+    ["0.99", "0.09", "0.00"],
   ]) {
     assert.equal(
       estimateExchangeTakerFee("polymarket-us", d(100), d(price)).toFixed(2),
@@ -423,19 +425,17 @@ await (async () => {
   }
   assert(
     estimateExchangeTakerFeePerContract("polymarket-us", d("0.5")).eq(
-      "0.017375",
+      "0.02375",
     ),
   );
   assert(
     estimateExchangeTakerFeePerContract("polymarket-us", d("0.5"))
       .div("0.5")
-      .eq("0.03475"),
+      .eq("0.0475"),
   );
-  // Exact half-cent ties in both directions, including negative maker rebates.
-  assert(estimatePolymarketUsFillFee(d(40), d("0.5"), "TAKER").eq("0.70")); // .695
-  assert(estimatePolymarketUsFillFee(d(120), d("0.5"), "TAKER").eq("2.08")); // 2.085
-  assert(estimatePolymarketUsFillFee(d(8), d("0.5"), "MAKER").eq("-0.02")); // -.025
-  assert(estimatePolymarketUsFillFee(d("11.2"), d("0.5"), "MAKER").eq("-0.04")); // -.035
+  // Exact half-cent ties in both directions.
+  assert(estimatePolymarketUsFillFee(d(20), d("0.5"), "TAKER").eq("0.48")); // .475
+  assert(estimatePolymarketUsFillFee(d(60), d("0.5"), "TAKER").eq("1.42")); // 1.425
   assert(estimatePolymarketUsFillFee(d("0.01"), d("0.01"), "TAKER").isZero());
   assert(estimatePolymarketUsFillFee(d(0), d("0.5"), "TAKER").isZero());
 
@@ -475,7 +475,7 @@ await (async () => {
                     .mul(index % 2 ? "0.5" : 0),
                 );
           cumulativeExact = cumulativeExact.plus(
-            estimateTakerFee(d(quantity), price),
+            estimateTakerFee(d(quantity), price, POLYMARKET_US_TAKER_FEE_THETA),
           );
           const roundedFill = estimatePolymarketUsFillFee(
             d(quantity),

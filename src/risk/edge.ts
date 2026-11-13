@@ -1,8 +1,12 @@
 import { Decimal } from "decimal.js";
 
-// https://docs.polymarket.us/fees — effective September 17, 2026.
+// https://docs.polymarket.us/fees — effective November 11, 2026. Taker fees are
+// tiered by 30-day taker volume; the coefficient below $10,000 is the highest,
+// so it bounds every account's tier. Maker rebates start at $10,000,000 of
+// maker volume, so none is credited.
+export const POLYMARKET_US_TAKER_FEE_THETA = new Decimal("0.095");
+export const POLYMARKET_US_MAKER_FEE_THETA = new Decimal("0");
 export const DEFAULT_TAKER_FEE_THETA = new Decimal("0.0695");
-export const POLYMARKET_US_MAKER_FEE_THETA = new Decimal("-0.0125");
 export const KALSHI_TAKER_FEE_THETA = new Decimal("0.07");
 const KALSHI_ROUNDING_RESERVE = new Decimal("0.01");
 const KALSHI_FEE_ROUNDING_INCREMENT = new Decimal("0.0001");
@@ -76,7 +80,7 @@ export function estimatePolymarketUsFillFee(
     price,
     liquidity === "MAKER"
       ? POLYMARKET_US_MAKER_FEE_THETA
-      : DEFAULT_TAKER_FEE_THETA,
+      : POLYMARKET_US_TAKER_FEE_THETA,
   ).toDecimalPlaces(2, Decimal.ROUND_HALF_EVEN);
 }
 
@@ -94,6 +98,7 @@ export function estimatePolymarketUsTakerFeeUpperBound(
     quantity,
     canonicalLimitPrice,
     action,
+    POLYMARKET_US_TAKER_FEE_THETA,
   ).toDecimalPlaces(2, Decimal.ROUND_HALF_EVEN);
 }
 
@@ -138,7 +143,8 @@ export function estimateExchangeTakerFeePerContract(
 ): Decimal {
   // A unit rate for price guards is not a one-contract fill; round only once
   // the actual candidate quantity is known.
-  if (exchangeId === "polymarket-us") return estimateTakerFeePerContract(price);
+  if (exchangeId === "polymarket-us")
+    return estimateTakerFeePerContract(price, POLYMARKET_US_TAKER_FEE_THETA);
   return estimateExchangeTakerFee(exchangeId, new Decimal(1), price);
 }
 
