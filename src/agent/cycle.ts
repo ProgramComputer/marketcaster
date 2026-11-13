@@ -2196,16 +2196,79 @@ export async function runCycle(
         }),
       overallController.signal,
     );
-    const rawDecision = retainPositionReductionRequests(
+    let rawDecision = retainPositionReductionRequests(
       submittedDecision,
       retainedReductionDecision,
       blockedReductionMarketSlugs,
     );
     const decisionReturnedAt = safeTimestamp(now).toISOString();
-    const finalGuards = await validateDecisionGuards(
+    let finalGuards = await validateDecisionGuards(
       rawDecision,
       overallController.signal,
     );
+    // After bounded repair, a new entry whose evidence still fails becomes a
+    // pass rather than failing the whole cycle. Only targets in markets with
+    // no current position qualify, and the reduced plan must pass every guard.
+    const blocksOnlyByEvidence =
+      !finalGuards.evidence.valid &&
+      finalGuards.coverage.issues.every(
+        (issue) => issue.code === "CONTRADICTORY_NO_POSITIVE_EDGE",
+      );
+    const failedEntrySlugs = new Set(
+      finalGuards.evidence.issues.map((issue) => issue.marketSlug),
+    );
+    const heldSlugs = new Set(
+      initialSnapshot.positions
+        .filter((position) => position.quantity.gt(0))
+        .map((position) => position.marketSlug),
+    );
+    const targetSlugs = new Set(
+      rawDecision.portfolioTargets.map((target) => target.marketSlug),
+    );
+    if (
+      blocksOnlyByEvidence &&
+      failedEntrySlugs.size > 0 &&
+      [...failedEntrySlugs].every(
+        (slug) => targetSlugs.has(slug) && !heldSlugs.has(slug),
+      )
+    ) {
+      const demoted = {
+        ...rawDecision,
+        portfolioTargets: rawDecision.portfolioTargets.filter(
+          (target) => !failedEntrySlugs.has(target.marketSlug),
+        ),
+        candidateDispositions: [
+          ...rawDecision.candidateDispositions,
+          ...rawDecision.portfolioTargets
+            .filter((target) => failedEntrySlugs.has(target.marketSlug))
+            .map((target) => ({
+              marketSlug: target.marketSlug,
+              side: target.side,
+              outcome: "PASS" as const,
+              reasonCode: "INSUFFICIENT_CURRENT_EVIDENCE" as const,
+              rationale:
+                "Evidence for this new entry failed deterministic verification after bounded repair.",
+              evidence: [],
+            })),
+        ],
+      };
+      const demotedGuards = await validateDecisionGuards(
+        demoted,
+        overallController.signal,
+      );
+      if (
+        demotedGuards.evidence.valid &&
+        demotedGuards.coverage.issues.every(
+          (issue) => issue.code === "CONTRADICTORY_NO_POSITIVE_EDGE",
+        )
+      ) {
+        warnings.push(
+          `Passed ${failedEntrySlugs.size} new entr${failedEntrySlugs.size === 1 ? "y" : "ies"} whose evidence failed verification after bounded repair: ${[...failedEntrySlugs].join(", ")}`,
+        );
+        rawDecision = demoted;
+        finalGuards = demotedGuards;
+      }
+    }
     const submissionHistory = summarizeDecisionSubmissions(
       decisionSubmissions,
       rawDecision.portfolioTargets,
