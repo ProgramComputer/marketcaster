@@ -2168,19 +2168,26 @@ export async function runCycle(
             // obtain fresh live evidence. Authoritative final validation still
             // runs, so a quote that returns before execution remains eligible.
             if (quoteMovedOnly) return { repair: false };
+            // Continuation is offered before repair because a repair round
+            // disables it. Repair feedback travels with the request, and the
+            // next submission is reviewed again in full.
             if (
-              feedback === undefined &&
               candidatePlan.riskProposals.length === 0 &&
               passReadiness.continuation?.canContinue === true
             ) {
+              const continuationFeedback = {
+                acceptedProposalIndexes: [],
+                rejectedProposals: [],
+                instructions: [passReadiness.continuation.requirement],
+              } satisfies TerminalDecisionRepairFeedback;
               return {
                 repair: false,
                 continueResearch: true,
-                feedback: {
-                  acceptedProposalIndexes: [],
-                  rejectedProposals: [],
-                  instructions: [passReadiness.continuation.requirement],
-                },
+                feedback:
+                  mergeTerminalDecisionRepairFeedback(
+                    continuationFeedback,
+                    feedback,
+                  ) ?? continuationFeedback,
               };
             }
             return feedback === undefined ||

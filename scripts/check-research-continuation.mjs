@@ -142,7 +142,7 @@ assert.equal(
   "DECISION",
 );
 
-// A qualified candidate ends continuation but retains the ordinary research gate.
+// A qualified candidate keeps continuation and the ordinary research gate.
 const qualified = fixture({
   marketDetailsHandler: async (slug) => detail(slug, true),
   passResearchRequirements: {
@@ -152,9 +152,9 @@ const qualified = fixture({
   },
 });
 await inspect(qualified.session, supplied[0]);
-assert.equal(
-  qualified.tools.strictPassResearchReadiness.continuation,
-  undefined,
+assert.deepEqual(
+  qualified.tools.strictPassResearchReadiness.continuation.pendingMarketSlugs,
+  supplied.slice(1),
 );
 assert.equal(qualified.tools.strictPassResearchReadiness.allowed, false);
 assert.ok(

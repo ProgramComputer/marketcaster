@@ -2854,11 +2854,7 @@ export class DecisionResearchSession {
 
   private resolvePassReadiness(allowWaivers: boolean): PassResearchReadiness {
     const readiness = this.resolveMinimumPassReadiness(allowWaivers);
-    if (
-      this.passResearchRequirements === undefined ||
-      this.qualifiedSlugs.size > 0
-    )
-      return readiness;
+    if (this.passResearchRequirements === undefined) return readiness;
     const pendingMarketSlugs = this.researchContinuationMarketSlugs.filter(
       (slug) => !this.inspectedSlugs.has(slug),
     );
@@ -2879,7 +2875,7 @@ export class DecisionResearchSession {
       stopReason === undefined
         ? `Check the executable book for ${pendingMarketSlugs[0]} next, using the existing research budget.`
         : `Further inspection stopped: ${stopReason}. State this coverage limitation in the cycle summary.`
-    } No qualifying inspected candidate does not establish that the remaining candidates lack opportunity.`;
+    } Passing on the inspected candidates does not establish that the remaining candidates lack opportunity.`;
     const continuation: ResearchContinuationReadiness = {
       pendingMarketSlugs,
       remainingDetailRequests,

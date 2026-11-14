@@ -12,8 +12,9 @@ run as trusted local code, not in a sandbox.
 - Selection returns a bounded research board and optional required inspections.
 - Optional `selection.selectResearchContinuationMarketSlugs(board)` returns an
   ordered list of supplied board slugs. With pass research enabled, a no-order
-  decision must continue inspecting these candidates when none inspected qualify
-  and the existing research budget permits it. Unknown slugs or invalid return
+  decision must continue inspecting these candidates, before any plan repair,
+  while the existing research budget permits it, whether or not an inspected
+  candidate qualified. Unknown slugs or invalid return
   values fail closed; duplicates are removed. Successful family inspection covers
   only the members actually returned. The hook adds no market preferences to the
   reference policy and does not require an order. Request or round limits leave
