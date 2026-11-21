@@ -11,6 +11,7 @@ import {
 } from "../exchanges/exchange.js";
 import { reconstructAccount } from "../portfolio/reconstruct.js";
 import {
+  calculateNetEdge,
   estimateExchangeTakerFee,
   feeForEdgeEvaluation,
 } from "../risk/edge.js";
@@ -21,6 +22,7 @@ import type {
 } from "../risk/validate.js";
 import { safeErrorMessage } from "../utilities/redaction.js";
 import { canonicalBookLevels, walkCanonicalBook } from "./depth.js";
+import { alignQuantity } from "./price-rounding.js";
 import {
   createFingerprint,
   type DuplicateFingerprint,
@@ -530,6 +532,10 @@ function assertCanonicalBookSane(book: OrderBook, side: OutcomeSide): void {
   }
 }
 
+/**
+ * Returns the fresh order book only when an immediate BUY passes every check
+ * except full depth at its limit, so the caller can send a smaller order.
+ */
 async function assertFreshExecutionState(
   exchange: PredictionExchange,
   validated: ValidatedProposal,
@@ -537,7 +543,7 @@ async function assertFreshExecutionState(
   managedRestingBuyOrders: ManagedRestingBuyOrdersPolicy | undefined,
   checkedAt: Date,
   signal: AbortSignal | undefined,
-): Promise<void> {
+): Promise<OrderBook | undefined> {
   assertManagedRestingOrderSafe(
     exchange,
     validated,
@@ -606,17 +612,108 @@ async function assertFreshExecutionState(
     validated.order.quantity,
     validated.order.canonicalLimitPrice,
   );
-  if (
-    (validated.order.executionPolicy ?? "IOC") === "GTD"
-      ? freshDepth.fillableQuantity.lte(0)
-      : !freshDepth.fullyFillable
-  ) {
+  if ((validated.order.executionPolicy ?? "IOC") === "GTD") {
+    if (freshDepth.fillableQuantity.lte(0)) {
+      throw new SafetyGuardError(
+        "Managed resting BUY no longer has immediately executable depth",
+      );
+    }
+    return undefined;
+  }
+  if (freshDepth.fullyFillable) return undefined;
+  if (validated.order.action === "BUY") return book;
+  throw new SafetyGuardError("Fresh depth cannot fill the validated quantity");
+}
+
+/**
+ * Shrinks an immediate BUY to the quantity fresh depth fills at or below the
+ * validated limit, recomputing fees, reserve, spend and edge for that size.
+ * The limit price never changes and the result never exceeds the validated
+ * worst-case spend.
+ */
+async function resizeImmediateBuyToFreshDepth(
+  exchange: PredictionExchange,
+  validated: ValidatedProposal,
+  book: OrderBook,
+): Promise<ValidatedProposal> {
+  const { order, market } = validated;
+  const available = walkCanonicalBook(
+    book,
+    order.side,
+    "BUY",
+    order.quantity,
+    order.canonicalLimitPrice,
+  );
+  const quantity = alignQuantity(
+    available.fillableQuantity,
+    market.minimumTradeQuantity,
+  );
+  if (quantity.lt(market.minimumTradeQuantity)) {
     throw new SafetyGuardError(
-      (validated.order.executionPolicy ?? "IOC") === "GTD"
-        ? "Managed resting BUY no longer has immediately executable depth"
-        : "Fresh depth cannot fill the validated quantity",
+      "Fresh depth cannot fill the market minimum quantity at the validated limit",
     );
   }
+  if (quantity.gte(order.quantity)) {
+    throw new SafetyGuardError("Fresh depth resize did not reduce the order");
+  }
+  const depth = walkCanonicalBook(
+    book,
+    order.side,
+    "BUY",
+    quantity,
+    order.canonicalLimitPrice,
+  );
+  if (!depth.fullyFillable) {
+    throw new SafetyGuardError("Fresh depth cannot fill the resized quantity");
+  }
+  const estimatedFees = estimateExchangeTakerFee(
+    exchange.id,
+    quantity,
+    depth.vwap,
+  );
+  const exchangeFeeReserve = (
+    await exchange.createImmediateOrderFeeReserveEstimator(order)
+  )(quantity);
+  if (!exchangeFeeReserve.isFinite() || exchangeFeeReserve.lt(0)) {
+    throw new SafetyGuardError(
+      "Exchange returned an invalid conservative fee reserve",
+    );
+  }
+  const conservativeFeeReserve = Decimal.max(estimatedFees, exchangeFeeReserve);
+  const maximumExecutionSpend = quantity
+    .mul(order.canonicalLimitPrice)
+    .plus(conservativeFeeReserve);
+  if (maximumExecutionSpend.gt(validated.maximumExecutionSpend)) {
+    throw new SafetyGuardError(
+      "Resized order would exceed the validated maximum execution spend",
+    );
+  }
+  const netEdge = calculateNetEdge(
+    validated.authorizationProbability,
+    depth.vwap,
+    feeForEdgeEvaluation(
+      exchange.id,
+      estimatedFees,
+      conservativeFeeReserve,
+    ).div(quantity),
+  );
+  if (netEdge.lte(0)) {
+    throw new SafetyGuardError(
+      "Fresh depth at the validated limit does not leave positive net edge",
+    );
+  }
+  return {
+    ...validated,
+    book,
+    order: { ...order, quantity },
+    depth,
+    estimatedFees,
+    expectedSpend: depth.principal.plus(estimatedFees),
+    conservativeFeeReserve,
+    maximumExecutionSpend,
+    netEdge,
+    freshDepthResizedFrom: validated.freshDepthResizedFrom ?? order.quantity,
+  };
 }
 
 function stalePortfolioTargetReason(
@@ -756,7 +853,10 @@ export async function executeValidatedOrders(
     };
   };
 
-  for (const [validatedIndex, validated] of input.validated.entries()) {
+  for (const [validatedIndex, approved] of input.validated.entries()) {
+    // Replaced only by a smaller immediate BUY sized to fresh depth; every
+    // later guard, journal record and reconciliation uses the sent order.
+    let validated = approved;
     const attemptSequence = validatedIndex + 1;
     const identity = {
       proposalIndex: validatedIndex,
@@ -941,7 +1041,7 @@ export async function executeValidatedOrders(
         });
         continue;
       }
-      const fingerprint = createFingerprint(
+      let fingerprint = createFingerprint(
         validated.order,
         checkedAt,
         input.policy.duplicateWindowMinutes,
@@ -981,7 +1081,7 @@ export async function executeValidatedOrders(
         }
       }
 
-      await assertFreshExecutionState(
+      const partialDepthBook = await assertFreshExecutionState(
         input.exchange,
         validated,
         input.policy,
@@ -990,6 +1090,34 @@ export async function executeValidatedOrders(
         input.signal,
       );
       input.signal?.throwIfAborted();
+      if (partialDepthBook !== undefined) {
+        validated = await resizeImmediateBuyToFreshDepth(
+          input.exchange,
+          validated,
+          partialDepthBook,
+        );
+        input.signal?.throwIfAborted();
+        fingerprint = createFingerprint(
+          validated.order,
+          checkedAt,
+          input.policy.duplicateWindowMinutes,
+        );
+        const resizedDuplicate = findLikelyDuplicate(
+          fingerprint,
+          openOrders,
+          activities.items,
+          validated.market.minimumTradeQuantity,
+          validated.market.priceTick,
+        );
+        if (resizedDuplicate !== undefined) {
+          attempts.push({
+            ...identity,
+            validated,
+            skippedReason: `Likely duplicate detected: ${resizedDuplicate}`,
+          });
+          continue;
+        }
+      }
       phase = "PREVIEW";
       const preview = await input.exchange.previewImmediateOrder(
         validated.order,

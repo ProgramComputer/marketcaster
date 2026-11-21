@@ -106,6 +106,11 @@ export interface ValidatedProposal {
   readonly maximumExecutionSpend: Decimal;
   readonly riskBudget: Decimal;
   readonly netEdge?: Decimal;
+  /**
+   * The validated quantity, set only when execution sent a smaller immediate
+   * BUY because fresh depth at the same limit could not fill it.
+   */
+  readonly freshDepthResizedFrom?: Decimal;
 }
 
 export interface RejectedProposal {

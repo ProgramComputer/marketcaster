@@ -694,6 +694,12 @@ function executionReports(execution: ExecutionRun): readonly ExecutionReport[] {
       side: attempt.validated.order.side,
       action: attempt.validated.order.action,
       quantity: attempt.validated.order.quantity.toFixed(),
+      ...(attempt.validated.freshDepthResizedFrom === undefined
+        ? {}
+        : {
+            validatedQuantity:
+              attempt.validated.freshDepthResizedFrom.toFixed(),
+          }),
       canonicalLimitPrice:
         attempt.validated.order.canonicalLimitPrice.toFixed(),
       executionPolicy: attempt.validated.order.executionPolicy ?? "IOC",

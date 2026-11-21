@@ -269,6 +269,8 @@ export interface ExecutionReport {
   readonly side: "YES" | "NO";
   readonly action: "BUY" | "SELL";
   readonly quantity: string;
+  /** Present when fresh depth at the limit reduced the sent quantity. */
+  readonly validatedQuantity?: string;
   readonly canonicalLimitPrice: string;
   readonly executionPolicy: "IOC" | "GTD";
   readonly restUntil?: string;
