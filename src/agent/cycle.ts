@@ -1479,9 +1479,12 @@ export async function runCycle(
     const criticalLearningPolicy = historyEnabled
       ? strategy.selection.buildCriticalLearning
       : undefined;
+    const realizedOutcomes =
+      dependencies.config.agent.history.realizedOutcomes ?? true;
     const settledPositions =
       criticalLearningPolicy === undefined ||
-      dependencies.writeReports === false
+      dependencies.writeReports === false ||
+      !realizedOutcomes
         ? []
         : summarizeSettledPositions(
             initialSnapshot.recentActivities,
@@ -1531,6 +1534,7 @@ export async function runCycle(
         ? {}
         : { criticalLearningPolicy, settledPositions, settledForecasts }),
       historyEnabled,
+      historyRealizedOutcomes: realizedOutcomes,
       ...(dependencies.config.agent.history.outcomeUnit === undefined
         ? {}
         : {

@@ -76,6 +76,11 @@ const AgentHistoryConfigSchema = z
   .object({
     enabled: z.boolean(),
     outcomeUnit: z.enum(["ENTRY", "MARKET"]).optional(),
+    /**
+     * False omits recent realized outcomes, keeping the critical-learning
+     * policy's reminders and forecast record. Defaults to true.
+     */
+    realizedOutcomes: z.boolean().optional(),
   })
   .strict();
 

@@ -111,6 +111,12 @@ export interface BuildAgentContextInput {
   readonly historyEnabled?: boolean;
   /** Unit for recent realized-outcome counts. Defaults to ENTRY. */
   readonly historyOutcomeUnit?: RecentOutcomeUnit;
+  /**
+   * False omits recent performance and the realized-outcome fields of the
+   * learning block, keeping the policy's reminders and forecast record.
+   * Defaults to true.
+   */
+  readonly historyRealizedOutcomes?: boolean;
 }
 
 export interface PreloadedMarketInput {
@@ -816,7 +822,10 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
   const allowPositionReductions =
     input.riskConstraints.allowPositionReductions ?? true;
   const historyEnabled = input.historyEnabled ?? true;
-  const criticalLearning = !historyEnabled
+  const realizedOutcomes = historyEnabled
+    ? (input.historyRealizedOutcomes ?? true)
+    : false;
+  const learning = !historyEnabled
     ? omittedHistoryLearning()
     : input.criticalLearningPolicy === undefined
       ? buildCriticalLearning(performance)
@@ -831,6 +840,16 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
             },
           ),
         );
+  const criticalLearning =
+    historyEnabled && !realizedOutcomes
+      ? {
+          ...omittedHistoryLearning(),
+          positionManagementReminders: learning.positionManagementReminders,
+          ...(learning.forecastRecord === undefined
+            ? {}
+            : { forecastRecord: learning.forecastRecord }),
+        }
+      : learning;
 
   return {
     currentUtcTime,
@@ -895,7 +914,7 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
         : { spendableCapitalUsd: spendableCapital }),
     },
     positions,
-    ...(historyEnabled
+    ...(realizedOutcomes
       ? {
           recentPerformance: {
             settlements: performance.settlements.map((settlement) => ({
