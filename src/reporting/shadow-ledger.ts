@@ -1746,3 +1746,164 @@ export function degradedShadowLedgerReport(input: {
     ],
   };
 }
+
+const MAXIMUM_SETTLED_FORECASTS = 5_000;
+
+/** A recorded forecast whose market has settled YES or NO. */
+export interface SettledForecast {
+  readonly marketSlug: string;
+  readonly eventSlug?: string;
+  readonly seriesSlug?: string;
+  readonly category?: string;
+  readonly closesAt?: Date;
+  readonly mode: RuntimeMode;
+  readonly decisionRecordedAt: Date;
+  readonly decisionAction: ShadowDecisionAction;
+  readonly riskStatus: ShadowRiskStatus;
+  readonly side: OutcomeSide;
+  readonly estimatedProbability: Decimal;
+  readonly probabilityLowerBound: Decimal;
+  readonly probabilityUpperBound: Decimal;
+  readonly buyAuthorizationProbability?: Decimal;
+  readonly confidence: "LOW" | "MEDIUM" | "HIGH";
+  readonly bookStatus?: ShadowBookSnapshot["status"];
+  readonly selectedSideBid?: Decimal;
+  readonly selectedSideAsk?: Decimal;
+  /** Whether the forecast side settled true. */
+  readonly outcome: "WON" | "LOST";
+  readonly settledAt?: Date;
+}
+
+export interface SettledForecastLoad {
+  /** Newest decision first. */
+  readonly forecasts: readonly SettledForecast[];
+  readonly readFailureCount: number;
+  readonly truncated: boolean;
+}
+
+/**
+ * Joins recorded forecasts to their markets' settlements. A market is used only
+ * when every recorded settlement for it says the same YES or NO result.
+ */
+export function joinSettledForecasts(
+  observations: readonly ShadowObservation[],
+  settlements: readonly ShadowSettlementEvent[],
+  maximumForecasts = MAXIMUM_SETTLED_FORECASTS,
+): Pick<SettledForecastLoad, "forecasts" | "truncated"> {
+  const results = new Map<string, ShadowSettlementEvent | null>();
+  for (const settlement of settlements) {
+    const key = marketKey(settlement.exchangeId, settlement.marketId);
+    const existing = results.get(key);
+    if (
+      settlement.state !== "SETTLED_YES" &&
+      settlement.state !== "SETTLED_NO"
+    ) {
+      results.set(key, null);
+    } else if (existing === undefined) {
+      results.set(key, settlement);
+    } else if (existing !== null && existing.state !== settlement.state) {
+      results.set(key, null);
+    }
+  }
+  const joined = observations
+    .flatMap((observation) => {
+      const settlement = results.get(
+        marketKey(observation.exchangeId, observation.market.id),
+      );
+      if (settlement === undefined || settlement === null) return [];
+      const { market, forecast, book } = observation;
+      const settledYes = settlement.state === "SETTLED_YES";
+      const record: SettledForecast = {
+        marketSlug: market.slug,
+        ...(market.eventSlug === undefined
+          ? {}
+          : { eventSlug: market.eventSlug }),
+        ...(market.seriesSlug === undefined
+          ? {}
+          : { seriesSlug: market.seriesSlug }),
+        ...(market.category === undefined ? {} : { category: market.category }),
+        ...(market.closesAt === undefined
+          ? {}
+          : { closesAt: new Date(market.closesAt) }),
+        mode: observation.mode,
+        decisionRecordedAt: new Date(observation.decisionRecordedAt),
+        decisionAction: observation.decisionAction,
+        riskStatus: observation.riskStatus,
+        side: forecast.side,
+        estimatedProbability: new Decimal(forecast.estimatedProbability),
+        probabilityLowerBound: new Decimal(forecast.probabilityLowerBound),
+        probabilityUpperBound: new Decimal(forecast.probabilityUpperBound),
+        ...(forecast.buyAuthorizationProbability === undefined
+          ? {}
+          : {
+              buyAuthorizationProbability: new Decimal(
+                forecast.buyAuthorizationProbability,
+              ),
+            }),
+        confidence: forecast.confidence,
+        ...(book === undefined ? {} : { bookStatus: book.status }),
+        ...(book?.selectedSideBid === undefined
+          ? {}
+          : { selectedSideBid: new Decimal(book.selectedSideBid) }),
+        ...(book?.selectedSideAsk === undefined
+          ? {}
+          : { selectedSideAsk: new Decimal(book.selectedSideAsk) }),
+        outcome: settledYes === (forecast.side === "YES") ? "WON" : "LOST",
+        ...(settlement.settledAt === undefined
+          ? {}
+          : { settledAt: new Date(settlement.settledAt) }),
+      };
+      return [{ id: observation.observationId, record }];
+    })
+    .toSorted(
+      (left, right) =>
+        right.record.decisionRecordedAt.getTime() -
+          left.record.decisionRecordedAt.getTime() ||
+        left.id.localeCompare(right.id),
+    );
+  return {
+    forecasts: joined.slice(0, maximumForecasts).map(({ record }) => record),
+    truncated: joined.length > maximumForecasts,
+  };
+}
+
+/**
+ * Reads the persisted ledger's observations and settlements for one exchange
+ * account, without marks or exchange requests.
+ */
+export async function loadSettledForecasts(input: {
+  readonly rootDirectory: string;
+  readonly exchangeId: ExchangeId;
+  readonly accountScope: string;
+  readonly maximumForecasts?: number;
+}): Promise<SettledForecastLoad> {
+  const accountScope = assertSafeMemoryScope(input.accountScope);
+  const base = resolve(
+    process.cwd(),
+    input.rootDirectory,
+    "shadow-ledger",
+    input.exchangeId,
+    accountScope,
+  );
+  const [observationRead, settlementRead] = await Promise.all([
+    readEvents(resolve(base, "observations"), ObservationSchema),
+    readEvents(resolve(base, "settlements"), SettlementSchema),
+  ]);
+  const inScope = (value: {
+    readonly exchangeId: ExchangeId;
+    readonly accountScope: string;
+  }): boolean =>
+    value.exchangeId === input.exchangeId &&
+    value.accountScope === accountScope;
+  return {
+    ...joinSettledForecasts(
+      (observationRead.values as readonly ShadowObservation[]).filter(inScope),
+      (settlementRead.values as readonly ShadowSettlementEvent[]).filter(
+        inScope,
+      ),
+      input.maximumForecasts,
+    ),
+    readFailureCount:
+      observationRead.failureCount + settlementRead.failureCount,
+  };
+}

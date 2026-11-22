@@ -78,7 +78,9 @@ import {
   buildShadowLedgerCandidates,
   captureShadowLedgerObservations,
   degradedShadowLedgerReport,
+  loadSettledForecasts,
   persistAndReconcileShadowLedger,
+  type SettledForecast,
   type ShadowLedgerCaptureResult,
   type ShadowLedgerCycleReport,
 } from "../reporting/shadow-ledger.js";
@@ -1493,10 +1495,41 @@ export async function runCycle(
             }),
             (event) => reviewDiagnostics?.append("history-attribution", event),
           );
+    // A missing or unreadable ledger leaves the policy an empty record; it
+    // never fails the cycle.
+    let settledForecasts: readonly SettledForecast[] = [];
+    if (
+      criticalLearningPolicy !== undefined &&
+      dependencies.writeReports !== false
+    ) {
+      try {
+        const forecastHistory = await loadSettledForecasts({
+          rootDirectory: dependencies.config.reporting.directory,
+          exchangeId: dependencies.exchange.id,
+          accountScope,
+        });
+        settledForecasts = forecastHistory.forecasts;
+        if (forecastHistory.readFailureCount > 0 || forecastHistory.truncated)
+          reviewDiagnostics?.append("history-attribution", {
+            stage: "FORECAST_HISTORY",
+            reason:
+              forecastHistory.readFailureCount > 0
+                ? "EVENT_READ_FAILED"
+                : "TRUNCATED",
+            readFailureCount: forecastHistory.readFailureCount,
+            truncated: forecastHistory.truncated,
+          });
+      } catch {
+        reviewDiagnostics?.append("history-attribution", {
+          stage: "FORECAST_HISTORY",
+          reason: "HISTORY_UNAVAILABLE",
+        });
+      }
+    }
     const contextInput: BuildAgentContextInput = {
       ...(criticalLearningPolicy === undefined
         ? {}
-        : { criticalLearningPolicy, settledPositions }),
+        : { criticalLearningPolicy, settledPositions, settledForecasts }),
       historyEnabled,
       ...(dependencies.config.agent.history.outcomeUnit === undefined
         ? {}

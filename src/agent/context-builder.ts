@@ -30,6 +30,7 @@ import type {
 import { summarizeRecentPerformance } from "./recent-performance.js";
 import type { OpportunityBoardItem } from "./opportunity-board.js";
 import type { PreviousCycleAdvisory } from "../reporting/previous-cycle-advisory.js";
+import type { SettledForecast } from "../reporting/shadow-ledger.js";
 import type { SettledPosition } from "./settled-positions.js";
 
 export interface PositionValuationInput {
@@ -97,6 +98,8 @@ export interface BuildAgentContextInput {
   readonly criticalLearningPolicy?: CriticalLearningPolicy;
   /** Settlements joined to recorded entries, for the critical-learning policy. */
   readonly settledPositions?: readonly SettledPosition[];
+  /** Settled recorded forecasts, newest first, for the critical-learning policy. */
+  readonly settledForecasts?: readonly SettledForecast[];
   readonly recentExecutionOutcomes?: readonly RecentExecutionOutcomeInput[];
   readonly previousCycle?: PreviousCycleAdvisory;
   readonly memory?: AgentMemoryContext;
@@ -267,6 +270,7 @@ export interface AgentContext {
     readonly losingPatternAssessment: string;
     readonly positionManagementReminders: readonly string[];
     readonly scorecard?: SettlementScorecard;
+    readonly forecastRecord?: ForecastRecord;
   };
   readonly markets: {
     readonly catalogCount: number;
@@ -344,10 +348,18 @@ function positionValuationMap(
   return result;
 }
 
+export interface ForecastHistory {
+  /** The cycle clock, the same instant as the context's currentUtcTime. */
+  readonly asOf: Date;
+  /** Settled recorded forecasts, newest first. */
+  readonly settled: readonly SettledForecast[];
+}
+
 export type CriticalLearningPolicy = (
   performance: RecentPerformance,
   previousCycle: PreviousCycleAdvisory | undefined,
   settledPositions: readonly SettledPosition[],
+  forecastHistory: ForecastHistory,
 ) => AgentContext["criticalLearning"];
 
 const DECIMAL_TEXT = /^-?\d+(?:\.\d+)?$/u;
@@ -394,6 +406,34 @@ const SettlementScorecardSchema = z
  */
 export type SettlementScorecard = z.infer<typeof SettlementScorecardSchema>;
 
+const ForecastRecordSchema = z
+  .object({
+    basis: z.string().min(1).max(600),
+    windowDays: z.number().int().min(1).max(3_650),
+    rows: z
+      .array(
+        z
+          .object({
+            group: z.string().min(1).max(80),
+            forecasts: CountSchema,
+            events: CountSchema,
+            happened: CountSchema,
+            happenedRate: z.string().regex(DECIMAL_TEXT),
+            meanStatedProbability: z.string().regex(DECIMAL_TEXT),
+            meanAsk: z.string().regex(DECIMAL_TEXT),
+          })
+          .strict(),
+      )
+      .max(12),
+  })
+  .strict();
+
+/**
+ * Policy-built summary of settled recorded forecasts. The engine bounds its
+ * size; the grouping, window and interpretation belong to the deployment policy.
+ */
+export type ForecastRecord = z.infer<typeof ForecastRecordSchema>;
+
 function checkedCriticalLearning(
   learning: AgentContext["criticalLearning"],
 ): AgentContext["criticalLearning"] {
@@ -402,6 +442,12 @@ function checkedCriticalLearning(
     !SettlementScorecardSchema.safeParse(learning.scorecard).success
   ) {
     throw new TypeError("Strategy settlement scorecard is invalid");
+  }
+  if (
+    learning.forecastRecord !== undefined &&
+    !ForecastRecordSchema.safeParse(learning.forecastRecord).success
+  ) {
+    throw new TypeError("Strategy forecast record is invalid");
   }
   return learning;
 }
@@ -779,6 +825,10 @@ export function buildAgentContext(input: BuildAgentContextInput): AgentContext {
             performance,
             input.previousCycle,
             input.settledPositions ?? [],
+            {
+              asOf: new Date(currentUtcTime),
+              settled: input.settledForecasts ?? [],
+            },
           ),
         );
 
