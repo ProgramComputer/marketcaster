@@ -425,6 +425,15 @@ const ForecastRecordSchema = z
             events: CountSchema,
             happened: CountSchema,
             happenedRate: z.string().regex(DECIMAL_TEXT),
+            byAction: z
+              .partialRecord(
+                z.enum(["BUY", "SELL", "HOLD", "PASS"]),
+                z
+                  .object({ forecasts: CountSchema, happened: CountSchema })
+                  .strict()
+                  .refine((counts) => counts.happened <= counts.forecasts),
+              )
+              .optional(),
             meanStatedProbability: z.string().regex(DECIMAL_TEXT),
             meanAsk: z.string().regex(DECIMAL_TEXT),
           })

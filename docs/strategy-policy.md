@@ -39,11 +39,12 @@ run as trusted local code, not in a sandbox.
   with recorded SELL fills, fills on both sides, or no recorded entry are
   omitted, and zero realized PnL is `UNKNOWN`. `forecastHistory.settled` lists
   the shadow ledger's recorded forecasts whose markets settled YES or NO, newest
-  first and bounded, with the selected side's quote at decision time and whether
-  that side won; `forecastHistory.asOf` is the cycle clock. An unreadable ledger
+  first and bounded, with the selected side's quote recorded near the decision
+  and whether that side won. `forecastHistory.asOf` is the cycle clock. An unreadable ledger
   leaves the list empty. The block may include a `scorecard` of grouped counts,
-  PnL and probability bands and a `forecastRecord` of grouped forecast counts;
-  the engine rejects either when it exceeds its size and field bounds.
+  PnL and probability bands and a `forecastRecord` of grouped forecast counts.
+  A forecast row can include `byAction` counts of forecasts and how many settled
+  true for each decision action. The engine validates both record formats.
 - Optional cooldown durations apply to typed execution failures. State is isolated
   by account, exchange, market, outcome side, and action; it contains no raw errors.
 - An optional version 1 `evidenceContentAdapter` can extract text from a fetched

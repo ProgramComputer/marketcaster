@@ -872,6 +872,40 @@ const resolution = (marketSlug, realizedPnl, resolvedAt) => ({
   );
   assert.deepEqual(received, [{ marketSlug: "alpha" }]);
   assert.deepEqual(context.criticalLearning.scorecard, scorecard);
+  const forecastRow = {
+    group: "sample",
+    forecasts: 2,
+    events: 2,
+    happened: 1,
+    happenedRate: "0.5",
+    meanStatedProbability: "0.6",
+    meanAsk: "0.45",
+  };
+  const forecastContext = (row) =>
+    buildAgentContext(
+      input(() => ({
+        ...learning(),
+        forecastRecord: {
+          basis: "Synthetic forecasts.",
+          windowDays: 1,
+          rows: [row],
+        },
+      })),
+    ).criticalLearning.forecastRecord;
+  assert.deepEqual(forecastContext(forecastRow).rows, [forecastRow]);
+  const byAction = { HOLD: { forecasts: 2, happened: 1 } };
+  assert.deepEqual(
+    forecastContext({ ...forecastRow, byAction }).rows[0].byAction,
+    byAction,
+  );
+  assert.throws(
+    () =>
+      forecastContext({
+        ...forecastRow,
+        byAction: { HOLD: { forecasts: 1, happened: 2 } },
+      }),
+    /forecast record is invalid/u,
+  );
   assert.throws(
     () =>
       buildAgentContext(
